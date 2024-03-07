@@ -43,11 +43,13 @@ pub fn Site() -> impl IntoView {
     provide_meta_context();
 
     // Choose a subtitle
-    let subtitles = [
-        "A stack-based array programming language".into_view(),
-        "An array-oriented tacit programming language".into_view(),
-        "A programming language for point-free enjoyers".into_view(),
-        "A programming language for variable dislikers".into_view(),
+    let subtitles_common = [
+        "A stack-based array programming language",
+        "An array-oriented tacit programming language",
+        "A programming language for point-free enjoyers",
+        "A programming language for variable dislikers",
+    ];
+    let subtitles_rare = [
         view!("Check out "<a href="https://arraycast.com/">"The Array Cast"</a>).into_view(),
         view!(<a href="https://youtu.be/seVSlKazsNk">"Point-Free or Die"</a>).into_view(),
         view! {
@@ -111,13 +113,15 @@ pub fn Site() -> impl IntoView {
         .into_view(),
     ];
     let local_storage = window().local_storage().unwrap().unwrap();
-    let mut visits: usize = local_storage
-        .get_item("visits")
-        .ok()
-        .flatten()
+    let mut visits: usize = (local_storage.get_item("visits").ok().flatten())
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let subtitle = subtitles[visits % subtitles.len()].clone();
+    let subtitle = if visits % 3 < 2 {
+        subtitles_common[(visits as f64 * 2.0 / 3.0).round() as usize % subtitles_common.len()]
+            .into_view()
+    } else {
+        subtitles_rare[visits / 3 % subtitles_rare.len()].clone()
+    };
     visits = visits.overflowing_add(1).0;
 
     // Change the favicon to favicon-crayon.ico every 10 visits
@@ -406,15 +410,17 @@ fn prim_class(prim: Primitive) -> &'static str {
 
 fn binding_class(name: &str, docs: &BindingDocs) -> &'static str {
     match name {
-        "Trans" => code_font!("trans text-gradient"),
-        "Bi" => code_font!("bi text-gradient"),
-        "Pan" => code_font!("pan text-gradient"),
+        "Trans" | "Transgender" => code_font!("trans text-gradient"),
+        "Bi" | "Bisexual" => code_font!("bi text-gradient"),
+        "Pan" | "Pansexual" => code_font!("pan text-gradient"),
         "Gay" => code_font!("gay text-gradient"),
-        "Ace" => code_font!("ace text-gradient"),
-        "Nb" | "Enby" => code_font!("nb text-gradient"),
-        "Fluid" => code_font!("fluid text-gradient"),
-        "Queer" => code_font!("queer text-gradient"),
         "Lesbian" => code_font!("lesbian text-gradient"),
+        "Ace" | "Asexual" => code_font!("ace text-gradient"),
+        "Aro" | "Aromantic" => code_font!("aro text-gradient"),
+        "AroAce" => code_font!("aroace text-gradient"),
+        "Nb" | "Enby" | "Nonbinary" | "NonBinary" => code_font!("nb text-gradient"),
+        "Fluid" | "Genderfluid" | "GenderFluid" => code_font!("fluid text-gradient"),
+        "Queer" | "Genderqueer" | "GenderQueer" => code_font!("queer text-gradient"),
         _ => match docs.kind {
             BindingDocsKind::Constant(_) => code_font!(""),
             BindingDocsKind::Function { sig, .. } => match sig.args {

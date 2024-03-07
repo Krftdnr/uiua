@@ -36,6 +36,9 @@ impl Value {
         self.shape_mut().insert(depth, 1);
     }
     pub(crate) fn inv_fix(&mut self) {
+        if self.is_map() {
+            return;
+        }
         let shape = self.shape_mut();
         if shape.starts_with(&[1]) {
             shape.remove(0);
@@ -159,6 +162,9 @@ impl<T: ArrayValue> Array<T> {
         self.shape = self.element_count().into();
     }
     pub(crate) fn deshape_depth(&mut self, mut depth: usize) {
+        if self.is_map() {
+            return;
+        }
         depth = depth.min(self.rank());
         let deshaped = self.shape.split_off(depth).into_iter().product();
         self.shape.push(deshaped);
@@ -293,7 +299,7 @@ impl Value {
             |a| a.last(env).map(Into::into),
         )
     }
-    pub(crate) fn unfirst(self, into: Self, env: &Uiua) -> UiuaResult<Self> {
+    pub(crate) fn undo_first(self, into: Self, env: &Uiua) -> UiuaResult<Self> {
         into.try_map_boxed(|into| {
             self.generic_bin_into(
                 into.unboxed(),
@@ -312,7 +318,7 @@ impl Value {
             )
         })
     }
-    pub(crate) fn unlast(self, into: Self, env: &Uiua) -> UiuaResult<Self> {
+    pub(crate) fn undo_last(self, into: Self, env: &Uiua) -> UiuaResult<Self> {
         into.try_map_boxed(|into| {
             self.generic_bin_into(
                 into.unboxed(),
@@ -467,11 +473,9 @@ impl Value {
             Value::Complex(c) => c.transpose_depth(depth, amnt),
             Value::Char(c) => c.transpose_depth(depth, amnt),
             Value::Box(b) => {
-                if let Some(bx) = b.as_scalar_mut() {
-                    bx.as_value_mut().transpose_depth(depth, amnt);
-                } else if depth > 0 && b.rank() <= 1 {
+                if depth == b.rank() {
                     for b in b.data.as_mut_slice() {
-                        b.as_value_mut().transpose_depth(depth - 1, amnt);
+                        b.0.transpose();
                     }
                 } else {
                     b.transpose_depth(depth, amnt);
@@ -488,6 +492,9 @@ impl<T: ArrayValue> Array<T> {
     }
     pub(crate) fn transpose_depth(&mut self, mut depth: usize, amnt: i32) {
         crate::profile_function!();
+        if depth == 0 && self.is_map() {
+            return;
+        }
         depth = depth.min(self.rank());
         let trans_count = amnt.unsigned_abs() as usize;
         let trans_rank = self.rank() - depth;
@@ -780,7 +787,7 @@ impl Value {
         }
     }
     /// Decode the `bits` of the value
-    pub fn inv_bits(&self, env: &Uiua) -> UiuaResult<Array<f64>> {
+    pub fn un_bits(&self, env: &Uiua) -> UiuaResult<Array<f64>> {
         match self {
             #[cfg(feature = "bytes")]
             Value::Byte(n) => n.inverse_bits(env),
@@ -990,11 +997,11 @@ impl Value {
         }
     }
     /// `un` `where`
-    pub fn inv_where(&self, env: &Uiua) -> UiuaResult<Self> {
+    pub fn unwhere(&self, env: &Uiua) -> UiuaResult<Self> {
+        const INDICES_ERROR: &str = "Argument to ° un ⊚ where must be an array of naturals";
         Ok(match self.shape().dims() {
             [] | [_] => {
-                let indices =
-                    self.as_nats(env, "Argument to inverse where must be a list of naturals")?;
+                let indices = self.as_nats(env, INDICES_ERROR)?;
                 let is_sorted = indices
                     .iter()
                     .zip(indices.iter().skip(1))
@@ -1027,10 +1034,7 @@ impl Value {
                 Array::from(data).into()
             }
             [_, trailing] => {
-                let indices = self.as_natural_array(
-                    env,
-                    "Argument to inverse where must be an array of naturals",
-                )?;
+                let indices = self.as_natural_array(env, INDICES_ERROR)?;
                 let mut counts: HashMap<&[usize], usize> = HashMap::new();
                 for row in indices.row_slices() {
                     *counts.entry(row).or_default() += 1;
@@ -1071,7 +1075,7 @@ impl Value {
         Ok(Array::<u8>::from_iter(s.into_bytes()).into())
     }
     /// Convert a list of UTF-8 bytes to a string value
-    pub fn inv_utf8(&self, env: &Uiua) -> UiuaResult<Self> {
+    pub fn un_utf8(&self, env: &Uiua) -> UiuaResult<Self> {
         let bytes = self.as_bytes(env, "Argument to inverse utf must be a list of bytes")?;
         let s = String::from_utf8(bytes).map_err(|e| env.error(e))?;
         Ok(s.into())
@@ -1256,5 +1260,65 @@ impl Array<f64> {
         let mut shape = self.shape.clone();
         shape.insert(0, longest);
         Ok(Array::new(shape, data))
+    }
+}
+
+impl Value {
+    pub(crate) fn to_csv(&self, env: &Uiua) -> UiuaResult<String> {
+        #[cfg(not(feature = "csv"))]
+        return Err(env.error("CSV support is not enabled in this environment"));
+        #[cfg(feature = "csv")]
+        {
+            let mut buf = Vec::new();
+            let mut writer = csv::Writer::from_writer(&mut buf);
+            match self.rank() {
+                0 => {
+                    writer
+                        .write_record([self.format()])
+                        .map_err(|e| env.error(e))?;
+                }
+                1 => {
+                    for row in self.rows() {
+                        writer
+                            .write_record([row.format()])
+                            .map_err(|e| env.error(e))?;
+                    }
+                }
+                2 => {
+                    for row in self.rows() {
+                        writer
+                            .write_record(row.rows().map(|v| v.format()))
+                            .map_err(|e| env.error(e))?;
+                    }
+                }
+                n => return Err(env.error(format!("Cannot write a rank-{n} array to CSV"))),
+            }
+            writer.flush().map_err(|e| env.error(e))?;
+            drop(writer);
+            let s = String::from_utf8(buf).map_err(|e| env.error(e))?;
+            Ok(s)
+        }
+    }
+    pub(crate) fn from_csv(csv: &str, env: &mut Uiua) -> UiuaResult<Self> {
+        #[cfg(not(feature = "csv"))]
+        return Err(env.error("CSV support is not enabled in this environment"));
+        #[cfg(feature = "csv")]
+        {
+            let mut reader = csv::ReaderBuilder::new()
+                .has_headers(false)
+                .from_reader(csv.as_bytes());
+            env.with_fill("".into(), |env| {
+                let mut rows = Vec::new();
+                for result in reader.records() {
+                    let record = result.map_err(|e| env.error(e))?;
+                    let mut row = EcoVec::new();
+                    for field in record.iter() {
+                        row.push(Boxed(field.into()));
+                    }
+                    rows.push(Array::new(row.len(), row));
+                }
+                Array::from_row_arrays(rows, env).map(Into::into)
+            })
+        }
     }
 }

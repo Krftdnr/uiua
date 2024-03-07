@@ -16,9 +16,6 @@ This version is not yet released. If you are reading this on the website, then t
   - `∿` is more representative of what it does
   - Most circle glyphs like `○` are used for array functions or stack manipulation
   - `○` will continue to work and will be formatted as `∿`
-- [`map`](https://uiua.org/docs/map) arrays are now a less leaky abstraction. The keys are now stored as metadata on the values.
-  - [`reverse ⇌`](https://uiua.org/docs/reverse), [`rotate ↻`](https://uiua.org/docs/rotate), [`take ↙`](https://uiua.org/docs/take), [`drop ↘`](https://uiua.org/docs/drop), and [`join ⊂`](https://uiua.org/docs/join) now work with [`map`](https://uiua.org/docs/map) arrays without corrupting them
-- Add the [`by ⊸`](https://uiua.org/docs/by) modifier, which duplicates the second value on the stack
 - [`under ⍜`](https://uiua.org/docs/under) [`join ⊂`](https://uiua.org/docs/join) now works with arrays of the same rank as long as the row count does not change
 - [`un °`](https://uiua.org/docs/un) [`scan \\`](https://uiua.org/docs/scan) now works with [`equals =`](https://uiua.org/docs/equals) and [`not equals ≠`](https://www.uiua.org/docs/not%20equals)
 - [`group ⊕`](https://uiua.org/docs/group) can now take multidimensional index arrays
@@ -29,6 +26,7 @@ This version is not yet released. If you are reading this on the website, then t
 - [`fold ∧`](https://uiua.org/docs/fold) now works with [`under ⍜`](https://uiua.org/docs/under) if its function does
 - [`inventory ⍚`](https://uiua.org/docs/inventory) can now take 3 or more arrays
 - Characters can now be [`multiply ×`](https://uiua.org/docs/multiply)d or [`divide ÷`](https://uiua.org/docs/divide)d by numbers to possibly toggle their case
+- Add the [`csv`](https://uiua.org/docs/csv) function, which encodes and decodes CSV data
 - Add the [`&clget`](https://uiua.org/docs/&clget) and [`&clset`](https://uiua.org/docs/&clset) system functions, which allow copying and pasting text to and from the system clipboard
 - Add more [shadowable constants](https://www.uiua.org/docs/constants)
 - Importing modules that use the `# Experimental!` comment now requires the `# Experimental!` comment in the importing file
@@ -39,23 +37,27 @@ This version is not yet released. If you are reading this on the website, then t
   - This works similarly to [`find ⌕`](https://uiua.org/docs/find), but is better when you need a mask or to distinguish between adjacent occurrences
 - Add the experimental [`coordinate ⟔`](https://uiua.org/docs/coordinate) function, which searches an array for a value and returns a multidimensional index
   - [`coordinate ⟔`](https://uiua.org/docs/coordinate) is to [`pick ⊡`](https://uiua.org/docs/pick) as [`indexof ⊗`](https://uiua.org/docs/indexof) is to [`select ⊏`](https://uiua.org/docs/select)
+- Experimental function strands now use the `‿` character, which formats from `__`
 - Add experimental array macros, which allow code to be generated and manipulated at compile time as strings
   - These are specified with a `^` immediately following a binding's arrow
+- Add the experimental [`by ⊸`](https://uiua.org/docs/by) modifier, which duplicates a function's last argument before calling it
 - Add the experimental [`quote`](https://uiua.org/docs/quote) modifier, which converts a string to code at compile time
   - This is useful in array macros
 - Add `# No inline!` semantic comment, which prevents a function and its callers from being inlined
   - This enables stack traces on errors
 - Remove `unpack ⊐` for good
 ### Interpreter
-- Functions are now analyzed for purity
+- Code is now analyzed for purity
+  - All pure top-level expressions will attempt to evaluate at compile time
   - A `|0.1` binding will be automatically evaluated at compile time if it is pure
-- Language Server
-  - Add find references
-  - Add signature inlay hints (can be toggled/adjusted in settings)
-  - Add macro expansion as a code action
-  - Add on-type formatting (can be toggled in settings)
-  - Add completions for shadowable constants
-  - Add completions for module items when the module reference is partially typed
+- Add lots of LSP features
+  - Find references
+  - Signature inlay hints (can be toggled/adjusted in settings)
+  - Value inlay hints (can be toggled in settings)
+  - Macro expansion as a code action
+  - On-type formatting (can be toggled in settings)
+  - Completions for shadowable constants
+  - Completions for module items when the module reference is partially typed
 - Add the `--file <file>` option to the `uiua repl` command
   - This runs a file before starting the REPL
 - Improve the supported binding type coverage of [`&ffi`](https://uiua.org/docs/&ffi)
@@ -64,6 +66,7 @@ This version is not yet released. If you are reading this on the website, then t
 - Hide experimental glyphs in the editor by default
   - They can be toggled on in the settings
 - An `# Experimental!` comment can now be easily inserted via a settings button or with `Ctrl+E`
+- Add horizontal scrolling to pad output
 
 ## 0.9.5 - 2024-02-28
 ### Interpreter

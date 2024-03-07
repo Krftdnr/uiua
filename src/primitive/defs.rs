@@ -1213,6 +1213,9 @@ primitive!(
     /// ex: /+ 1_2_3_4_5
     /// [reduce] goes from left to right. This is important for non-commutative functions like [subtract].
     /// ex: /- 1_2_3_4_5
+    /// [reduce] works on arrays of arbitrary rank. The leading-axis rows will always be iterated over.
+    /// ex: /+ . [1_2_3 4_5_6]
+    /// ex: /+ . [[0_1 1_0] [2_0 0_0] [0_0 0_3]]
     ///
     /// If you want to see the intermediate values, you can use [scan].
     /// ex: /- 1_2_3_4_5
@@ -1838,6 +1841,9 @@ primitive!(
     /// Because array construction is implemented in terms of [couple] and [join], [fill] can be used when building arrays.
     /// ex: ⬚0[1 2_3 4_5_6]
     ///
+    /// This also means that modifiers like [rows] and [each] work with [fill].
+    /// ex: ⬚∞≡⇡ [4 5 8]
+    ///
     /// [fill] also works with pervasive operations where the shapes don't match.
     /// ex: ⬚0+ 1_2_3 10_9_8_7_6_5
     ///
@@ -2159,19 +2165,23 @@ primitive!(
     ///   : insert 7 8_9
     ///   : °map .
     ///
-    /// The values of a map array are just the array itself. The keys are stored as metadata on the array.
-    /// Performing non-map operations on a map array may work, but it will usually break the mapping.
+    /// Pervasive operations work on the values of a map, but not on the keys.
     /// ex: # Experimental!
-    ///   : map 1_2_3 [3_4 5_6 7_8]
-    ///   : get 1 ⍉ .
-    ///
-    /// Some normal array operations *do* work on maps though.
-    /// They are:
+    ///   : ×10 map 1_2_3 4_5_6
+    /// Some normal array operations work on maps:
     /// - [reverse]
     /// - [rotate]
     /// - [take]
     /// - [drop]
     /// - [join]
+    /// - [each]
+    /// - [rows]
+    /// These operations do *not* work on maps:
+    /// - [fix]
+    /// - [transpose]
+    /// - [deshape]
+    /// - [rerank]
+    /// - [reshape]
     ///
     /// Regardless of the size of the map, operations on it have O(1) amortized time complexity.
     /// In this example, we time [get] and [insert] operations on maps from 10 entries up to 100,000 entries.
@@ -2409,6 +2419,23 @@ primitive!(
     /// At the moment, this is only useful for debugging.
     /// While theoretically, it could be used in a macro to choose a branch of a switch function appropriate for the function, this is not yet possible because of the way that macros and signature checking work.
     (0(2)[1], Sig, OtherModifier, "signature"),
+    /// Encode an array into a CSV string
+    ///
+    /// The input array must be at most rank-`2`.
+    /// ex: csv [1 2 3]
+    /// ex: csv ↯3_4⇡12
+    /// ex: csv [{"Foo" "Bar"} [1 2] [3 4] [5 6]]
+    /// You can use [un][csv] to decode a CSV string back into an array.
+    /// ex: °csv "#,Count\n1,5\n2,21\n3,8\n"
+    /// The decoding result will always be a rank-`2` array of boxed strings.
+    /// You can use `each``try``parse``gap``identity` to convert the strings that represent numbers.
+    /// ex: ∵⍣⋕⋅∘ °csv "#,Count\n1,5\n2,21\n3,8\n"
+    /// If you know there are headers, you can use [un][join] to separate them.
+    /// ex: ⊙⋕°⊂ °csv "#,Count\n1,5\n2,21\n3,8\n"
+    /// You can easily create a [map] with the headers as keys.
+    /// ex: # Experimental!
+    ///   : map⊙(⍉⋕)°⊂ °csv "#,Count\n1,5\n2,21\n3,8\n"
+    (1, Csv, Misc, "csv"),
     /// Convert a value to its code representation
     ///
     /// ex: # Experimental!
@@ -2493,20 +2520,22 @@ impl_primitive!(
     (1, InvFix),
     (1[1], InvScan),
     (1(2), InvMap),
-    (1, InvTrace),
-    (0(0), InvStack),
-    (0[1], InvDump),
+    (1, InvTrace, impure),
+    (2(2), InvBothTrace, impure),
+    (0(0), InvStack, impure),
+    (0[1], InvDump, impure),
     (1, Primes),
     (1, InvBox),
     (1(2), InvJoin),
+    (1, InvCsv),
     // Unders
-    (3, Unselect),
-    (3, Unpick),
-    (3, Untake),
-    (3, Undrop),
-    (2, Unfirst),
-    (2, Unlast),
-    (3, Unkeep),
+    (3, UndoSelect),
+    (3, UndoPick),
+    (3, UndoTake),
+    (3, UndoDrop),
+    (2, UndoFirst),
+    (2, UndoLast),
+    (3, UndoKeep),
     (3, Unrerank),
     (2, Unreshape),
     (3(2), Unjoin),
@@ -2514,8 +2543,8 @@ impl_primitive!(
     (3, Unpartition2),
     (1[1], Ungroup1),
     (3, Ungroup2),
-    (4, Uninsert),
-    (3, Unremove),
+    (4, UndoInsert),
+    (3, UndoRemove),
     // Optimizations
     (1, Last),
     (1, FirstMinIndex),
@@ -2529,4 +2558,5 @@ impl_primitive!(
     (1, ReplaceRand, impure),
     (2, ReplaceRand2, impure),
     (2, Adjacent),
+    (2(2), BothTrace, impure),
 );

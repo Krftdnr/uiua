@@ -346,6 +346,14 @@ impl Value {
     pub fn take_map_keys(&mut self) -> Option<MapKeys> {
         unsafe { self.repr_mut() }.arr.take_map_keys()
     }
+    /// Take the persistent metadata from the value
+    pub fn take_per_meta(&mut self) -> PersistentMeta {
+        unsafe { self.repr_mut() }.arr.take_per_meta()
+    }
+    /// Set the persistent metadata for the value
+    pub fn set_per_meta(&mut self, per_meta: PersistentMeta) {
+        unsafe { self.repr_mut() }.arr.set_per_meta(per_meta)
+    }
     /// Combine this value's metadata with another
     pub fn combine_meta(&mut self, other: &ArrayMeta) {
         unsafe { self.repr_mut() }.arr.combine_meta(other)
@@ -1083,7 +1091,7 @@ impl Value {
     pub fn unbox(&mut self) {
         if let Value::Box(boxed) = self {
             if boxed.rank() == 0 {
-                *self = take(boxed).data.into_iter().next().unwrap().0;
+                *self = boxed.data.modify(|data| data.remove(0)).0;
             }
         }
     }
@@ -1409,7 +1417,7 @@ macro_rules! value_un_impl {
 }
 
 value_un_impl!(
-    neg,
+    scalar_neg,
     [Num, num],
     ("bytes", Byte, byte),
     [Complex, com],
@@ -1423,7 +1431,7 @@ value_un_impl!(
     [Complex, com]
 );
 value_un_impl!(
-    abs,
+    scalar_abs,
     [Num, num],
     ("bytes", Byte, byte),
     (Complex, com),
@@ -1462,6 +1470,73 @@ value_un_impl!(
     ["bytes", Byte, byte],
     (Complex, com)
 );
+
+impl Value {
+    /// Get the `absolute value` of a value
+    pub fn abs(self, env: &Uiua) -> UiuaResult<Self> {
+        match self {
+            Value::Char(mut chars) if chars.rank() == 1 && env.char_fill().is_ok() => {
+                chars.data = (chars.data.into_iter())
+                    .flat_map(|c| c.to_uppercase())
+                    .collect();
+                chars.shape = chars.data.len().into();
+                Ok(chars.into())
+            }
+            Value::Char(chars) if chars.rank() > 1 && env.char_fill().is_ok() => {
+                let mut rows = Vec::new();
+                for row in chars.row_shaped_slices(Shape::from(*chars.shape.last().unwrap())) {
+                    rows.push(Array::<char>::from_iter(
+                        row.data().iter().flat_map(|c| c.to_uppercase()),
+                    ));
+                }
+                let mut arr = Array::from_row_arrays(rows, env)?;
+                let last = arr.shape.pop().unwrap();
+                arr.shape = chars.shape;
+                *arr.shape.last_mut().unwrap() = last;
+                Ok(arr.into())
+            }
+            value => value.scalar_abs(env),
+        }
+    }
+    /// `negate` a value
+    pub fn neg(self, env: &Uiua) -> UiuaResult<Self> {
+        match self {
+            Value::Char(mut chars) if chars.rank() == 1 && env.char_fill().is_ok() => {
+                let mut new_data = EcoVec::with_capacity(chars.data.len());
+                for c in chars.data {
+                    if c.is_uppercase() {
+                        new_data.extend(c.to_lowercase());
+                    } else {
+                        new_data.extend(c.to_uppercase());
+                    }
+                }
+                chars.data = new_data.into();
+                chars.shape = chars.data.len().into();
+                Ok(chars.into())
+            }
+            Value::Char(chars) if chars.rank() > 1 && env.char_fill().is_ok() => {
+                let mut rows = Vec::new();
+                for row in chars.row_shaped_slices(Shape::from(*chars.shape.last().unwrap())) {
+                    let mut new_data = EcoVec::with_capacity(row.data().len());
+                    for c in row.data() {
+                        if c.is_uppercase() {
+                            new_data.extend(c.to_lowercase());
+                        } else {
+                            new_data.extend(c.to_uppercase());
+                        }
+                    }
+                    rows.push(Array::from(new_data));
+                }
+                let mut arr = Array::from_row_arrays(rows, env)?;
+                let last = arr.shape.pop().unwrap();
+                arr.shape = chars.shape;
+                *arr.shape.last_mut().unwrap() = last;
+                Ok(arr.into())
+            }
+            value => value.scalar_neg(env),
+        }
+    }
+}
 
 macro_rules! val_retry {
     (Byte, $env:expr) => {
@@ -1850,18 +1925,22 @@ impl ValueBuilder {
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
-enum MapNumRep {
+enum F64Rep {
     #[serde(rename = "NaN")]
     NaN,
     #[serde(rename = "empty")]
     MapEmpty,
     #[serde(rename = "tomb")]
     MapTombstone,
+    #[serde(rename = "∞")]
+    Infinity,
+    #[serde(rename = "-∞")]
+    NegInfinity,
     #[serde(untagged)]
     Num(f64),
 }
 
-impl From<f64> for MapNumRep {
+impl From<f64> for F64Rep {
     fn from(n: f64) -> Self {
         if n.is_nan() {
             if n.to_bits() == EMPTY_NAN.to_bits() {
@@ -1871,19 +1950,27 @@ impl From<f64> for MapNumRep {
             } else {
                 Self::NaN
             }
+        } else if n.is_infinite() {
+            if n.is_sign_positive() {
+                Self::Infinity
+            } else {
+                Self::NegInfinity
+            }
         } else {
             Self::Num(n)
         }
     }
 }
 
-impl From<MapNumRep> for f64 {
-    fn from(rep: MapNumRep) -> Self {
+impl From<F64Rep> for f64 {
+    fn from(rep: F64Rep) -> Self {
         match rep {
-            MapNumRep::NaN => f64::NAN,
-            MapNumRep::MapEmpty => EMPTY_NAN,
-            MapNumRep::MapTombstone => TOMBSTONE_NAN,
-            MapNumRep::Num(n) => n,
+            F64Rep::NaN => f64::NAN,
+            F64Rep::MapEmpty => EMPTY_NAN,
+            F64Rep::MapTombstone => TOMBSTONE_NAN,
+            F64Rep::Infinity => f64::INFINITY,
+            F64Rep::NegInfinity => f64::NEG_INFINITY,
+            F64Rep::Num(n) => n,
         }
     }
 }
@@ -1893,7 +1980,7 @@ impl From<MapNumRep> for f64 {
 enum ValueRep {
     #[cfg(feature = "bytes")]
     Byte(Array<u8>),
-    Num(Array<MapNumRep>),
+    Num(Array<F64Rep>),
     Complex(Array<Complex>),
     Char {
         #[serde(rename = "s", default, skip_serializing_if = "<[_]>::is_empty")]
@@ -1935,7 +2022,7 @@ impl From<Value> for ValueRep {
         match value {
             #[cfg(feature = "bytes")]
             Value::Byte(arr) => Self::Byte(arr),
-            Value::Num(arr) => Self::Num(arr.convert_with(MapNumRep::from)),
+            Value::Num(arr) => Self::Num(arr.convert_with(F64Rep::from)),
             Value::Complex(arr) => Self::Complex(arr),
             Value::Char(arr) => Self::Char {
                 shape: arr.shape().clone(),

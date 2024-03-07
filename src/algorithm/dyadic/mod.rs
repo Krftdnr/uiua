@@ -185,7 +185,7 @@ impl Value {
         }
         Ok(())
     }
-    pub(crate) fn unreshape(&mut self, old_shape: &Self, env: &Uiua) -> UiuaResult {
+    pub(crate) fn undo_reshape(&mut self, old_shape: &Self, env: &Uiua) -> UiuaResult {
         if old_shape.as_nat(env, "").is_ok() {
             return Err(env.error("Cannot undo scalar reshae"));
         }
@@ -207,6 +207,7 @@ impl Value {
 impl<T: Clone> Array<T> {
     /// `reshape` this array by replicating it as the rows of a new array
     pub fn reshape_scalar(&mut self, count: Result<isize, bool>) {
+        self.take_map_keys();
         match count {
             Ok(count) => {
                 if count == 0 {
@@ -239,6 +240,13 @@ impl<T: ArrayValue> Array<T> {
     pub fn reshape(&mut self, dims: &[Result<isize, bool>], env: &Uiua) -> UiuaResult {
         let fill = env.scalar_fill::<T>();
         let axes = derive_shape(&self.shape, dims, fill.is_ok(), env)?;
+        if self.is_map()
+            && axes
+                .first()
+                .map_or(true, |&d| d.unsigned_abs() != self.row_count())
+        {
+            return Ok(());
+        }
         let reversed_axes: Vec<usize> = axes
             .iter()
             .enumerate()
@@ -359,6 +367,9 @@ fn derive_shape(
 impl Value {
     /// `rerank` this value with another
     pub fn rerank(&mut self, rank: &Self, env: &Uiua) -> UiuaResult {
+        if self.is_map() {
+            return Ok(());
+        }
         let irank = rank.as_int(env, "Rank must be a natural number")?;
         let shape = self.shape_mut();
         let rank = irank.unsigned_abs();
@@ -384,22 +395,21 @@ impl Value {
                     rank,
                     shape.len()
                 )));
-            } else {
-                let new_first_dim: usize = shape[..rank].iter().product();
-                *shape = once(new_first_dim)
-                    .chain(shape[rank..].iter().copied())
-                    .collect();
             }
+            let new_first_dim: usize = shape[..rank].iter().product();
+            *shape = once(new_first_dim)
+                .chain(shape[rank..].iter().copied())
+                .collect();
         }
         self.validate_shape();
         Ok(())
     }
-    pub(crate) fn unrerank(&mut self, rank: &Self, orig_shape: &Self, env: &Uiua) -> UiuaResult {
+    pub(crate) fn undo_rerank(&mut self, rank: &Self, orig_shape: &Self, env: &Uiua) -> UiuaResult {
         if self.rank() == 0 {
             if let Value::Box(arr) = self {
                 arr.data.as_mut_slice()[0]
                     .0
-                    .unrerank(rank, orig_shape, env)?;
+                    .undo_rerank(rank, orig_shape, env)?;
             }
             return Ok(());
         }
@@ -464,7 +474,7 @@ impl Value {
             }
         })
     }
-    pub(crate) fn unkeep(self, kept: Self, into: Self, env: &Uiua) -> UiuaResult<Self> {
+    pub(crate) fn undo_keep(self, kept: Self, into: Self, env: &Uiua) -> UiuaResult<Self> {
         let counts = self.as_nats(
             env,
             "Keep amount must be a natural number \
@@ -1143,6 +1153,10 @@ impl<T: ArrayValue> Array<T> {
     /// Check which rows of this array are `member`s of another
     pub fn member(&self, of: &Self, env: &Uiua) -> UiuaResult<Array<u8>> {
         let elems = self;
+        if elems.rank() == 0 {
+            let elem = &elems.data[0];
+            return Ok(of.data.iter().any(|of| elem.array_eq(of)).into());
+        }
         let mut arr = match elems.rank().cmp(&of.rank()) {
             Ordering::Equal => {
                 let mut result_data = EcoVec::with_capacity(elems.row_count());
@@ -1165,12 +1179,7 @@ impl<T: ArrayValue> Array<T> {
             }
             Ordering::Less => {
                 if of.rank() - elems.rank() == 1 {
-                    if elems.rank() == 0 {
-                        let elem = &elems.data[0];
-                        Array::from(of.data.iter().any(|of| elem.array_eq(of)) as u8)
-                    } else {
-                        of.rows().any(|r| *elems == r).into()
-                    }
+                    of.rows().any(|r| *elems == r).into()
                 } else {
                     let mut rows = Vec::with_capacity(of.row_count());
                     for of in of.rows() {
@@ -1246,6 +1255,16 @@ impl<T: ArrayValue> Array<T> {
     /// Get the `index of` the rows of this array in another
     pub fn index_of(&self, searched_in: &Array<T>, env: &Uiua) -> UiuaResult<Array<f64>> {
         let searched_for = self;
+        if searched_for.rank() == 0 {
+            let searched_for = &searched_for.data[0];
+            return Ok(Array::from(
+                searched_in
+                    .data
+                    .iter()
+                    .position(|of| searched_for.array_eq(of))
+                    .unwrap_or(searched_in.row_count()) as f64,
+            ));
+        }
         Ok(match searched_for.rank().cmp(&searched_in.rank()) {
             Ordering::Equal => {
                 let mut result_data = EcoVec::with_capacity(searched_for.row_count());
@@ -1273,26 +1292,14 @@ impl<T: ArrayValue> Array<T> {
             }
             Ordering::Less => {
                 if searched_in.rank() - searched_for.rank() == 1 {
-                    if searched_for.rank() == 0 {
-                        let searched_for = &searched_for.data[0];
-                        Array::from(
-                            searched_in
-                                .data
-                                .iter()
-                                .position(|of| searched_for.array_eq(of))
-                                .unwrap_or(searched_in.row_count())
-                                as f64,
-                        )
-                    } else {
-                        (searched_in
-                            .row_slices()
-                            .position(|r| {
-                                r.len() == searched_for.data.len()
-                                    && r.iter().zip(&searched_for.data).all(|(a, b)| a.array_eq(b))
-                            })
-                            .unwrap_or(searched_in.row_count()) as f64)
-                            .into()
-                    }
+                    (searched_in
+                        .row_slices()
+                        .position(|r| {
+                            r.len() == searched_for.data.len()
+                                && r.iter().zip(&searched_for.data).all(|(a, b)| a.array_eq(b))
+                        })
+                        .unwrap_or(searched_in.row_count()) as f64)
+                        .into()
                 } else {
                     let mut rows = Vec::with_capacity(searched_in.row_count());
                     for of in searched_in.rows() {

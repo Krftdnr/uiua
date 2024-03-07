@@ -252,7 +252,7 @@ impl Compiler {
                                     formatted = formatted[1..formatted.len() - 1].to_string();
                                 }
                             }
-                            Boxed(formatted.into())
+                            Boxed(formatted.trim().into())
                         })
                         .collect();
 
@@ -451,10 +451,18 @@ impl Compiler {
                     On => {
                         instrs.insert(
                             0,
-                            Instr::CopyToTemp {
-                                stack: TempStack::Inline,
-                                count: 1,
-                                span,
+                            if sig.args == 0 {
+                                Instr::PushTemp {
+                                    stack: TempStack::Inline,
+                                    count: 1,
+                                    span,
+                                }
+                            } else {
+                                Instr::CopyToTemp {
+                                    stack: TempStack::Inline,
+                                    count: 1,
+                                    span,
+                                }
                             },
                         );
                         instrs.push(Instr::PopTemp {
@@ -462,7 +470,7 @@ impl Compiler {
                             count: 1,
                             span,
                         });
-                        Signature::new(sig.args, sig.outputs + 1)
+                        Signature::new(sig.args.max(1), sig.outputs + 1)
                     }
                     By => {
                         if sig.args > 0 {
@@ -730,37 +738,44 @@ impl Compiler {
                 }
             }
             Both => {
-                let mut operands = modified.code_operands().cloned();
-                let (mut instrs, sig) = self.compile_operand_word(operands.next().unwrap())?;
-                let span = self.add_span(modified.modifier.span.clone());
-                instrs.insert(
-                    0,
-                    Instr::PushTemp {
+                let operand = modified.code_operands().next().unwrap().clone();
+                let (mut instrs, sig) = self.compile_operand_word(operand)?;
+                if let [Instr::Prim(Trace, span)] = instrs.as_slice() {
+                    finish!(
+                        [Instr::ImplPrim(ImplPrimitive::BothTrace, *span)],
+                        Signature::new(2, 2)
+                    )
+                } else {
+                    let span = self.add_span(modified.modifier.span.clone());
+                    instrs.insert(
+                        0,
+                        Instr::PushTemp {
+                            stack: TempStack::Inline,
+                            count: sig.args,
+                            span,
+                        },
+                    );
+                    instrs.push(Instr::PopTemp {
                         stack: TempStack::Inline,
                         count: sig.args,
                         span,
-                    },
-                );
-                instrs.push(Instr::PopTemp {
-                    stack: TempStack::Inline,
-                    count: sig.args,
-                    span,
-                });
-                for i in 1..instrs.len() - 1 {
-                    instrs.push(instrs[i].clone());
-                }
-                let sig = Signature::new(sig.args * 2, sig.outputs * 2);
-                if call {
-                    self.push_instr(Instr::PushSig(sig));
-                    self.push_all_instrs(instrs);
-                    self.push_instr(Instr::PopSig);
-                } else {
-                    let func = self.add_function(
-                        FunctionId::Anonymous(modified.modifier.span.clone()),
-                        sig,
-                        instrs,
-                    );
-                    self.push_instr(Instr::PushFunc(func));
+                    });
+                    for i in 1..instrs.len() - 1 {
+                        instrs.push(instrs[i].clone());
+                    }
+                    let sig = Signature::new(sig.args * 2, sig.outputs * 2);
+                    if call {
+                        self.push_instr(Instr::PushSig(sig));
+                        self.push_all_instrs(instrs);
+                        self.push_instr(Instr::PopSig);
+                    } else {
+                        let func = self.add_function(
+                            FunctionId::Anonymous(modified.modifier.span.clone()),
+                            sig,
+                            instrs,
+                        );
+                        self.push_instr(Instr::PushFunc(func));
+                    }
                 }
             }
             Bind => {

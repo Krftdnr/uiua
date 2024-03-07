@@ -43,6 +43,7 @@ fn prim_inverse(prim: Primitive, span: usize) -> Option<Instr> {
         Sys(SysOp::ImEncode) => Instr::Prim(Sys(SysOp::ImDecode), span),
         Sys(SysOp::ClipboardSet) => Instr::Prim(Sys(SysOp::ClipboardGet), span),
         Sys(SysOp::ClipboardGet) => Instr::Prim(Sys(SysOp::ClipboardSet), span),
+        Csv => Instr::ImplPrim(InvCsv, span),
         _ => return None,
     })
 }
@@ -67,6 +68,9 @@ fn impl_prim_inverse(prim: ImplPrimitive, span: usize) -> Option<Instr> {
         InvStack => Instr::Prim(Stack, span),
         InvBox => Instr::Prim(Box, span),
         InvJoin => Instr::Prim(Join, span),
+        InvCsv => Instr::Prim(Csv, span),
+        BothTrace => Instr::ImplPrim(InvBothTrace, span),
+        InvBothTrace => Instr::ImplPrim(BothTrace, span),
         _ => return None,
     })
 }
@@ -286,12 +290,12 @@ pub(crate) fn under_instrs(
         // Pop
         &pat!(Pop, (PushTempN(1)), (PopTempN(1))),
         // Array restructuring
-        &maybe_val!(stash2!(Take, Untake)),
-        &maybe_val!(stash2!(Drop, Undrop)),
+        &maybe_val!(stash2!(Take, UndoTake)),
+        &maybe_val!(stash2!(Drop, UndoDrop)),
         &maybe_val!(pat!(
             Keep,
             (CopyToTempN(2), Keep),
-            (PopTempN(1), Flip, PopTempN(1), Unkeep),
+            (PopTempN(1), Flip, PopTempN(1), UndoKeep),
         )),
         &stash1!(Rotate, (Neg, Rotate)),
         &maybe_val!(pat!(
@@ -316,21 +320,21 @@ pub(crate) fn under_instrs(
             (PopTempN(1), Flip, Keep)
         )),
         // Value retrieval
-        &stash1!(First, Unfirst),
-        &stash1!(Last, Unlast),
-        &maybe_val!(stash2!(Pick, Unpick)),
-        &maybe_val!(stash2!(Select, Unselect)),
+        &stash1!(First, UndoFirst),
+        &stash1!(Last, UndoLast),
+        &maybe_val!(stash2!(Pick, UndoPick)),
+        &maybe_val!(stash2!(Select, UndoSelect)),
         // Map control
         &maybe_val!(pat!(
             Get,
             (CopyToTempN(2), Get),
             (PopTempN(1), Flip, PopTempN(1), Insert),
         )),
-        &maybe_val!(stash2!(Remove, Unremove)),
+        &maybe_val!(stash2!(Remove, UndoRemove)),
         &maybe_val!(pat!(
             Insert,
             (CopyToTempN(3), Insert),
-            (PopTempN(3), Uninsert)
+            (PopTempN(3), UndoInsert)
         )),
         // Shaping
         &stash1!(Shape, (Flip, Reshape)),
@@ -369,6 +373,7 @@ pub(crate) fn under_instrs(
         &store1copy!(Sys(SysOp::TcpAccept), Sys(SysOp::Close)),
         &maybe_val!(stash1!(Sys(SysOp::FReadAllStr), Sys(SysOp::FWriteAll))),
         &maybe_val!(stash1!(Sys(SysOp::FReadAllBytes), Sys(SysOp::FWriteAll))),
+        &pat!(BothTrace, (BothTrace), (InvTrace)),
         // Patterns that need to be last
         &UnderPatternFn(under_flip_pattern, "flip"),
         &UnderPatternFn(under_push_temp_pattern, "push temp"),

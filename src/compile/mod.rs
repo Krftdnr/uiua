@@ -74,6 +74,8 @@ pub struct Compiler {
     print_diagnostics: bool,
     /// Whether to evaluate comptime code
     comptime: bool,
+    /// The comptime mode
+    pre_eval_mode: PreEvalMode,
     /// The interpreter used for comptime code
     macro_env: Uiua,
 }
@@ -101,6 +103,7 @@ impl Default for Compiler {
             diagnostics: BTreeSet::new(),
             print_diagnostics: false,
             comptime: true,
+            pre_eval_mode: PreEvalMode::default(),
             macro_env: Uiua::default(),
         }
     }
@@ -169,6 +172,32 @@ pub(crate) struct LocalName {
     pub public: bool,
 }
 
+/// The mode that dictates how much code to pre-evaluate at compile time
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreEvalMode {
+    /// The normal mode. Tries to evaluate pure, time-bounded constants and expressions at comptime
+    #[default]
+    Normal,
+    /// Does not evalute pure constants and expressions at comptime, but still evaluates `comptime`
+    Lazy,
+    /// Evaluate as much as possible at compile time, even impure expressions
+    ///
+    /// Recursive functions and certain system functions are not evaluated
+    Lsp,
+}
+
+impl PreEvalMode {
+    fn matches_instrs(&self, instrs: &[Instr], asm: &Assembly) -> bool {
+        match self {
+            PreEvalMode::Normal => {
+                instrs_are_pure(instrs, asm) && instrs_are_limit_bounded(instrs, asm)
+            }
+            PreEvalMode::Lazy => false,
+            PreEvalMode::Lsp => instrs_are_limit_bounded(instrs, asm),
+        }
+    }
+}
+
 impl Compiler {
     /// Create a new compiler
     pub fn new() -> Self {
@@ -197,9 +226,14 @@ impl Compiler {
     pub fn finish(&mut self) -> Assembly {
         take(&mut self.asm)
     }
-    /// Set whether to evaluate comptime code
+    /// Set whether to evaluate `comptime`
     pub fn comptime(&mut self, comptime: bool) -> &mut Self {
         self.comptime = comptime;
+        self
+    }
+    /// Set the [`PreEvalMode`]
+    pub fn pre_eval_mode(&mut self, mode: PreEvalMode) -> &mut Self {
+        self.pre_eval_mode = mode;
         self
     }
     /// Set whether to print diagnostics as they are encountered
@@ -390,98 +424,12 @@ code:
             })
         }
         let prev_com = prev_comment.take();
-        match item {
+        let mut lines = match item {
             Item::TestScope(items) => {
                 self.in_scope(|env| env.items(items.value, true))?;
+                return Ok(());
             }
-            Item::Words(mut lines) => {
-                if lines.iter().flatten().all(|w| !w.value.is_code()) {
-                    let mut comment = String::new();
-                    for (i, line) in lines.iter().enumerate() {
-                        if line.is_empty() {
-                            comment.clear();
-                            continue;
-                        }
-                        if i > 0 {
-                            comment.push('\n');
-                        }
-                        for word in line {
-                            if let Word::Comment(c) = &word.value {
-                                comment.push_str(c);
-                            }
-                        }
-                    }
-                    *prev_comment = if comment.trim().is_empty() {
-                        None
-                    } else {
-                        Some(comment.trim().into())
-                    };
-                };
-                let can_run = match self.mode {
-                    RunMode::Normal => !in_test,
-                    RunMode::Test => in_test,
-                    RunMode::All => true,
-                };
-                lines = unsplit_words(lines.into_iter().flat_map(split_words));
-                for line in lines {
-                    if line.is_empty() {
-                        continue;
-                    }
-                    if can_run || words_should_run_anyway(&line) {
-                        let span = (line.first().unwrap().span.clone())
-                            .merge(line.last().unwrap().span.clone());
-                        if count_placeholders(&line) > 0 {
-                            self.add_error(
-                                span.clone(),
-                                "Cannot use placeholder outside of function",
-                            );
-                        }
-                        let line_span = (line.first().unwrap().span.clone())
-                            .merge(line.last().unwrap().span.clone());
-                        let all_literal = line.iter().filter(|w| w.value.is_code()).all(|w| {
-                            matches!(
-                                w.value,
-                                Word::Char(_)
-                                    | Word::Number(..)
-                                    | Word::String(_)
-                                    | Word::MultilineString(_)
-                            )
-                        });
-                        // Compile the words
-                        let mut instrs = self.compile_words(line, true)?;
-                        match instrs_signature(&instrs) {
-                            Ok(sig) => {
-                                // Update scope stack height
-                                if let Ok(height) = &mut self.scope.stack_height {
-                                    *height = (*height + sig.outputs).saturating_sub(sig.args);
-                                }
-                                // Try to evaluate at comptime
-                                if sig.args == 0 && instrs_are_pure(&instrs, &self.asm) {
-                                    match self.comptime_instrs(instrs.clone()) {
-                                        Ok(Some(vals)) => {
-                                            if !all_literal {
-                                                (self.code_meta.top_level_values)
-                                                    .insert(line_span, vals.clone());
-                                            }
-                                            instrs = vals.into_iter().map(Instr::push).collect();
-                                        }
-                                        Ok(None) => {}
-                                        Err(e) => self.errors.push(e),
-                                    }
-                                }
-                            }
-                            Err(e) => self.scope.stack_height = Err(span.sp(e)),
-                        }
-                        let start = self.asm.instrs.len();
-                        (self.asm.instrs).extend(optimize_instrs(instrs, true, &self.asm));
-                        let end = self.asm.instrs.len();
-                        self.asm.top_slices.push(FuncSlice {
-                            start,
-                            len: end - start,
-                        });
-                    }
-                }
-            }
+            Item::Words(lines) => lines,
             Item::Binding(binding) => {
                 let can_run = match self.mode {
                     RunMode::Normal => !in_test,
@@ -490,8 +438,120 @@ code:
                 if can_run || words_should_run_anyway(&binding.words) {
                     self.binding(binding, prev_com)?;
                 }
+                return Ok(());
             }
-            Item::Import(import) => self.import(import, prev_com)?,
+            Item::Import(import) => return self.import(import, prev_com),
+        };
+
+        // Compile top-level words
+        if lines.iter().flatten().all(|w| !w.value.is_code()) {
+            let mut comment = String::new();
+            for (i, line) in lines.iter().enumerate() {
+                if line.is_empty() {
+                    comment.clear();
+                    continue;
+                }
+                if i > 0 {
+                    comment.push('\n');
+                }
+                for word in line {
+                    if let Word::Comment(c) = &word.value {
+                        comment.push_str(c);
+                    }
+                }
+            }
+            *prev_comment = if comment.trim().is_empty() {
+                None
+            } else {
+                Some(comment.trim().into())
+            };
+        };
+        let can_run = match self.mode {
+            RunMode::Normal => !in_test,
+            RunMode::Test => in_test,
+            RunMode::All => true,
+        };
+        lines = unsplit_words(lines.into_iter().flat_map(split_words));
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            if !(can_run || words_should_run_anyway(&line)) {
+                continue;
+            }
+            let span =
+                (line.first().unwrap().span.clone()).merge(line.last().unwrap().span.clone());
+            if count_placeholders(&line) > 0 {
+                self.add_error(span.clone(), "Cannot use placeholder outside of function");
+            }
+            let all_literal = line.iter().filter(|w| w.value.is_code()).all(|w| {
+                matches!(
+                    w.value,
+                    Word::Char(_) | Word::Number(..) | Word::String(_) | Word::MultilineString(_)
+                )
+            });
+            // Compile the words
+            let instr_count_before = self.asm.instrs.len();
+            let mut instrs = self.compile_words(line, true)?;
+            match instrs_signature(&instrs) {
+                Ok(sig) => {
+                    // Update scope stack height
+                    if let Ok(height) = &mut self.scope.stack_height {
+                        *height = (*height + sig.outputs).saturating_sub(sig.args);
+                    }
+                    // Try to evaluate at comptime
+                    // This can be done when there are at least as many push instructions
+                    // preceding the current line as there are arguments to the line
+                    if instr_count_before >= sig.args
+                        && (self.asm.instrs.iter().take(instr_count_before).rev())
+                            .take(sig.args)
+                            .all(|instr| matches!(instr, Instr::Push(_)))
+                    {
+                        // The instructions for evaluation are the preceding push
+                        // instructions, followed by the current line
+                        let mut comp_instrs = EcoVec::from(
+                            &self.asm.instrs
+                                [instr_count_before.saturating_sub(sig.args)..instr_count_before],
+                        );
+                        comp_instrs.extend(instrs.iter().cloned());
+                        match self.comptime_instrs(comp_instrs) {
+                            Ok(Some(vals)) => {
+                                // Track top level values
+                                if !all_literal {
+                                    self.code_meta.top_level_values.insert(span, vals.clone());
+                                }
+                                // Truncate instrs
+                                self.asm.instrs.truncate(instr_count_before - sig.args);
+                                // Truncate top slices
+                                let mut remaining = sig.args;
+                                while let Some(slice) = self.asm.top_slices.last_mut() {
+                                    let to_sub = slice.len.min(remaining);
+                                    slice.len -= to_sub;
+                                    remaining -= to_sub;
+                                    if remaining == 0 {
+                                        break;
+                                    }
+                                    if slice.len == 0 {
+                                        self.asm.top_slices.pop();
+                                    }
+                                }
+                                // Set instrs
+                                instrs = vals.into_iter().map(Instr::push).collect();
+                            }
+                            Ok(None) => {}
+                            Err(e) => self.errors.push(e),
+                        }
+                    }
+                }
+                Err(e) => self.scope.stack_height = Err(span.sp(e)),
+            }
+            let start = self.asm.instrs.len();
+            (self.asm.instrs).extend(optimize_instrs(instrs, true, &self.asm));
+            let end = self.asm.instrs.len();
+            self.asm.top_slices.push(FuncSlice {
+                start,
+                len: end - start,
+            });
         }
         Ok(())
     }
@@ -667,7 +727,7 @@ code:
         let mut words = words
             .into_iter()
             .rev()
-            .filter(|word| word.value.is_code() || matches!(&word.value, Word::Comment(_)))
+            .filter(|word| word.value.is_code())
             .peekable();
         while let Some(word) = words.next() {
             if let Some(next) = words.peek() {
@@ -872,41 +932,21 @@ code:
                     .rev()
                     .map(|word| self.compile_operand_word(word))
                     .collect::<UiuaResult<Vec<_>>>()?;
-                let item_count = op_instrs.len();
                 // Check item sigs
-                let is_function_strand = op_instrs.iter().any(|(_, sig)| sig.args > 0);
+                let has_functions = op_instrs.iter().any(|(_, sig)| sig.args > 0);
+                if has_functions {
+                    return Err(self.fatal_error(
+                        word.span.clone(),
+                        "Functions are not allowed in strands. \n\
+                        You can use the ‿ character (which formats from __) \
+                        to make a function strand.",
+                    ));
+                }
                 // Flatten instrs
                 let inner: Vec<Instr> = op_instrs
                     .into_iter()
                     .flat_map(|(instrs, _)| instrs)
                     .collect();
-
-                // Function strand
-                if is_function_strand {
-                    if item_count > 2 {
-                        self.add_error(
-                            word.span.clone(),
-                            "Function strands cannot contain more than two items",
-                        );
-                    }
-                    if !self.scope.experimental && !self.experimental_function_strand_error {
-                        self.experimental_function_strand_error = true;
-                        self.add_error(
-                            word.span.clone(),
-                            "Function strands are experimental. To use them, add \
-                            `# Experimental!` to the top of the file.",
-                        );
-                    }
-                    let sig = instrs_signature(&inner).unwrap();
-                    if call {
-                        self.push_all_instrs(inner);
-                    } else {
-                        let f =
-                            self.add_function(FunctionId::Anonymous(word.span.clone()), sig, inner);
-                        self.push_instr(Instr::PushFunc(f));
-                    }
-                    return Ok(());
-                }
 
                 // Normal strand
                 if !call {
@@ -1023,6 +1063,47 @@ code:
                     let sig = instrs_signature(&instrs).unwrap_or(Signature::new(0, 0));
                     let func = self.add_function(FunctionId::Anonymous(word.span), sig, instrs);
                     self.push_instr(Instr::PushFunc(func));
+                }
+            }
+            Word::Undertied(words) => {
+                if words.len() > 2 {
+                    self.add_error(
+                        word.span.clone(),
+                        "Function strands cannot contain more than two items",
+                    );
+                }
+                if !self.scope.experimental && !self.experimental_function_strand_error {
+                    self.experimental_function_strand_error = true;
+                    self.add_error(
+                        word.span.clone(),
+                        "Function strands are experimental. To use them, add \
+                        `# Experimental!` to the top of the file.",
+                    );
+                }
+                let instrs = self.compile_words(words, true)?;
+                if call {
+                    self.push_all_instrs(instrs);
+                } else {
+                    match instrs_signature(&instrs) {
+                        Ok(sig) => {
+                            let func =
+                                self.add_function(FunctionId::Anonymous(word.span), sig, instrs);
+                            self.push_instr(Instr::PushFunc(func));
+                        }
+                        Err(e) => {
+                            return Err(self.fatal_error(
+                                word.span,
+                                format!(
+                                    "Cannot infer function signature: {e}{}",
+                                    if e.ambiguous {
+                                        ". A signature can be declared after the opening `(`."
+                                    } else {
+                                        ""
+                                    }
+                                ),
+                            ));
+                        }
+                    }
                 }
             }
             Word::Func(func) => self.func(func, word.span, call)?,
@@ -1604,13 +1685,15 @@ code:
     }
 
     fn comptime_instrs(&mut self, instrs: EcoVec<Instr>) -> UiuaResult<Option<Vec<Value>>> {
+        if !self.pre_eval_mode.matches_instrs(&instrs, &self.asm) {
+            return Ok(None);
+        }
         thread_local! {
             static CACHE: RefCell<HashMap<EcoVec<Instr>, Option<Vec<Value>>>> = RefCell::new(HashMap::new());
         }
         CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
             let instrs = optimize_instrs(instrs, true, &self.asm);
-            if let Some(stack) = cache.get(&instrs) {
+            if let Some(stack) = cache.borrow().get(&instrs) {
                 return Ok(stack.clone());
             }
             let mut asm = self.asm.clone();
@@ -1619,7 +1702,17 @@ code:
             let len = instrs.len();
             asm.instrs.extend(instrs.iter().cloned());
             asm.top_slices.push(FuncSlice { start, len });
-            let mut env = Uiua::with_safe_sys().with_execution_limit(Duration::from_millis(40));
+            let mut env = if self.pre_eval_mode == PreEvalMode::Lsp {
+                #[cfg(feature = "native_sys")]
+                {
+                    Uiua::with_native_sys()
+                }
+                #[cfg(not(feature = "native_sys"))]
+                Uiua::with_safe_sys()
+            } else {
+                Uiua::with_safe_sys()
+            }
+            .with_execution_limit(Duration::from_millis(40));
             match env.run_asm(asm) {
                 Ok(()) => {
                     let stack = env.take_stack();
@@ -1628,11 +1721,11 @@ code:
                     } else {
                         Some(stack)
                     };
-                    cache.insert(instrs, res.clone());
+                    cache.borrow_mut().insert(instrs, res.clone());
                     Ok(res)
                 }
                 Err(e) if matches!(e.inner(), UiuaError::Timeout(..)) => {
-                    cache.insert(instrs, None);
+                    cache.borrow_mut().insert(instrs, None);
                     Ok(None)
                 }
                 Err(e) => Err(e),

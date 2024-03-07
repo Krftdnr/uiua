@@ -6,7 +6,8 @@ use ecow::{eco_vec, EcoVec};
 
 use crate::{
     algorithm::pervade::bin_pervade_generic, function::Function, random, value::Value, Array,
-    ArrayValue, Boxed, Complex, ImplPrimitive, Instr, Primitive, Shape, Uiua, UiuaResult,
+    ArrayValue, Boxed, Complex, ImplPrimitive, Instr, PersistentMeta, Primitive, Shape, Uiua,
+    UiuaResult,
 };
 
 use super::{fill_value_shapes, multi_output, FillContext, MultiOutput};
@@ -165,7 +166,7 @@ pub fn each(env: &mut Uiua) -> UiuaResult {
     let f = env.pop_function()?;
     let sig = f.signature();
     match sig.args {
-        0 => Ok(()),
+        0 => env.call(f),
         1 => each1(f, env.pop(1)?, env),
         2 => each2(f, env.pop(1)?, env.pop(2)?, env),
         n => {
@@ -178,7 +179,7 @@ pub fn each(env: &mut Uiua) -> UiuaResult {
     }
 }
 
-fn each1(f: Function, xs: Value, env: &mut Uiua) -> UiuaResult {
+fn each1(f: Function, mut xs: Value, env: &mut Uiua) -> UiuaResult {
     if let Some((f, ..)) = f_mon_fast_fn(&f, env) {
         let maybe_through_boxes = matches!(&xs, Value::Box(..));
         if !maybe_through_boxes {
@@ -189,9 +190,11 @@ fn each1(f: Function, xs: Value, env: &mut Uiua) -> UiuaResult {
         }
     }
     let outputs = f.signature().outputs;
+    let is_scalar = xs.rank() == 0;
     let mut new_values = multi_output(outputs, Vec::with_capacity(xs.element_count()));
     let new_shape = xs.shape().clone();
     let is_empty = outputs > 0 && xs.row_count() == 0;
+    let per_meta = xs.take_per_meta();
     env.without_fill(|env| -> UiuaResult {
         if is_empty {
             env.push(xs.proxy_scalar(env));
@@ -213,11 +216,14 @@ fn each1(f: Function, xs: Value, env: &mut Uiua) -> UiuaResult {
     for new_values in new_values.into_iter().rev() {
         let mut new_shape = new_shape.clone();
         let mut eached = Value::from_row_values(new_values, env)?;
-        if is_empty {
+        if is_scalar {
+            eached.shape_mut().make_row();
+        } else if is_empty {
             eached.pop_row();
         }
         new_shape.extend_from_slice(&eached.shape()[1..]);
         *eached.shape_mut() = new_shape;
+        eached.set_per_meta(per_meta.clone());
         env.push(eached);
     }
     Ok(())
@@ -235,6 +241,7 @@ fn each2(f: Function, mut xs: Value, mut ys: Value, env: &mut Uiua) -> UiuaResul
         let mut xs_shape = xs.shape().to_vec();
         let mut ys_shape = ys.shape().to_vec();
         let is_empty = outputs > 0 && (xs.row_count() == 0 || ys.row_count() == 0);
+        let per_meta = xs.take_per_meta().xor(ys.take_per_meta());
         let (new_shape, new_values) = env.without_fill(|env| {
             if is_empty {
                 if let Some(r) = xs_shape.first_mut() {
@@ -298,6 +305,7 @@ fn each2(f: Function, mut xs: Value, mut ys: Value, env: &mut Uiua) -> UiuaResul
             }
             new_shape.extend_from_slice(&eached.shape()[1..]);
             *eached.shape_mut() = new_shape;
+            eached.set_per_meta(per_meta.clone());
             env.push(eached);
         }
     }
@@ -322,6 +330,7 @@ fn eachn(f: Function, mut args: Vec<Value>, env: &mut Uiua) -> UiuaResult {
         .max_by_key(|s| s.len())
         .unwrap()
         .clone();
+    let per_meta = PersistentMeta::xor_all(args.iter_mut().map(|v| v.take_per_meta()));
     env.without_fill(|env| -> UiuaResult {
         if is_empty {
             for arg in args.into_iter().rev() {
@@ -360,6 +369,7 @@ fn eachn(f: Function, mut args: Vec<Value>, env: &mut Uiua) -> UiuaResult {
         }
         new_shape.extend_from_slice(&eached.shape()[1..]);
         *eached.shape_mut() = new_shape;
+        eached.set_per_meta(per_meta.clone());
         env.push(eached);
     }
     Ok(())
@@ -370,7 +380,7 @@ pub fn rows(env: &mut Uiua) -> UiuaResult {
     let f = env.pop_function()?;
     let sig = f.signature();
     match sig.args {
-        0 => Ok(()),
+        0 => env.call(f),
         1 => rows1(f, env.pop(1)?, env),
         2 => rows2(f, env.pop(1)?, env.pop(2)?, env),
         n => {
@@ -383,7 +393,7 @@ pub fn rows(env: &mut Uiua) -> UiuaResult {
     }
 }
 
-pub fn rows1(f: Function, xs: Value, env: &mut Uiua) -> UiuaResult {
+pub fn rows1(f: Function, mut xs: Value, env: &mut Uiua) -> UiuaResult {
     if let Some((f, d)) = f_mon_fast_fn(&f, env) {
         let maybe_through_boxes = matches!(&xs, Value::Box(arr) if arr.rank() <= d + 1);
         if !maybe_through_boxes {
@@ -393,11 +403,13 @@ pub fn rows1(f: Function, xs: Value, env: &mut Uiua) -> UiuaResult {
         }
     }
     let outputs = f.signature().outputs;
+    let is_scalar = xs.rank() == 0;
     let is_empty = outputs > 0 && xs.row_count() == 0;
     let mut new_rows = multi_output(
         outputs,
         Vec::with_capacity(xs.row_count() + is_empty as usize),
     );
+    let per_meta = xs.take_per_meta();
     env.without_fill(|env| -> UiuaResult {
         if is_empty {
             env.push(xs.proxy_row(env));
@@ -418,9 +430,12 @@ pub fn rows1(f: Function, xs: Value, env: &mut Uiua) -> UiuaResult {
     })?;
     for new_rows in new_rows.into_iter().rev() {
         let mut val = Value::from_row_values(new_rows, env)?;
-        if is_empty {
+        if is_scalar {
+            val.shape_mut().make_row();
+        } else if is_empty {
             val.pop_row();
         }
+        val.set_per_meta(per_meta.clone());
         env.push(val);
     }
 
@@ -435,6 +450,7 @@ fn rows2(f: Function, mut xs: Value, mut ys: Value, env: &mut Uiua) -> UiuaResul
             ys.shape_mut().make_row();
             let is_empty = outputs > 0 && xs.row_count() == 0;
             let mut new_rows = multi_output(outputs, Vec::with_capacity(xs.row_count()));
+            let per_meta = xs.take_per_meta();
             env.without_fill(|env| -> UiuaResult {
                 if is_empty {
                     env.push(ys.proxy_row(env));
@@ -462,6 +478,7 @@ fn rows2(f: Function, mut xs: Value, mut ys: Value, env: &mut Uiua) -> UiuaResul
                 } else if is_empty {
                     val.pop_row();
                 }
+                val.set_per_meta(per_meta.clone());
                 env.push(val);
             }
             Ok(())
@@ -470,6 +487,7 @@ fn rows2(f: Function, mut xs: Value, mut ys: Value, env: &mut Uiua) -> UiuaResul
             xs.shape_mut().make_row();
             let is_empty = outputs > 0 && ys.row_count() == 0;
             let mut new_rows = multi_output(outputs, Vec::with_capacity(ys.row_count()));
+            let per_meta = ys.take_per_meta();
             env.without_fill(|env| -> UiuaResult {
                 if is_empty {
                     env.push(ys.proxy_row(env));
@@ -497,6 +515,7 @@ fn rows2(f: Function, mut xs: Value, mut ys: Value, env: &mut Uiua) -> UiuaResul
                 } else if is_empty {
                     val.pop_row();
                 }
+                val.set_per_meta(per_meta.clone());
                 env.push(val);
             }
             Ok(())
@@ -523,6 +542,7 @@ fn rows2(f: Function, mut xs: Value, mut ys: Value, env: &mut Uiua) -> UiuaResul
                 outputs,
                 Vec::with_capacity(xs.row_count() + is_empty as usize),
             );
+            let per_meta = xs.take_per_meta().xor(ys.take_per_meta());
             env.without_fill(|env| -> UiuaResult {
                 if is_empty {
                     env.push(ys.proxy_row(env));
@@ -550,6 +570,7 @@ fn rows2(f: Function, mut xs: Value, mut ys: Value, env: &mut Uiua) -> UiuaResul
                 } else if is_empty {
                     val.pop_row();
                 }
+                val.set_per_meta(per_meta.clone());
                 env.push(val);
             }
             Ok(())
@@ -593,6 +614,7 @@ fn rowsn(f: Function, mut args: Vec<Value>, env: &mut Uiua) -> UiuaResult {
     let mut all_1 = true;
     let outputs = f.signature().outputs;
     let is_empty = outputs > 0 && args.iter().any(|v| v.row_count() == 0);
+    let mut per_meta = Vec::new();
     let mut arg_elems: Vec<_> = args
         .into_iter()
         .map(|mut v| {
@@ -604,6 +626,7 @@ fn rowsn(f: Function, mut args: Vec<Value>, env: &mut Uiua) -> UiuaResult {
                 let proxy = is_empty.then(|| v.proxy_row(env));
                 row_count = row_count.max(v.row_count());
                 all_1 = false;
+                per_meta.push(v.take_per_meta());
                 Ok(v.into_rows().chain(proxy))
             }
         })
@@ -612,6 +635,7 @@ fn rowsn(f: Function, mut args: Vec<Value>, env: &mut Uiua) -> UiuaResult {
         row_count = 1;
     }
     let mut new_values = multi_output(outputs, Vec::new());
+    let per_meta = PersistentMeta::xor_all(per_meta);
     env.without_fill(|env| -> UiuaResult {
         for _ in 0..row_count + is_empty as usize {
             for arg in arg_elems.iter_mut().rev() {
@@ -635,6 +659,7 @@ fn rowsn(f: Function, mut args: Vec<Value>, env: &mut Uiua) -> UiuaResult {
             rowsed.pop_row();
         }
         rowsed.validate_shape();
+        rowsed.set_per_meta(per_meta.clone());
         env.push(rowsed);
     }
     Ok(())
@@ -645,6 +670,7 @@ pub fn inventory(env: &mut Uiua) -> UiuaResult {
     let f = env.pop_function()?;
     let sig = f.signature();
     match sig.args {
+        0 => env.call(f),
         1 => inventory1(f, env.pop(1)?, env),
         2 => invertory2(f, env.pop(1)?, env.pop(2)?, env),
         n => {

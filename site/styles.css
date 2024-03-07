@@ -455,7 +455,6 @@ input[type=number] {
     overflow-y: auto;
     display: flex;
     gap: 0.1em;
-    line-height: 1.09em;
 }
 
 .code-block {
@@ -472,8 +471,14 @@ input[type=number] {
     white-space: pre;
 }
 
+.code-line {
+    height: 1.25em;
+    padding: 0;
+    margin: 0;
+}
+
 .line-numbers {
-    width: 1.5em;
+    min-width: 1.5em;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -486,10 +491,6 @@ input[type=number] {
     .line-numbers {
         color: #bcc9ca;
     }
-}
-
-.code-line {
-    display: block;
 }
 
 .code-span {
@@ -521,21 +522,61 @@ input[type=number] {
 .output-frame {
     display: flex;
     justify-content: space-between;
+    min-height: 1.9em;
 }
 
-.output {
-    display: inline-block;
+.output-lines {
+    overflow-x: auto;
+}
+
+.output-diagnostics {
     white-space: pre-wrap;
     margin-left: 1.75em;
     padding: 0.3em 0;
     font-family: "Code Font", monospace;
-    overflow-wrap: break-word;
-    word-break: break-word;
+}
+
+.output-wrapper {
+    transform: rotateX(180deg);
+    overflow-x: auto;
+}
+
+.output {
+    white-space: pre;
+    margin-left: 1.85em;
+    padding: 0.4em 0;
+    font-family: "Code Font", monospace;
+    transform: rotateX(180deg);
+}
+
+.output:empty,
+.output-diagnostics:empty {
+    display: none;
 }
 
 .output-item,
 .output-report {
     font-family: inherit;
+}
+
+#code-buttons {
+    margin: 0.2em 0.2em 0.2em 0;
+    display: flex;
+    flex-wrap: nowrap;
+    right: 0;
+    max-height: 1.5em;
+}
+
+.code-button {
+    font-size: 0.9em;
+    margin: 0 0 0 0.2em;
+    height: auto;
+    text-align: center;
+    text-justify: center;
+}
+
+.important-button {
+    animation: fadeAnimation 2s infinite;
 }
 
 .output-report {
@@ -574,23 +615,6 @@ input[type=number] {
 .output-audio {
     border-radius: 0.5em;
     max-width: 50vw;
-}
-
-#code-buttons {
-    margin: 0.2em 0.2em 0.2em 0;
-    display: flex;
-    flex-wrap: nowrap;
-    height: 1.5em;
-}
-
-.code-button {
-    font-size: 0.9em;
-    margin: 0 0 0 0.2em;
-    height: auto;
-}
-
-.important-button {
-    animation: fadeAnimation 2s infinite;
 }
 
 #code-right-side {
@@ -1109,6 +1133,32 @@ a.clean {
             #800080 70%);
 }
 
+.aro {
+    background-image: linear-gradient(180deg,
+            #000000 36%,
+            #A9A9A9 36%,
+            #A9A9A9 47%,
+            #FFFFFF 47%,
+            #FFFFFF 58%,
+            #A7D379 58%,
+            #A7D379 69%,
+            #3DA542 69%);
+
+}
+
+.aroace {
+    background-image: linear-gradient(180deg,
+            #ef9007 36%,
+            #f6d317 36%,
+            #f6d317 47%,
+            #FFFFFF 47%,
+            #FFFFFF 58%,
+            #45bcee 58%,
+            #45bcee 69%,
+            #1e3f54 69%);
+
+}
+
 .nb {
     background-image: linear-gradient(180deg,
             #FCF434 30%,
@@ -1141,14 +1191,14 @@ a.clean {
 
 .lesbian {
     background-image: linear-gradient(180deg,
-                #d42c00 34%,
-                #fd9855 34%,
-                #fd9855 45%,
-                #FFFFFF 45%,
-                #FFFFFF 56%,
-                #d161a2 56%,
-                #d161a2 67%,
-                #a20161 67%);
+            #d42c00 34%,
+            #fd9855 34%,
+            #fd9855 45%,
+            #FFFFFF 45%,
+            #FFFFFF 56%,
+            #d161a2 56%,
+            #d161a2 67%,
+            #a20161 67%);
 }
 
 @media (prefers-color-scheme: light) {
@@ -1157,6 +1207,8 @@ a.clean {
     .bi,
     .pan,
     .ace,
+    .aro,
+    .aroace,
     .gay,
     .nb,
     .fluid,
@@ -1170,6 +1222,8 @@ a.clean {
     .bi,
     .nb,
     .ace,
+    .aro,
+    .aroace,
     .fluid {
         -webkit-text-stroke: 0.01em #fff8;
     }

@@ -12,10 +12,10 @@ use crate::{
     algorithm::invert::{invert_instrs, under_instrs},
     ast::{Item, Modifier, PlaceholderOp, Ref, RefComponent, Word},
     ident_modifier_args, instrs_are_pure,
-    lex::{CodeSpan, Loc, Sp},
+    lex::{CodeSpan, Sp},
     parse::parse,
-    Assembly, BindingInfo, Compiler, Global, Ident, InputSrc, Inputs, Primitive, SafeSys,
-    Signature, SysBackend, UiuaError, Value, CONSTANTS,
+    Assembly, BindingInfo, Compiler, Global, Ident, InputSrc, Inputs, PreEvalMode, Primitive,
+    SafeSys, Signature, SysBackend, UiuaError, Value, CONSTANTS,
 };
 
 /// Kinds of span in Uiua code, meant to be used in the language server or other IDE tools
@@ -126,6 +126,7 @@ struct Spanner {
 impl Spanner {
     fn new(src: InputSrc, input: &str, backend: impl SysBackend) -> Self {
         let mut compiler = Compiler::with_backend(backend);
+        compiler.pre_eval_mode(PreEvalMode::Lsp);
         let errors = match compiler.load_str_src(input, src) {
             Ok(_) => Vec::new(),
             Err(UiuaError::Multi(errors)) => errors,
@@ -278,28 +279,21 @@ impl Spanner {
                 }
                 Word::Ref(r) => spans.extend(self.ref_spans(r)),
                 Word::IncompleteRef(path) => spans.extend(self.ref_path_spans(path)),
-                Word::Strand(items) => {
-                    for (i, word) in items.iter().enumerate() {
-                        let item_spans = self.words_spans(slice::from_ref(word));
+                Word::Strand(items) | Word::Undertied(items) => {
+                    for i in 0..items.len() {
+                        let word = &items[i];
                         if i > 0 {
-                            if let Some(first_item) = item_spans.first() {
-                                let end = first_item.span.start;
-                                spans.push(
-                                    CodeSpan {
-                                        start: Loc {
-                                            char_pos: end.char_pos - 1,
-                                            byte_pos: end.byte_pos - 1,
-                                            col: end.col - 1,
-                                            ..end
-                                        },
-                                        end,
-                                        ..first_item.span.clone()
-                                    }
-                                    .sp(SpanKind::Strand),
-                                )
-                            }
+                            let prev = &items[i - 1];
+                            spans.push(
+                                CodeSpan {
+                                    start: prev.span.end,
+                                    end: word.span.start,
+                                    src: word.span.src.clone(),
+                                }
+                                .sp(SpanKind::Strand),
+                            );
                         }
-                        spans.extend(item_spans);
+                        spans.extend(self.words_spans(slice::from_ref(word)));
                     }
                 }
                 Word::Array(arr) => {
@@ -988,6 +982,8 @@ mod server {
             // Get ident
             let pos = params.text_document_position.position;
             let is_newline = params.ch == "\n";
+            let is_underscore = params.ch == "_";
+            let mut is_undertie = false;
             let line = if is_newline { pos.line - 1 } else { pos.line };
             let Some(line_str) = doc.input.lines().nth(line as usize) else {
                 return Ok(None);
@@ -1002,42 +998,42 @@ mod server {
                 .take_while(|&c| is_ident_char(c))
                 .collect::<String>();
             ident = ident.chars().rev().collect();
-            // Get prims
+            // Get formatted
             let mut start = col - ident.chars().count() as u32;
-            let prims = if ident.is_empty() {
-                let mut prims = Vec::new();
-                let mut ascii_prims: Vec<_> = Primitive::non_deprecated()
-                    .filter_map(|p| p.ascii().map(|a| (p, a.to_string())))
-                    .collect();
-                ascii_prims.sort_by_key(|(_, a)| a.len());
-                ascii_prims.reverse();
-                for (prim, ascii) in ascii_prims {
-                    if before.ends_with(&ascii) {
-                        prims.push(prim);
-                        start -= ascii.chars().count() as u32;
-                        break;
+            let mut formatted = String::new();
+            if ident.is_empty() {
+                if is_underscore && before.ends_with('_') {
+                    formatted.push('‿');
+                    start -= 1;
+                    is_undertie = true;
+                } else {
+                    let mut ascii_prims: Vec<_> = Primitive::non_deprecated()
+                        .filter_map(|p| p.ascii().map(|a| (p, a.to_string())))
+                        .collect();
+                    ascii_prims.sort_by_key(|(_, a)| a.len());
+                    ascii_prims.reverse();
+                    for (prim, ascii) in ascii_prims {
+                        if before.ends_with(&ascii) {
+                            formatted.push_str(&prim.to_string());
+                            start -= ascii.chars().count() as u32;
+                            break;
+                        }
                     }
                 }
-                if prims.is_empty() {
-                    return Ok(None);
+            } else if let Some(prims) = Primitive::from_format_name_multi(&ident) {
+                for (p, _) in prims {
+                    formatted.push_str(&p.to_string());
                 }
-                prims
-            } else {
-                match Primitive::from_format_name_multi(&ident) {
-                    Some(prims) => prims.into_iter().map(|(p, _)| p).collect(),
-                    None => return Ok(None),
-                }
-            };
-            let mut formatted = String::new();
-            for prim in prims {
-                formatted.push_str(&prim.to_string());
+            }
+            if formatted.is_empty() {
+                return Ok(None);
             }
 
             // Adjust range
             let mut end = pos;
             if params.ch.chars().all(|c| c.is_whitespace()) {
                 formatted.push_str(&params.ch);
-            } else {
+            } else if !is_undertie {
                 end.character -= 1;
             }
             let start = Position {
@@ -1404,7 +1400,6 @@ mod server {
         }
 
         async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
-            use serde_json::Value;
             let Some(doc) = self.docs.get(&params.text_document.uri) else {
                 return Ok(None);
             };
@@ -1426,13 +1421,13 @@ mod server {
                 )
                 .await
                 .unwrap_or_default();
-            let (binding_sigs, inline_sigs, min_length, show_values) = if let [Value::Bool(
+            let (binding_sigs, inline_sigs, min_length, show_values) = if let [serde_json::Value::Bool(
                 binding_sigs,
-            ), Value::Bool(
+            ), serde_json::Value::Bool(
                 inline_sigs,
-            ), Value::Number(
+            ), serde_json::Value::Number(
                 min_length,
-            ), Value::Bool(
+            ), serde_json::Value::Bool(
                 show_values,
             )] = config.as_slice()
             {
@@ -1503,39 +1498,36 @@ mod server {
             // Values
             if show_values {
                 for (span, values) in &doc.code_meta.top_level_values {
-                    let Some(value) = values.last() else {
-                        continue;
-                    };
-                    let shown = value.show();
-                    let (label, tooltip) = if shown.lines().count() > 1 || values.len() > 1 {
-                        let mut shapes = value.shape_string();
-                        let mut md = "```uiua\n".to_string();
-                        for val in values.iter().rev().skip(1).rev() {
-                            md.push_str(&val.show());
-                            md.push('\n');
-                        }
-                        for val in values.iter().rev().skip(1) {
-                            shapes.push('|');
+                    let mut shown: Vec<String> = values.iter().map(Value::show).collect();
+                    let mut md = "```uiua\n".to_string();
+                    for shown in &shown {
+                        md.push_str(shown);
+                        md.push('\n');
+                    }
+                    md.push_str("\n```");
+                    let tooltip = InlayHintTooltip::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: md,
+                    });
+                    let label = if shown.iter().any(|s| s.lines().count() > 1) {
+                        let mut shapes = String::new();
+                        for (i, val) in values.iter().rev().enumerate() {
+                            if i > 0 {
+                                shapes.push_str(" | ");
+                            }
                             shapes.push_str(&val.shape_string());
                         }
-                        md.push_str(&shown);
-                        md.push_str("\n```");
-                        (
-                            InlayHintLabel::String(shapes),
-                            Some(InlayHintTooltip::MarkupContent(MarkupContent {
-                                kind: MarkupKind::Markdown,
-                                value: md,
-                            })),
-                        )
+                        InlayHintLabel::String(shapes)
                     } else {
-                        (InlayHintLabel::String(shown), None)
+                        shown.reverse();
+                        InlayHintLabel::String(shown.join(" "))
                     };
                     hints.push(InlayHint {
                         text_edits: None,
                         position: uiua_loc_to_lsp(span.end),
                         label,
                         kind: None,
-                        tooltip,
+                        tooltip: Some(tooltip),
                         padding_left: Some(true),
                         padding_right: None,
                         data: None,

@@ -83,16 +83,26 @@ pub fn do_(env: &mut Uiua) -> UiuaResult {
         )));
     }
     loop {
+        if env.stack().len() < copy_count {
+            // Pop until it fails
+            for i in 0..copy_count {
+                env.pop(i + 1)?;
+            }
+        }
+        // Copy necessary condition args
         for _ in 0..copy_count {
             env.push(env.stack()[env.stack().len() - copy_count].clone());
         }
+        // Call condition
         env.call(g.clone())?;
+        // Break if condition is false
         let cond = env
             .pop("do condition")?
             .as_bool(env, "Do condition must be a boolean")?;
         if !cond {
             break;
         }
+        // Call body
         env.call(f.clone())?;
     }
     Ok(())
@@ -236,7 +246,7 @@ fn multi_partition_indices(markers: Array<isize>) -> Vec<(isize, Vec<usize>)> {
         .collect()
 }
 
-pub fn unpartition_part1(env: &mut Uiua) -> UiuaResult {
+pub fn undo_partition_part1(env: &mut Uiua) -> UiuaResult {
     crate::profile_function!();
     let f = env.pop_function()?;
     let sig = f.signature();
@@ -260,7 +270,7 @@ pub fn unpartition_part1(env: &mut Uiua) -> UiuaResult {
 }
 
 #[allow(clippy::unit_arg)]
-pub fn unpartition_part2(env: &mut Uiua) -> UiuaResult {
+pub fn undo_partition_part2(env: &mut Uiua) -> UiuaResult {
     let untransformed = env.pop(1)?;
     let markers = env
         .pop(2)?
@@ -420,7 +430,7 @@ impl<T: ArrayValue> Array<T> {
     }
 }
 
-pub fn ungroup_part1(env: &mut Uiua) -> UiuaResult {
+pub fn undo_group_part1(env: &mut Uiua) -> UiuaResult {
     crate::profile_function!();
     let f = env.pop_function()?;
     let sig = f.signature();
@@ -445,7 +455,7 @@ pub fn ungroup_part1(env: &mut Uiua) -> UiuaResult {
     Ok(())
 }
 
-pub fn ungroup_part2(env: &mut Uiua) -> UiuaResult {
+pub fn undo_group_part2(env: &mut Uiua) -> UiuaResult {
     let ungrouped_rows = env.pop(1)?;
     let indices = env
         .pop(2)?

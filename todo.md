@@ -1,12 +1,14 @@
 # Uiua Todo
 
 - 0.10
-  - System for custom glyph formatting
+  - Specialization for `both` `rerank`
+  - `fill`ed `un` `drop`
+  - Non-scalar `repeat`
+  - Better span serialization
+  - Planet expressions?
+  - Proofread and update tutorial and tour
   - System functions
     - Excel
-  - Let bind only take an ident?
-  - Proofread and update tutorial and tour
-  - Make maps good enough to not be experimental
 - Site pages/tutorials
   - Working with strings
   - Duality of `pick` and `select`
