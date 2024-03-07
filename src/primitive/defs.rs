@@ -1009,8 +1009,9 @@ primitive!(
     /// This is the opposite of [drop].
     ///
     /// ex: ↙ 3 [8 3 9 2 0]
-    /// ex: ↙ ¯3 [8 3 9 2 0]
     /// ex: ↙ 2 ↯3_3⇡9
+    /// Negative amounts take from the end.
+    /// ex: ↙ ¯3 [8 3 9 2 0]
     /// ex: ↙ ¯2 ↯3_3⇡9
     /// The amount to take can also be a list to take along multiple axes.
     /// ex: .↯3_4⇡12
@@ -1021,14 +1022,17 @@ primitive!(
     /// ex! ↙7 [8 3 9 2 0]
     /// If you would like to fill the excess length with some fill value, use [fill].
     /// ex: ⬚π↙ 7 [8 3 9 2 0]
+    /// This works with negative values as well.
+    /// ex: ⬚π↙ ¯7 [8 3 9 2 0]
     (2, Take, DyadicArray, ("take", '↙')),
     /// Drop the first n elements of an array
     ///
     /// This is the opposite of [take].
     ///
     /// ex: ↘ 3 [8 3 9 2 0]
-    /// ex: ↘ ¯3 [8 3 9 2 0]
     /// ex: ↘ 2 ↯3_3⇡9
+    /// Negative amounts drop from the end.
+    /// ex: ↘ ¯3 [8 3 9 2 0]
     /// ex: ↘ ¯2 ↯3_3⇡9
     /// The amount to drop can also be a list to drop along multiple axes.
     /// ex: .↯3_4⇡12
@@ -1040,6 +1044,10 @@ primitive!(
     /// ex: ↘ ¯7 [8 3 9 2 0]
     /// ex: ↘ 5 ↯3_3⇡9
     /// ex: ↘ ¯5 ↯3_3⇡9
+    ///
+    /// [un][drop] will pad an array if a [fill] is set.
+    /// ex: ⬚0°↘ 2 [1 2 3]
+    /// ex: ⬚0°↘ 2_¯3 [1_2 3_4]
     (2, Drop, DyadicArray, ("drop", '↘')),
     /// Rotate the elements of an array by n
     ///
@@ -1378,12 +1386,12 @@ primitive!(
     ///
     /// ex: ⍥(+2)5 0
     /// ex: ⍥(⊂2)5 []
-    /// One interesting use of `repeat` is to collect some number of stack values into an array.
-    /// ex: ⍥⊂3 [] 1 2 3
     /// Repeating [infinity] times will do a fixed-point iteration.
     /// The loop will end when the top value of the function's output is equal to the top value of the function's input.
     /// For example, this could be used to flatten a deeply nested array.
     /// ex: ⍥/◇⊂∞ {1 {2 3} {4 {5 6 {7}}}}
+    /// The number of repetitions may be non-scalar. In this case, the function will be repeated each row of the input a different number of times.
+    /// ex: ⍥(×2) [1 2 3 4] [5 5 5 5]
     ///
     /// [repeat]'s glyph is a combination of a circle, representing a loop, and the 𝄇 symbol from musical notation.
     ([1], Repeat, IteratingModifier, ("repeat", '⍥')),
@@ -2508,26 +2516,27 @@ macro_rules! impl_primitive {
 
 impl_primitive!(
     // Inverses
-    (0, InvPop),
+    (0, UnPop),
     (1, Asin),
-    (1, InverseBits),
-    (1, InvWhere),
-    (1(2), InvCouple),
-    (1, InvUtf),
-    (1(2), InvAtan),
-    (1(2), InvComplex),
-    (1, InvParse),
-    (1, InvFix),
-    (1[1], InvScan),
-    (1(2), InvMap),
-    (1, InvTrace, impure),
-    (2(2), InvBothTrace, impure),
-    (0(0), InvStack, impure),
-    (0[1], InvDump, impure),
+    (1, UnBits),
+    (1, UnWhere),
+    (1(2), UnCouple),
+    (1, UnUtf),
+    (1(2), UnAtan),
+    (1(2), UnComplex),
+    (1, UnParse),
+    (1, UnFix),
+    (1[1], UnScan),
+    (1(2), UnMap),
+    (1, UnTrace, impure),
+    (2(2), UnBothTrace, impure),
+    (0(0), UnStack, impure),
+    (0[1], UnDump, impure),
     (1, Primes),
-    (1, InvBox),
-    (1(2), InvJoin),
-    (1, InvCsv),
+    (1, UnBox),
+    (1(2), UnJoin),
+    (2, UnDrop),
+    (1, UnCsv),
     // Unders
     (3, UndoSelect),
     (3, UndoPick),
@@ -2536,13 +2545,13 @@ impl_primitive!(
     (2, UndoFirst),
     (2, UndoLast),
     (3, UndoKeep),
-    (3, Unrerank),
-    (2, Unreshape),
-    (3(2), Unjoin),
-    (1[1], Unpartition1),
-    (3, Unpartition2),
-    (1[1], Ungroup1),
-    (3, Ungroup2),
+    (3, UndoRerank),
+    (2, UndoReshape),
+    (3(2), UndoJoin),
+    (1[1], UndoPartition1),
+    (3, UndpPartition2),
+    (1[1], UndoGroup1),
+    (3, UndoGroup2),
     (4, UndoInsert),
     (3, UndoRemove),
     // Optimizations

@@ -16,25 +16,26 @@ fn prim_inverse(prim: Primitive, span: usize) -> Option<Instr> {
     Some(match prim {
         Identity => Instr::Prim(Identity, span),
         Flip => Instr::Prim(Flip, span),
-        Pop => Instr::ImplPrim(InvPop, span),
+        Pop => Instr::ImplPrim(UnPop, span),
         Neg => Instr::Prim(Neg, span),
         Not => Instr::Prim(Not, span),
         Sin => Instr::ImplPrim(Asin, span),
-        Atan => Instr::ImplPrim(InvAtan, span),
-        Complex => Instr::ImplPrim(InvComplex, span),
+        Atan => Instr::ImplPrim(UnAtan, span),
+        Complex => Instr::ImplPrim(UnComplex, span),
         Reverse => Instr::Prim(Reverse, span),
         Transpose => Instr::ImplPrim(TransposeN(-1), span),
-        Bits => Instr::ImplPrim(InverseBits, span),
-        Couple => Instr::ImplPrim(InvCouple, span),
-        Box => Instr::ImplPrim(InvBox, span),
-        Where => Instr::ImplPrim(InvWhere, span),
-        Utf => Instr::ImplPrim(InvUtf, span),
-        Parse => Instr::ImplPrim(InvParse, span),
-        Fix => Instr::ImplPrim(InvFix, span),
-        Map => Instr::ImplPrim(InvMap, span),
-        Trace => Instr::ImplPrim(InvTrace, span),
-        Stack => Instr::ImplPrim(InvStack, span),
-        Join => Instr::ImplPrim(InvJoin, span),
+        Bits => Instr::ImplPrim(UnBits, span),
+        Couple => Instr::ImplPrim(UnCouple, span),
+        Box => Instr::ImplPrim(UnBox, span),
+        Where => Instr::ImplPrim(UnWhere, span),
+        Utf => Instr::ImplPrim(UnUtf, span),
+        Parse => Instr::ImplPrim(UnParse, span),
+        Fix => Instr::ImplPrim(UnFix, span),
+        Map => Instr::ImplPrim(UnMap, span),
+        Trace => Instr::ImplPrim(UnTrace, span),
+        Stack => Instr::ImplPrim(UnStack, span),
+        Join => Instr::ImplPrim(UnJoin, span),
+        Drop => Instr::ImplPrim(UnDrop, span),
         Sys(SysOp::GifDecode) => Instr::Prim(Sys(SysOp::GifEncode), span),
         Sys(SysOp::GifEncode) => Instr::Prim(Sys(SysOp::GifDecode), span),
         Sys(SysOp::AudioDecode) => Instr::Prim(Sys(SysOp::AudioEncode), span),
@@ -43,7 +44,7 @@ fn prim_inverse(prim: Primitive, span: usize) -> Option<Instr> {
         Sys(SysOp::ImEncode) => Instr::Prim(Sys(SysOp::ImDecode), span),
         Sys(SysOp::ClipboardSet) => Instr::Prim(Sys(SysOp::ClipboardGet), span),
         Sys(SysOp::ClipboardGet) => Instr::Prim(Sys(SysOp::ClipboardSet), span),
-        Csv => Instr::ImplPrim(InvCsv, span),
+        Csv => Instr::ImplPrim(UnCsv, span),
         _ => return None,
     })
 }
@@ -52,25 +53,26 @@ fn impl_prim_inverse(prim: ImplPrimitive, span: usize) -> Option<Instr> {
     use ImplPrimitive::*;
     use Primitive::*;
     Some(match prim {
-        InvPop => Instr::Prim(Pop, span),
+        UnPop => Instr::Prim(Pop, span),
         Asin => Instr::Prim(Sin, span),
         TransposeN(n) => Instr::ImplPrim(TransposeN(-n), span),
-        InverseBits => Instr::Prim(Bits, span),
-        InvWhere => Instr::Prim(Where, span),
-        InvUtf => Instr::Prim(Utf, span),
-        InvAtan => Instr::Prim(Atan, span),
-        InvComplex => Instr::Prim(Complex, span),
-        InvCouple => Instr::Prim(Couple, span),
-        InvParse => Instr::Prim(Parse, span),
-        InvFix => Instr::Prim(Fix, span),
-        InvMap => Instr::Prim(Map, span),
-        InvTrace => Instr::Prim(Trace, span),
-        InvStack => Instr::Prim(Stack, span),
-        InvBox => Instr::Prim(Box, span),
-        InvJoin => Instr::Prim(Join, span),
-        InvCsv => Instr::Prim(Csv, span),
-        BothTrace => Instr::ImplPrim(InvBothTrace, span),
-        InvBothTrace => Instr::ImplPrim(BothTrace, span),
+        UnBits => Instr::Prim(Bits, span),
+        UnWhere => Instr::Prim(Where, span),
+        UnUtf => Instr::Prim(Utf, span),
+        UnAtan => Instr::Prim(Atan, span),
+        UnComplex => Instr::Prim(Complex, span),
+        UnCouple => Instr::Prim(Couple, span),
+        UnParse => Instr::Prim(Parse, span),
+        UnFix => Instr::Prim(Fix, span),
+        UnMap => Instr::Prim(Map, span),
+        UnTrace => Instr::Prim(Trace, span),
+        UnStack => Instr::Prim(Stack, span),
+        UnBox => Instr::Prim(Box, span),
+        UnJoin => Instr::Prim(Join, span),
+        UnDrop => Instr::Prim(Drop, span),
+        UnCsv => Instr::Prim(Csv, span),
+        BothTrace => Instr::ImplPrim(UnBothTrace, span),
+        UnBothTrace => Instr::ImplPrim(BothTrace, span),
         _ => return None,
     })
 }
@@ -207,8 +209,20 @@ pub(crate) fn under_instrs(
 
     /// Copy 2 values to the temp stack before the "before", and pop them before the "after"
     macro_rules! stash2 {
+        (($($before:expr),*)) => {
+            pat!(($($before),*), (CopyToTempN(2), $($before),*), (PopTempN(2), $($before),*))
+        };
+        (($($before:expr),*), ($($after:expr),*)) => {
+            pat!(($($before),*), (CopyToTempN(2), $($before),*), (PopTempN(2), $($after),*))
+        };
+        (($($before:expr),*), $after:expr) => {
+            pat!(($($before),*), (CopyToTempN(2), $($before),*), (PopTempN(2), $after))
+        };
+        ($before:expr, ($($after:expr),*)) => {
+            pat!($before, (CopyToTempN(2), $before), (PopTempN(2), $($after),*))
+        };
         ($before:expr, $after:expr) => {
-            pat!($before, (CopyToTempN(2), $before), (PopTempN(2), $after),)
+            pat!($before, (CopyToTempN(2), $before), (PopTempN(2), $after))
         };
     }
 
@@ -292,6 +306,7 @@ pub(crate) fn under_instrs(
         // Array restructuring
         &maybe_val!(stash2!(Take, UndoTake)),
         &maybe_val!(stash2!(Drop, UndoDrop)),
+        &maybe_val!(stash2!(UnDrop, (Flip, Pop, Drop))),
         &maybe_val!(pat!(
             Keep,
             (CopyToTempN(2), Keep),
@@ -301,7 +316,7 @@ pub(crate) fn under_instrs(
         &maybe_val!(pat!(
             Join,
             (Over, Shape, Over, Shape, PushTempN(2), Join),
-            (PopTempN(2), Unjoin),
+            (PopTempN(2), UndoJoin),
         )),
         // Array indexing
         &stash1!(Rise, (Flip, Select)),
@@ -341,17 +356,17 @@ pub(crate) fn under_instrs(
         &pat!(
             Deshape,
             (Dup, Shape, PushTempN(1), Deshape),
-            (PopTempN(1), 0, Unrerank),
+            (PopTempN(1), 0, UndoRerank),
         ),
         &maybe_val!(pat!(
             Rerank,
             (Over, Shape, Over, PushTempN(2), Rerank),
-            (PopTempN(2), Unrerank),
+            (PopTempN(2), UndoRerank),
         )),
         &maybe_val!(pat!(
             Reshape,
             (Over, Shape, PushTempN(1), Reshape),
-            (PopTempN(1), Unreshape),
+            (PopTempN(1), UndoReshape),
         )),
         // Classify and deduplicate
         &pat!(
@@ -373,7 +388,7 @@ pub(crate) fn under_instrs(
         &store1copy!(Sys(SysOp::TcpAccept), Sys(SysOp::Close)),
         &maybe_val!(stash1!(Sys(SysOp::FReadAllStr), Sys(SysOp::FWriteAll))),
         &maybe_val!(stash1!(Sys(SysOp::FReadAllBytes), Sys(SysOp::FWriteAll))),
-        &pat!(BothTrace, (BothTrace), (InvTrace)),
+        &pat!(BothTrace, (BothTrace), (UnTrace)),
         // Patterns that need to be last
         &UnderPatternFn(under_flip_pattern, "flip"),
         &UnderPatternFn(under_push_temp_pattern, "push temp"),
@@ -553,9 +568,9 @@ fn invert_dump_pattern<'a>(
     match input {
         [f @ Instr::PushFunc(_), Instr::Prim(Primitive::Dump, span), input @ ..] => Some((
             input,
-            eco_vec![f.clone(), Instr::ImplPrim(ImplPrimitive::InvDump, *span)],
+            eco_vec![f.clone(), Instr::ImplPrim(ImplPrimitive::UnDump, *span)],
         )),
-        [f @ Instr::PushFunc(_), Instr::ImplPrim(ImplPrimitive::InvDump, span), input @ ..] => {
+        [f @ Instr::PushFunc(_), Instr::ImplPrim(ImplPrimitive::UnDump, span), input @ ..] => {
             Some((
                 input,
                 eco_vec![f.clone(), Instr::Prim(Primitive::Dump, *span)],
@@ -575,14 +590,14 @@ fn under_dump_pattern<'a>(
             input,
             (
                 eco_vec![f.clone(), Instr::Prim(Primitive::Dump, *span)],
-                eco_vec![f.clone(), Instr::ImplPrim(ImplPrimitive::InvDump, *span)],
+                eco_vec![f.clone(), Instr::ImplPrim(ImplPrimitive::UnDump, *span)],
             ),
         )),
-        [f @ Instr::PushFunc(_), Instr::ImplPrim(ImplPrimitive::InvDump, span), input @ ..] => {
+        [f @ Instr::PushFunc(_), Instr::ImplPrim(ImplPrimitive::UnDump, span), input @ ..] => {
             Some((
                 input,
                 (
-                    eco_vec![f.clone(), Instr::ImplPrim(ImplPrimitive::InvDump, *span)],
+                    eco_vec![f.clone(), Instr::ImplPrim(ImplPrimitive::UnDump, *span)],
                     eco_vec![f.clone(), Instr::Prim(Primitive::Dump, *span)],
                 ),
             ))
@@ -811,10 +826,6 @@ fn under_push_temp_pattern<'a>(
     let inner_befores_sig = instrs_signature(&inner_befores).ok()?;
     let inner_afters_sig = instrs_signature(&inner_afters).ok()?;
 
-    let mut befores = inner_befores;
-    befores.insert(0, start_instr.clone());
-    befores.push(end_instr.clone());
-
     if g_sig.args < g_sig.outputs {
         return None;
     }
@@ -835,6 +846,10 @@ fn under_push_temp_pattern<'a>(
     let both = inner_befores_sig.args == temp_depth
         && input_iter.clone().count() >= inner_iter.clone().count()
         && input_iter.zip(inner_iter).all(|(a, b)| a == b);
+
+    let mut befores = inner_befores;
+    befores.insert(0, start_instr.clone());
+    befores.push(end_instr.clone());
 
     let afters = if both && g_sig.args > g_sig.outputs {
         let mut before_temp_count = 0;
@@ -1163,10 +1178,10 @@ macro_rules! partition_group {
 partition_group!(
     under_partition_pattern,
     Partition,
-    Unpartition1,
-    Unpartition2
+    UndoPartition1,
+    UndpPartition2
 );
-partition_group!(under_group_pattern, Group, Ungroup1, Ungroup2);
+partition_group!(under_group_pattern, Group, UndoGroup1, UndoGroup2);
 
 fn try_array_wrap<'a>(
     input: &'a [Instr],
@@ -1304,7 +1319,7 @@ fn invert_scan_pattern<'a>(
         input,
         eco_vec![
             Instr::PushFunc(inverse),
-            Instr::ImplPrim(ImplPrimitive::InvScan, *span)
+            Instr::ImplPrim(ImplPrimitive::UnScan, *span)
         ],
     ))
 }
