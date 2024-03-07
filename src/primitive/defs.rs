@@ -2481,6 +2481,7 @@ macro_rules! impl_primitive {
 
 impl_primitive!(
     // Inverses
+    (0, InvPop),
     (1, Asin),
     (1, InverseBits),
     (1, InvWhere),
