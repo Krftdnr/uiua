@@ -16,13 +16,11 @@ use paste::paste;
 
 use crate::{
     ast::*,
-    function::Signature,
     grid_fmt::GridFmt,
     lex::{is_ident_char, CodeSpan, Loc, Sp},
     parse::{parse, split_words, trim_spaces, unsplit_words},
-    value::Value,
-    Compiler, FunctionId, Ident, InputSrc, Inputs, Primitive, RunMode, SafeSys, SysBackend, SysOp,
-    Uiua, UiuaError, UiuaResult,
+    Compiler, FunctionId, Ident, InputSrc, Inputs, RunMode, SafeSys, Signature, SysBackend, Uiua,
+    UiuaError, UiuaResult, Value,
 };
 
 trait ConfigValue: Sized {
@@ -594,14 +592,6 @@ impl<'a> Formatter<'a> {
             }
             Item::Binding(binding) => {
                 match binding.words.first().map(|w| &w.value) {
-                    Some(Word::Primitive(Primitive::Sys(SysOp::Import)))
-                        if (binding.words.iter())
-                            .filter(|word| word.value.is_code())
-                            .count()
-                            == 2 =>
-                    {
-                        self.prev_import_function = Some(binding.name.value.clone());
-                    }
                     Some(Word::Ref(r)) => {
                         if r.root_module()
                             .zip(self.prev_import_function.as_ref())
@@ -806,10 +796,20 @@ impl<'a> Formatter<'a> {
                 .output
                 .push_str(&self.inputs.get(&word.span.src)[word.span.byte_range()]),
             Word::MultilineString(s) => {
+                let curr_line_pos = if self.output.ends_with('\n') {
+                    0
+                } else {
+                    self.output
+                        .split('\n')
+                        .last()
+                        .unwrap_or_default()
+                        .chars()
+                        .count()
+                };
                 for (i, line) in s.lines().enumerate() {
                     if i > 0 {
                         self.output.push('\n');
-                        for _ in 0..self.config.multiline_indent * depth {
+                        for _ in 0..curr_line_pos {
                             self.output.push(' ');
                         }
                     }

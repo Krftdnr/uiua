@@ -18,8 +18,8 @@ use parking_lot::Mutex;
 use serde::*;
 
 use crate::{
-    cowslice::cowslice, primitive::PrimDoc, Array, Boxed, FfiType, Signature, Uiua, UiuaResult,
-    Value,
+    algorithm::validate_size, cowslice::cowslice, primitive::PrimDoc, Array, Boxed, FfiType,
+    Signature, Uiua, UiuaResult, Value,
 };
 
 /// Access the built-in `example.ua` file
@@ -261,20 +261,6 @@ sys_op! {
     /// The stream handle `1` is stdout.
     /// The stream handle `2` is stderr.
     (2(0), Write, Stream, "&w", "write", [mutating]),
-    /// Import an item from a file
-    ///
-    /// The first argument is the path to the file. The second is the name of the item to import.
-    /// ex: Dub ← &i "example.ua" "Double"
-    ///   : Dub 5
-    /// To import multiple items, you can make a function that imports from a specific path.
-    /// ex: Ex ← &i "example.ua"
-    ///   : Double ← Ex "Double"
-    ///   : Square ← Ex "Square"
-    ///   : Square Double 5
-    ///
-    /// [&i] can only be used as the first function in a binding.
-    /// ex! &i "example.ua" "Double" 5
-    (2, Import, Filesystem, "&i", "import"),
     /// Invoke a path with the system's default program
     (1(1), Invoke, Command, "&invk", "invoke", [mutating]),
     /// Close a stream by its handle
@@ -1020,6 +1006,9 @@ impl SysOp {
                 let count = env
                     .pop(1)?
                     .as_nat_or_inf(env, "Count must be an integer or infinity")?;
+                if let Some(count) = count {
+                    validate_size::<u8>(count, env)?;
+                }
                 let handle = env
                     .pop(2)?
                     .as_nat(env, "Handle must be an natural number")?
@@ -1057,6 +1046,9 @@ impl SysOp {
                 let count = env
                     .pop(1)?
                     .as_nat_or_inf(env, "Count must be an integer or infinity")?;
+                if let Some(count) = count {
+                    validate_size::<u8>(count, env)?;
+                }
                 let handle = env
                     .pop(2)?
                     .as_nat(env, "Handle must be an natural number")?
@@ -1173,12 +1165,9 @@ impl SysOp {
                     Value::Num(arr) => arr.data.iter().map(|&x| x as u8).collect(),
                     #[cfg(feature = "bytes")]
                     Value::Byte(arr) => arr.data.into(),
-
-                    Value::Complex(_) => {
-                        return Err(env.error("Cannot write complex array to file"))
-                    }
+                    Value::Complex(_) => return Err(env.error("Cannot write complex array")),
                     Value::Char(arr) => arr.data.iter().collect::<String>().into(),
-                    Value::Box(_) => return Err(env.error("Cannot write box array to file")),
+                    Value::Box(_) => return Err(env.error("Cannot write box array")),
                 };
                 match handle {
                     Handle::STDOUT => env
@@ -1271,12 +1260,6 @@ impl SysOp {
                 let path = env.pop(1)?.as_string(env, "Path must be a string")?;
                 let is_file = env.rt.backend.is_file(&path).map_err(|e| env.error(e))?;
                 env.push(is_file);
-            }
-            SysOp::Import => {
-                return Err(env.error(
-                    "&i is not valid in this position. \
-                    It must be the first item in a binding.",
-                ));
             }
             SysOp::Invoke => {
                 let path = env.pop(1)?.as_string(env, "Invoke path must be a string")?;

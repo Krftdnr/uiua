@@ -1122,21 +1122,20 @@ primitive!(
     ///
     /// Occurences of the first array in the second array will be marked with increasing numbers.
     /// While [find] only marks the start of each occurence, [mask] marks the entire occurence.
-    /// ex: # Experimental!
-    ///   : ⦷ "ab" "abracadabra"
-    /// ex: # Experimental!
-    ///   : ⦷ [1 2 3].[0 1 2 3 1 2 3 4 5 1 2 3 4 5 6]
+    /// ex: ⦷ "ab" "abracadabra"
+    /// ex: ⦷ [1 2 3].[0 1 2 3 1 2 3 4 5 1 2 3 4 5 6]
     /// Increasing numbers are used so that adjacent occurences can be distinguished.
     /// An occurence that would overlap with a previous occurence is not marked.
-    /// ex: # Experimental!
-    ///   : ⦷ [3 4 3 4].[0 3 4 3 4 3 4 0 0 3 4 3 4 0]
+    /// ex: ⦷ [3 4 3 4].[0 3 4 3 4 3 4 0 0 3 4 3 4 0]
     ///
     /// Arbitrary rank arrays are supported.
     /// The first array's rank must be `less or equal` the rank of the second.
-    /// ex: # Experimental!
-    ///   : ⦷,, 3_4 ↯2_3⇡6
-    /// ex: # Experimental!
-    ///   : ⦷,, [1_2 5_6] [1_2_3_4 5_6_1_2 7_8_5_6 4_3_1_2]
+    /// ex: ⦷,, 3_4 ↯2_3⇡6
+    /// ex: ⦷,, [1_2 5_6] [1_2_3_4 5_6_1_2 7_8_5_6 4_3_1_2]
+    ///
+    /// [mask] works well with [partition] in a way that [find] does not.
+    /// Here, we [not] the [mask] of a non-scalar delimiter to split a string.
+    /// ex: ⊜∘ ¬⦷" - ". "foo - bar - baz"
     (2, Mask, DyadicArray, ("mask", '⦷')),
     /// Check if each row of one array exists in another
     ///
@@ -1392,6 +1391,10 @@ primitive!(
     /// ex: ⍥/◇⊂∞ {1 {2 3} {4 {5 6 {7}}}}
     /// The number of repetitions may be non-scalar. In this case, the function will be repeated each row of the input a different number of times.
     /// ex: ⍥(×2) [1 2 3 4] [5 5 5 5]
+    /// If you want to conditionally either run some function or not, you can use [repeat] to repeat `0` or `1` times.
+    /// ex: F ← ⍥(×10)<10.
+    ///   : F 5
+    ///   : F 12
     ///
     /// [repeat]'s glyph is a combination of a circle, representing a loop, and the 𝄇 symbol from musical notation.
     ([1], Repeat, IteratingModifier, ("repeat", '⍥')),
@@ -1428,7 +1431,7 @@ primitive!(
     /// This value sets the number of buckets to use.
     /// Here, the default behavior would generate 7 buckets, but we set it to 5 and 10 instead.
     /// ex: ⌊÷10.[7 46 19 8 23 5 42 72 7 36 4 18 37]
-    /// ∩(⊕□ ⊂:) ? ⊃(10⊙∘|5⊙∘)
+    ///   : ∩(⊕□ ⊂:) ? ⊃(10⊙∘|5⊙∘)
     ///
     /// [group] is closely related to [partition].
     (2[1], Group, AggregatingModifier, ("group", '⊕')),
@@ -1438,8 +1441,8 @@ primitive!(
     ///
     /// Takes a function and two arrays.
     /// The arrays must be the same [length].
-    /// The first array must be rank `1` and contain integers.
-    /// Consecutive rows in the second array that line up with groups of the same key in the first array will be grouped together.
+    /// The first array is called the "markers". It must be rank `1` and contain integers.
+    /// Consecutive rows in the second array that line up with groups of the same key in the markers will be grouped together.
     /// Keys `less or equal``0` will be omitted.
     /// The function then processes each group in order. The result depends on what the function is.
     /// If the function takes 0 or 1 arguments, then [partition] behaves like [rows]. This is called *iterating* [partition].
@@ -1457,6 +1460,12 @@ primitive!(
     /// ex: $ 1 1 2 3
     ///   : $ 5 8 13 21
     ///   : ⊜(⊜⋕≠@ .)≠@\n.
+    ///
+    /// [partition] also works with multidimensional markers. Groups are formed from markers that are adjacent along any axis.
+    /// Each group will be flattened before being passed to the function.
+    /// ex: ⊜□.. ↯4_4 [0 1 1 2 2]
+    /// If we wanted to group the indices that are adjacent, we could use the array to [partition] its own indices.
+    /// ex: ⊜□:⇡△.. ↯4_4 [0 1 1 2 2]
     ///
     /// [under][partition] works if [partition]'s function is [under]able.
     /// ex: ⍜⊜□⇌  ≠@ . $ These are some words

@@ -29,8 +29,8 @@ use crate::{
     optimize::{optimize_instrs, optimize_instrs_mut},
     parse::{count_placeholders, parse, split_words, unsplit_words},
     Array, Assembly, Boxed, Diagnostic, DiagnosticKind, Global, Ident, ImplPrimitive, InputSrc,
-    IntoInputSrc, IntoSysBackend, Primitive, RunMode, SemanticComment, SysBackend, SysOp, Uiua,
-    UiuaError, UiuaResult, Value, CONSTANTS, VERSION,
+    IntoInputSrc, IntoSysBackend, Primitive, RunMode, SemanticComment, SysBackend, Uiua, UiuaError,
+    UiuaResult, Value, CONSTANTS, VERSION,
 };
 
 /// The Uiua compiler
@@ -152,6 +152,8 @@ pub(crate) struct Scope {
     stack_height: Result<usize, Sp<SigCheckError>>,
     /// The stack of referenced bind locals
     bind_locals: Vec<HashSet<usize>>,
+    /// Whether currently compiling fill's second function
+    fill: bool,
 }
 
 impl Default for Scope {
@@ -162,6 +164,7 @@ impl Default for Scope {
             experimental: false,
             stack_height: Ok(0),
             bind_locals: Vec::new(),
+            fill: false,
         }
     }
 }
@@ -221,6 +224,14 @@ impl Compiler {
     /// Get a mutable reference to the assembly
     pub fn assembly_mut(&mut self) -> &mut Assembly {
         &mut self.asm
+    }
+    /// Get a reference to the code metadata
+    pub fn code_meta(&self) -> &CodeMeta {
+        &self.code_meta
+    }
+    /// Get a mutable reference to the code metadata
+    pub fn code_meta_mut(&mut self) -> &mut CodeMeta {
+        &mut self.code_meta
     }
     /// Take a completed assembly from the compiler
     pub fn finish(&mut self) -> Assembly {
@@ -418,10 +429,7 @@ code:
         prev_comment: &mut Option<Arc<str>>,
     ) -> UiuaResult {
         fn words_should_run_anyway(words: &[Sp<Word>]) -> bool {
-            words.iter().any(|w| {
-                matches!(&w.value, Word::Primitive(Primitive::Sys(SysOp::Import)))
-                    || matches!(&w.value, Word::Comment(_))
-            })
+            (words.iter()).any(|w| matches!(&w.value, Word::SemanticComment(_)))
         }
         let prev_com = prev_comment.take();
         let mut lines = match item {
@@ -490,7 +498,8 @@ code:
             // Compile the words
             let instr_count_before = self.asm.instrs.len();
             let instrs = self.compile_words(line, true)?;
-            let mut instrs = self.pre_eval_instrs(instrs);
+            let (mut instrs, pre_eval_errors) = self.pre_eval_instrs(instrs);
+            let mut line_eval_errored = false;
             match instrs_signature(&instrs) {
                 Ok(sig) => {
                     // Update scope stack height
@@ -537,11 +546,17 @@ code:
                                 instrs = vals.into_iter().map(Instr::push).collect();
                             }
                             Ok(None) => {}
-                            Err(e) => self.errors.push(e),
+                            Err(e) => {
+                                self.errors.push(e);
+                                line_eval_errored = true;
+                            }
                         }
                     }
                 }
                 Err(e) => self.scope.stack_height = Err(span.sp(e)),
+            }
+            if !line_eval_errored {
+                self.errors.extend(pre_eval_errors);
             }
             let start = self.asm.instrs.len();
             (self.asm.instrs).extend(instrs);
@@ -559,7 +574,8 @@ code:
         I: IntoIterator<Item = Instr> + fmt::Debug,
         I::IntoIter: ExactSizeIterator,
     {
-        let instrs = self.pre_eval_instrs(instrs.into_iter().collect());
+        let (instrs, errors) = self.pre_eval_instrs(instrs.into_iter().collect());
+        self.errors.extend(errors);
         let len = instrs.len();
         if len > 1 {
             (self.asm.instrs).push(Instr::Comment(format!("({id}").into()));
@@ -591,13 +607,6 @@ code:
         // Resolve path
         let path = if let Some(url) = path_str.strip_prefix("git:") {
             // Git import
-            if !self.scope.experimental {
-                return Err(self.fatal_error(
-                    span.clone(),
-                    "Git imports are experimental. To use them, add \
-                    `# Experimental!` to the top of the file.",
-                ));
-            }
             let mut url = url.trim().trim_end_matches(".git").to_string();
             if ![".com", ".net", ".org", ".io", ".dev"]
                 .iter()
@@ -729,42 +738,6 @@ code:
             .peekable();
         while let Some(word) = words.next() {
             if let Some(next) = words.peek() {
-                // Handle legacy imports
-                if let Word::Ref(r) = &next.value {
-                    if r.path.is_empty() {
-                        if let Some(local) = self.scope.names.get(&r.name.value) {
-                            if let Global::Module(module) = &self.asm.bindings[local.index].global {
-                                if let Word::String(item_name) = &word.value {
-                                    let local = self.imports[module]
-                                        .names
-                                        .get(item_name.as_str())
-                                        .copied()
-                                        .ok_or_else(|| {
-                                            self.fatal_error(
-                                                next.span.clone(),
-                                                format!(
-                                                    "Item `{item_name}` not found in module `{}`",
-                                                    module.display()
-                                                ),
-                                            )
-                                        })?;
-                                    self.validate_local(item_name, local, &next.span);
-                                    self.global_index(local.index, next.span.clone(), false);
-                                    words.next();
-                                    continue;
-                                }
-                                self.add_error(
-                                    next.span.clone(),
-                                    format!(
-                                        "Expected a string after `{}` \
-                                            to specify an item to import",
-                                        r.name.value
-                                    ),
-                                );
-                            }
-                        }
-                    }
-                }
                 // First select diagnostic
                 if let (Word::Primitive(Primitive::Select), Word::Primitive(Primitive::First)) =
                     (&word.value, &next.value)
@@ -1700,13 +1673,16 @@ code:
         let function = self.create_function(signature, f);
         self.bind_function(name, function)
     }
-    fn pre_eval_instrs(&mut self, instrs: EcoVec<Instr>) -> EcoVec<Instr> {
+    #[must_use]
+    fn pre_eval_instrs(&mut self, instrs: EcoVec<Instr>) -> (EcoVec<Instr>, Vec<UiuaError>) {
         use Primitive::*;
+        let mut errors = Vec::new();
         let instrs = optimize_instrs(instrs, true, &self.asm);
-        if self.pre_eval_mode == PreEvalMode::Lazy
+        if self.scope.fill
+            || self.pre_eval_mode == PreEvalMode::Lazy
             || instrs.iter().all(|instr| matches!(instr, Instr::Push(_)))
         {
-            return instrs;
+            return (instrs, errors);
         }
         let mut start = 0;
         let mut new_instrs: Option<EcoVec<Instr>> = None;
@@ -1760,7 +1736,7 @@ code:
                         Ok(None) => {}
                         Err(e) if e.is_fill() => {}
                         Err(e) if e.message().contains("No locals to get") => {}
-                        Err(e) => self.errors.push(e),
+                        Err(e) => errors.push(e),
                     }
                     start = end;
                     continue 'start;
@@ -1774,13 +1750,21 @@ code:
         // if let Some(new_instrs) = &new_instrs {
         //     println!("eval: {new_instrs:?}")
         // }
-        new_instrs.unwrap_or(instrs)
+        (new_instrs.unwrap_or(instrs), errors)
     }
     fn comptime_instrs(&mut self, instrs: EcoVec<Instr>) -> UiuaResult<Option<Vec<Value>>> {
-        if !self.pre_eval_mode.matches_instrs(&instrs, &self.asm)
-            || instrs.iter().all(|instr| matches!(instr, Instr::Push(_)))
-        {
+        if !self.pre_eval_mode.matches_instrs(&instrs, &self.asm) {
             return Ok(None);
+        }
+        if instrs.iter().all(|instr| matches!(instr, Instr::Push(_))) {
+            return Ok(Some(
+                (instrs.into_iter())
+                    .map(|instr| match instr {
+                        Instr::Push(val) => val,
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+            ));
         }
         thread_local! {
             static CACHE: RefCell<HashMap<EcoVec<Instr>, Option<Vec<Value>>>> = RefCell::new(HashMap::new());

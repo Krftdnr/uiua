@@ -1,5 +1,7 @@
 //! Compiler code for modifiers
 
+use std::slice;
+
 use crate::format::format_words;
 
 use super::*;
@@ -303,43 +305,6 @@ impl Compiler {
                 return Ok(());
             }
         };
-
-        // Give advice about redundancy
-        match prim {
-            m @ Primitive::Each if self.macro_depth == 0 => {
-                if let [Sp {
-                    value: Word::Primitive(prim),
-                    span,
-                }] = modified.operands.as_slice()
-                {
-                    if prim.class().is_pervasive() {
-                        let span = modified.modifier.span.clone().merge(span.clone());
-                        self.emit_diagnostic(
-                            format!(
-                                "Using {m} with a pervasive primitive like {p} is \
-                                redundant. Just use {p} by itself.",
-                                m = m.format(),
-                                p = prim.format(),
-                            ),
-                            DiagnosticKind::Advice,
-                            span,
-                        );
-                    }
-                } else if words_look_pervasive(&modified.operands) {
-                    let span = modified.modifier.span.clone();
-                    self.emit_diagnostic(
-                        format!(
-                            "{m}'s function is pervasive, \
-                                so {m} is redundant here.",
-                            m = m.format()
-                        ),
-                        DiagnosticKind::Advice,
-                        span,
-                    );
-                }
-            }
-            _ => {}
-        }
 
         // Compile operands
         let instrs = self.compile_words(modified.operands, false)?;
@@ -778,8 +743,36 @@ impl Compiler {
                     }
                 }
             }
+            Fill => {
+                let mut operands = modified.code_operands().rev().cloned();
+                if !call {
+                    self.new_functions.push(EcoVec::new());
+                }
+                let fill = take(&mut self.scope.fill);
+                self.scope.fill = true;
+                self.word(operands.next().unwrap(), false)?;
+                self.scope.fill = fill;
+                self.word(operands.next().unwrap(), false)?;
+                let span = self.add_span(modified.modifier.span.clone());
+                self.push_instr(Instr::Prim(Primitive::Fill, span));
+                if !call {
+                    let instrs = self.new_functions.pop().unwrap();
+                    let sig = instrs_signature(&instrs).map_err(|e| {
+                        self.fatal_error(
+                            modified.modifier.span.clone(),
+                            format!("Cannot infer function signature: {e}"),
+                        )
+                    })?;
+                    let func = self.add_function(
+                        FunctionId::Anonymous(modified.modifier.span.clone()),
+                        sig,
+                        instrs,
+                    );
+                    self.push_instr(Instr::PushFunc(func));
+                }
+            }
             Bind => {
-                let operand = modified.code_operands().next().cloned().unwrap();
+                let operand = modified.code_operands().next().unwrap().clone();
                 let operand_span = operand.span.clone();
                 self.scope.bind_locals.push(HashSet::new());
                 let (mut instrs, mut sig) = self.compile_operand_word(operand)?;
@@ -815,7 +808,7 @@ impl Compiler {
             }
             Reduce => {
                 // Reduce content
-                let operand = modified.code_operands().next().cloned().unwrap();
+                let operand = modified.code_operands().next().unwrap().clone();
                 let Word::Modified(m) = &operand.value else {
                     return Ok(false);
                 };
@@ -825,7 +818,7 @@ impl Compiler {
                 if m.code_operands().count() != 1 {
                     return Ok(false);
                 }
-                let operand = m.code_operands().next().cloned().unwrap();
+                let operand = m.code_operands().next().unwrap().clone();
                 let (content_instrs, sig) = self.compile_operand_word(operand)?;
                 if sig.args == 1 {
                     self.emit_diagnostic(
@@ -851,9 +844,38 @@ impl Compiler {
                 ];
                 finish!(instrs, Signature::new(1, 1));
             }
+            Each => {
+                // Each pervasive
+                let operand = modified.code_operands().next().unwrap().clone();
+                if !words_look_pervasive(slice::from_ref(&operand)) {
+                    return Ok(false);
+                }
+                let (instrs, sig) = self.compile_operand_word(operand)?;
+                let span = modified.modifier.span.clone();
+                self.emit_diagnostic(
+                    if let Some((prim, _)) = instrs_as_flipped_primitive(&instrs, &self.asm)
+                        .filter(|(prim, _)| prim.class().is_pervasive())
+                    {
+                        format!(
+                            "{} is pervasive, so {} is redundant here.",
+                            prim.format(),
+                            Each.format(),
+                        )
+                    } else {
+                        format!(
+                            "{m}'s function is pervasive, \
+                        so {m} is redundant here.",
+                            m = Each.format(),
+                        )
+                    },
+                    DiagnosticKind::Advice,
+                    span,
+                );
+                finish!(instrs, sig);
+            }
             Table => {
-                // Normalize table compilation, but get some diagnostics
-                let operand = modified.code_operands().next().cloned().unwrap();
+                // Normal table compilation, but get some diagnostics
+                let operand = modified.code_operands().next().unwrap().clone();
                 let op_span = operand.span.clone();
                 let function_id = FunctionId::Anonymous(op_span.clone());
                 let (instrs, sig) = self.compile_operand_word(operand)?;
@@ -881,7 +903,7 @@ impl Compiler {
                 finish!(instrs, sig);
             }
             Content => {
-                let operand = modified.code_operands().next().cloned().unwrap();
+                let operand = modified.code_operands().next().unwrap().clone();
                 let (instrs, sig) = self.compile_operand_word(operand)?;
                 let mut prefix = EcoVec::new();
                 let span = self.add_span(modified.modifier.span.clone());

@@ -1,7 +1,7 @@
 use std::{
     any::Any,
     env,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{stderr, stdin, stdout, Read, Write},
     net::*,
     path::{Path, PathBuf},
@@ -197,13 +197,17 @@ impl SysBackend for NativeSys {
     }
     fn open_file(&self, path: &Path) -> Result<Handle, String> {
         let handle = NATIVE_SYS.new_handle();
-        let file = File::open(path).map_err(|e| format!("{e} {}", path.display()))?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("{e} {}", path.display()))?;
         NATIVE_SYS.files.insert(handle, Buffered::new_reader(file));
         Ok(handle)
     }
     fn file_read_all(&self, path: &Path) -> Result<Vec<u8>, String> {
         let handle = self.open_file(path)?;
-        let bytes = self.read(handle, usize::MAX)?;
+        let bytes = self.read_all(handle)?;
         self.close(handle)?;
         Ok(bytes)
     }
@@ -228,27 +232,26 @@ impl SysBackend for NativeSys {
     fn read(&self, handle: Handle, len: usize) -> Result<Vec<u8>, String> {
         Ok(match NATIVE_SYS.get_stream(handle)? {
             SysStream::File(mut file) => {
-                let mut buf = Vec::new();
-                Write::by_ref(&mut *file)
-                    .take(len as u64)
-                    .read_to_end(&mut buf)
-                    .map_err(|e| e.to_string())?;
+                file.flush().map_err(|e| e.to_string())?;
+                let mut buf = vec![0; len];
+                let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+                buf.truncate(n);
                 buf
             }
             SysStream::Child(mut child) => {
                 let mut buf = vec![0; len];
-                (child.stdout.as_mut().unwrap())
-                    .read_exact(buf.as_mut_slice())
+                let n = (child.stdout.as_mut().unwrap())
+                    .read(&mut buf)
                     .map_err(|e| e.to_string())?;
+                buf.truncate(n);
                 buf
             }
             SysStream::TcpListener(_) => return Err("Cannot read from a tcp listener".to_string()),
             SysStream::TcpSocket(mut socket) => {
-                let mut buf = Vec::new();
-                Write::by_ref(&mut *socket)
-                    .take(len as u64)
-                    .read_to_end(&mut buf)
-                    .map_err(|e| e.to_string())?;
+                socket.flush().map_err(|e| e.to_string())?;
+                let mut buf = vec![0; len];
+                let n = socket.read(&mut buf).map_err(|e| e.to_string())?;
+                buf.truncate(n);
                 buf
             }
         })
@@ -256,22 +259,21 @@ impl SysBackend for NativeSys {
     fn read_all(&self, handle: Handle) -> Result<Vec<u8>, String> {
         Ok(match NATIVE_SYS.get_stream(handle)? {
             SysStream::File(mut file) => {
+                file.flush().map_err(|e| e.to_string())?;
                 let mut buf = Vec::new();
                 file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
                 buf
             }
             SysStream::Child(mut child) => {
                 let mut buf = Vec::new();
-                child
-                    .stdout
-                    .as_mut()
-                    .unwrap()
+                (child.stdout.as_mut().unwrap())
                     .read_to_end(&mut buf)
                     .map_err(|e| e.to_string())?;
                 buf
             }
             SysStream::TcpListener(_) => return Err("Cannot read from a tcp listener".to_string()),
             SysStream::TcpSocket(mut socket) => {
+                socket.flush().map_err(|e| e.to_string())?;
                 let mut buf = Vec::new();
                 socket.read_to_end(&mut buf).map_err(|e| e.to_string())?;
                 buf
@@ -534,10 +536,12 @@ impl SysBackend for NativeSys {
         if let Some((_, mut child)) = NATIVE_SYS.child_procs.remove(&handle) {
             child.kill().map_err(|e| e.to_string())?;
             Ok(())
-        } else if NATIVE_SYS.files.remove(&handle).is_some()
-            || NATIVE_SYS.tcp_listeners.remove(&handle).is_some()
-            || NATIVE_SYS.tcp_sockets.remove(&handle).is_some()
-        {
+        } else if let Some((_, mut file)) = NATIVE_SYS.files.remove(&handle) {
+            file.flush().map_err(|e| e.to_string())
+        } else if let Some((_, mut socket)) = NATIVE_SYS.tcp_sockets.remove(&handle) {
+            NATIVE_SYS.hostnames.remove(&handle);
+            socket.flush().map_err(|e| e.to_string())
+        } else if NATIVE_SYS.tcp_listeners.remove(&handle).is_some() {
             NATIVE_SYS.hostnames.remove(&handle);
             Ok(())
         } else {

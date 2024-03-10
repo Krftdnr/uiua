@@ -203,7 +203,7 @@ pub(crate) fn under_instrs(
     /// Copy 1 value to the temp stack after the "before", and pop it before the "after"
     macro_rules! store1copy {
         ($before:expr, $after:expr) => {
-            pat!($before, ($before, CopyToTempN(1)), (PopTempN(2), $after),)
+            pat!($before, ($before, CopyToTempN(1)), (PopTempN(1), $after),)
         };
     }
 
@@ -381,11 +381,11 @@ pub(crate) fn under_instrs(
         ),
         // System stuff
         &pat!(Now, (Now, PushTempN(1)), (PopTempN(1), Now, Flip, Sub)),
-        &store1copy!(Sys(SysOp::FOpen), Sys(SysOp::Close)),
-        &store1copy!(Sys(SysOp::FCreate), Sys(SysOp::Close)),
-        &store1copy!(Sys(SysOp::RunStream), Sys(SysOp::Close)),
-        &store1copy!(Sys(SysOp::TcpConnect), Sys(SysOp::Close)),
-        &store1copy!(Sys(SysOp::TcpAccept), Sys(SysOp::Close)),
+        &maybe_val!(store1copy!(Sys(SysOp::FOpen), Sys(SysOp::Close))),
+        &maybe_val!(store1copy!(Sys(SysOp::FCreate), Sys(SysOp::Close))),
+        &maybe_val!(store1copy!(Sys(SysOp::RunStream), Sys(SysOp::Close))),
+        &maybe_val!(store1copy!(Sys(SysOp::TcpConnect), Sys(SysOp::Close))),
+        &maybe_val!(store1copy!(Sys(SysOp::TcpAccept), Sys(SysOp::Close))),
         &maybe_val!(stash1!(Sys(SysOp::FReadAllStr), Sys(SysOp::FWriteAll))),
         &maybe_val!(stash1!(Sys(SysOp::FReadAllBytes), Sys(SysOp::FWriteAll))),
         &pat!(BothTrace, (BothTrace), (UnTrace)),
@@ -1304,7 +1304,7 @@ fn invert_scan_pattern<'a>(
     let [Instr::PushFunc(f), Instr::Prim(Primitive::Scan, span), input @ ..] = input else {
         return None;
     };
-    let inverse = match f.as_flipped_primitive(comp) {
+    let inverse = match f.as_flipped_primitive(&comp.asm) {
         Some((Primitive::Add, false)) => eco_vec![Instr::Prim(Primitive::Sub, *span)],
         Some((Primitive::Mul, false)) => eco_vec![Instr::Prim(Primitive::Div, *span)],
         Some((Primitive::Eq, false)) => eco_vec![Instr::Prim(Primitive::Eq, *span)],
@@ -1437,7 +1437,7 @@ fn invert_reduce_mul_pattern<'a>(
     let [Instr::PushFunc(f), Instr::Prim(Primitive::Reduce, span), input @ ..] = input else {
         return None;
     };
-    let Some((Primitive::Mul, _)) = f.as_flipped_primitive(comp) else {
+    let Some((Primitive::Mul, _)) = f.as_flipped_primitive(&comp.asm) else {
         return None;
     };
     let instrs = eco_vec![Instr::ImplPrim(ImplPrimitive::Primes, *span)];

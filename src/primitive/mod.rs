@@ -343,7 +343,6 @@ impl Primitive {
             Primitive::This | Primitive::Recur => {
                 Some("use the name of a binding to recur instead".into())
             }
-            Primitive::Sys(SysOp::Import) => Some("use new ~ syntax instead".into()),
             Primitive::Sys(SysOp::GifDecode) => Some(format!(
                 "use {} {} instead",
                 Primitive::Un.format(),
@@ -368,7 +367,7 @@ impl Primitive {
         use Primitive::*;
         matches!(
             self,
-            (Mask | Coordinate)
+            Coordinate
                 | (This | Recur)
                 | (Rectify | All | Cascade | By)
                 | (Map | Insert | Has | Get | Remove)

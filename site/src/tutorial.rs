@@ -6,7 +6,7 @@ use leptos_meta::*;
 use leptos_router::*;
 use uiua::{example_ua, Primitive, SysOp};
 
-use crate::{editor::*, Hd, Prim, Prims};
+use crate::{editor::*, other_tutorial::OtherTutorialParams, Hd, Prim, Prims};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Sequence)]
 pub enum TutorialPage {
@@ -59,42 +59,54 @@ pub struct TutorialParams {
 
 #[component]
 pub fn Tutorial() -> impl IntoView {
-    move || {
-        let page = match use_params::<TutorialParams>().get() {
-            Ok(params) => params.page,
-            Err(_) => TutorialPage::Introduction,
-        };
-        let tut_view = match page {
-            TutorialPage::Introduction => TutorialIntroduction().into_view(),
-            TutorialPage::Basic => TutorialBasic().into_view(),
-            TutorialPage::Math => TutorialMath().into_view(),
-            TutorialPage::Arrays => TutorialArrays().into_view(),
-            TutorialPage::Types => TutorialTypes().into_view(),
-            TutorialPage::Bindings => TutorialBindings().into_view(),
-            TutorialPage::Functions => TutorialFunctions().into_view(),
-            TutorialPage::ControlFlow => TutorialControlFlow().into_view(),
-            TutorialPage::AdvancedStack => TutorialAdvancedStack().into_view(),
-            TutorialPage::Inverses => TutorialInverses().into_view(),
-            TutorialPage::AdvancedArray => TutorialAdvancedArray().into_view(),
-            TutorialPage::ThinkingWithArrays => TutorialThinkingWithArrays().into_view(),
-            TutorialPage::Macros => TutorialMacros().into_view(),
-            TutorialPage::Modules => TutorialModules().into_view(),
-            TutorialPage::Testing => TutorialTesting().into_view(),
-        };
-        view! {
-            <A href="/docs">"Back to Docs Home"</A>
-            <br/>
-            <br/>
-            <TutorialNav page=page/>
-            { tut_view }
-            <br/>
-            <br/>
-            <TutorialNav page=page/>
-            <br/>
-            <br/>
-            <A href="/docs">"Back to Docs Home"</A>
+    move || match use_params::<TutorialParams>().get() {
+        Ok(params) => {
+            let page = params.page;
+            let tut_view = match page {
+                TutorialPage::Introduction => TutorialIntroduction().into_view(),
+                TutorialPage::Basic => TutorialBasic().into_view(),
+                TutorialPage::Math => TutorialMath().into_view(),
+                TutorialPage::Arrays => TutorialArrays().into_view(),
+                TutorialPage::Types => TutorialTypes().into_view(),
+                TutorialPage::Bindings => TutorialBindings().into_view(),
+                TutorialPage::Functions => TutorialFunctions().into_view(),
+                TutorialPage::ControlFlow => TutorialControlFlow().into_view(),
+                TutorialPage::AdvancedStack => TutorialAdvancedStack().into_view(),
+                TutorialPage::Inverses => TutorialInverses().into_view(),
+                TutorialPage::AdvancedArray => TutorialAdvancedArray().into_view(),
+                TutorialPage::ThinkingWithArrays => TutorialThinkingWithArrays().into_view(),
+                TutorialPage::Macros => TutorialMacros().into_view(),
+                TutorialPage::Modules => TutorialModules().into_view(),
+                TutorialPage::Testing => TutorialTesting().into_view(),
+            };
+            view! {
+                <A href="/docs">"Back to Docs Home"</A>
+                <br/>
+                <br/>
+                <TutorialNav page=page/>
+                { tut_view }
+                <br/>
+                <br/>
+                <TutorialNav page=page/>
+                <br/>
+                <br/>
+                <A href="/docs">"Back to Docs Home"</A>
+            }
+            .into_view()
         }
-        .into_view()
+        Err(_) => match use_params::<OtherTutorialParams>().get() {
+            Ok(params) => view! {
+                <A href="/docs">"Back to Docs Home"</A>
+                <br/>
+                <br/>
+                { params.page.view() }
+                <br/>
+                <br/>
+                <A href="/docs">"Back to Docs Home"</A>
+            }
+            .into_view(),
+            Err(_) => TutorialIntroduction().into_view(),
+        },
     }
 }
 
@@ -1178,6 +1190,8 @@ splitArray([1, 2, 3, 7, 2, 4, 5])"</code>
         <Editor example="⍥/+2 ↯3_3⇡9"/>
         <p><Prim prim=Repeat/><Prim prim=Rand/>" inside "<code>"[]"</code>"s is a common pattern for generating a list of random numbers."</p>
         <Editor example="⁅[⍥⚂]5"/>
+        <p><Prim prim=Repeat/>" is also useful for conditionally calling a function. Because booleans in Uiua are just numbers, "<Prim prim=Repeat/>"ing with a boolean value will call a function "<code>"0"</code>" or "<code>"1"</code>" times."</p>
+        <Editor example="F ← ⍥(×10)<10.\nF 5\nF 12"/>
         <p><Prim prim=Repeat/>"'s glyph is a combination of a circle, representing a loop, and the 𝄇 symbol from musical notation."</p>
         <p>"The "<Prim prim=Do/>" modifier takes a loop function and a condition function. It repeatedly calls the loop function as long as the condition function returns "<code>"1"</code>"."</p>
         <Editor example="⍢(×2|<1000) 1"/>
@@ -1517,6 +1531,7 @@ fn EndOfTutorialList() -> impl IntoView {
     view! {
         <ul>
             <li><A href="/docs#functions">"The list of all functions"</A></li>
+            <li><A href="/docs#other-tutorials">"Other tutorials about more specific topics"</A></li>
             <li><A href="/docs#other-docs">"Other language topics"</A></li>
             <li>"The online "<A href="/pad">"pad"</A>" for writing longer code"</li>
             <li><A href="/docs/isms">"Uiuisms"</A>", a currated list of common operations"</li>
