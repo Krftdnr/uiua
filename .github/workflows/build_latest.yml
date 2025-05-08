@@ -1,0 +1,152 @@
+name: Build Latest
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "site/**"
+      - "pad/**"
+      - "tests*/**"
+      - "changelog.md"
+      - "readme.md"
+      - ".github/workflows/build_latest.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Test the interpreter
+  test_bin:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/cache@v4
+      with:
+        path: target
+        key: build-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          build-${{ runner.os }}-
+    - name: Run interpreter tests
+      run: cargo test --lib
+  # Test the site
+  test_site:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/cache@v4
+      with:
+        path: target
+        key: build-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          build-${{ runner.os }}-
+    - name: Run site tests
+      run: cargo test -p site
+  # Build the site
+  build_site:
+    needs: test_site
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ref: main
+    - uses: actions/cache@v4
+      with:
+        path: target
+        key: build-${{ runner.os }}-${{ hashFiles('Cargo.lock', '.github/workflows/build_latest.yml') }}
+        restore-keys: |
+          build-${{ runner.os }}-
+    - name: Authenticate git
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+    - name: Fetch site branch
+      run: git fetch origin site:site
+    - name: Install dependencies
+      run: |
+        rustup target add wasm32-unknown-unknown
+        cargo install trunk --locked --root target
+    - name: Build site
+      run: |
+        git checkout site
+        git branch --set-upstream-to=origin/site
+        git reset --hard origin/site
+        git rebase main || { echo "Rebase failed, aborting."; git rebase --abort; exit 1; }
+        cd site
+        ../target/bin/trunk build --release -d ../docs
+        git add --all
+        git commit --amend --no-edit
+        git push --force
+        git checkout main
+  # Create the release without assets
+  create_release:
+    name: Create release
+    needs: [test_bin, build_site]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+    - uses: actions/checkout@v4
+    - name: Delete old release
+      run: gh release delete latest --yes || true
+    - name: Prepare release notes
+      run: echo "This release contains binaries for the latest \`main\` branch." >> release_notes.md
+    - name: Create release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: latest
+        name: Latest Build
+        body_path: ./release_notes.md
+        prerelease: true
+  # Create the binaries and upload them as release assets
+  create_binaries:
+    name: Create binary
+    needs: [test_bin, create_release]
+    runs-on: ${{ matrix.os }}
+    env:
+      BINARY_EXT: ${{ matrix.os == 'windows-latest' && '.exe' || '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest,   target: x86_64-apple-darwin,       features: "audio,window"                   }
+          - { os: macos-latest,   target: aarch64-apple-darwin,      features: "audio,window"                   }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  features: "full"                           }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  features: "window",      name: "-no-audio" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,    features: "full"                           }
+          - { os: windows-latest, target: aarch64-pc-windows-msvc,   features: "audio,window"                   }
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install dependencies
+      - if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get install -y musl-tools
+      - if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get install -y libasound2-dev libudev-dev libx11-dev libjpeg-dev libclang-dev
+
+      # Build
+      - name: Install target
+        run: rustup target add ${{matrix.target}}
+      - name: Build
+        run: cargo build --bin uiua --features ${{matrix.features}} --release --target ${{matrix.target}} --verbose
+
+      - name: Zip
+        run: 7z a -tzip uiua-bin-${{matrix.target}}${{matrix.name}}.zip ./target/${{matrix.target}}/release/uiua${{env.BINARY_EXT}}
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: latest
+          files: |
+            uiua-bin-${{matrix.target}}${{matrix.name}}.zip

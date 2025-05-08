@@ -1,85 +1,129 @@
-use std::{borrow::Cow, cmp::Ordering, fmt};
+//! Signature checker implementation
 
-use enum_iterator::Sequence;
-
-use crate::{
-    array::Array,
-    function::{Function, Instr, Signature},
-    value::Value,
-    ImplPrimitive, Primitive, TempStack,
+use std::{
+    array,
+    cell::RefCell,
+    collections::HashMap,
+    fmt,
+    hash::{DefaultHasher, Hash, Hasher},
+    slice,
 };
 
-const START_HEIGHT: usize = 16;
+use serde::*;
 
-/// Count the number of arguments and outputs of a function.
-pub(crate) fn instrs_signature(instrs: &[Instr]) -> Result<Signature, SigCheckError> {
-    if let [Instr::Prim(prim, _)] = instrs {
-        if let Some((args, outputs)) = prim.args().zip(prim.outputs()) {
-            return Ok(Signature {
-                args: args + prim.modifier_args().unwrap_or(0),
-                outputs,
-            });
-        }
+use crate::{ImplPrimitive, Node, Primitive, SigNode, Signature, SysOp};
+
+impl Node {
+    /// Get the signature of this node
+    pub fn sig(&self) -> Result<Signature, SigCheckError> {
+        nodes_all_sigs(self.as_slice())
     }
-    let env = VirtualEnv::from_instrs(instrs)?;
-    Ok(env.sig())
+    /// Convert this node to a [`SigNode`]
+    pub fn sig_node(self) -> Result<SigNode, SigCheckError> {
+        let sig = self.sig()?;
+        Ok(SigNode::new(sig, self.clone()))
+    }
+    /// Get the signature of this node if there is no net temp stack change
+    pub fn clean_sig(&self) -> Option<Signature> {
+        nodes_clean_sig(slice::from_ref(self))
+    }
 }
 
-pub(crate) fn instrs_temp_signatures(
-    instrs: &[Instr],
-) -> Result<[Signature; TempStack::CARDINALITY], SigCheckError> {
-    let env = VirtualEnv::from_instrs(instrs)?;
-    Ok(env.temp_signatures())
+pub fn nodes_sig(nodes: &[Node]) -> Result<Signature, SigCheckError> {
+    VirtualEnv::from_nodes(nodes).map(|env| env.stack.sig())
 }
 
-pub(crate) fn instrs_all_signatures(
-    instrs: &[Instr],
-) -> Result<(Signature, [Signature; TempStack::CARDINALITY]), SigCheckError> {
-    let env = VirtualEnv::from_instrs(instrs)?;
-    Ok((env.sig(), env.temp_signatures()))
+pub fn nodes_clean_sig(nodes: &[Node]) -> Option<Signature> {
+    let sig = nodes_all_sigs(nodes).ok()?;
+    if sig.under_args() != 0 || sig.under_outputs() != 0 {
+        None
+    } else {
+        Some(sig)
+    }
+}
+
+fn nodes_all_sigs(nodes: &[Node]) -> Result<Signature, SigCheckError> {
+    type AllSigsCache = HashMap<u64, Signature>;
+    thread_local! {
+        static CACHE: RefCell<AllSigsCache> = RefCell::new(AllSigsCache::new());
+    }
+    let mut hasher = DefaultHasher::new();
+    nodes.hash(&mut hasher);
+    let hash = hasher.finish();
+    CACHE.with(|cache| {
+        if let Some(sigs) = cache.borrow().get(&hash) {
+            return Ok(*sigs);
+        }
+        let env = VirtualEnv::from_nodes(nodes)?;
+        let under_sig = env.under.sig();
+        let sig = (env.stack.sig()).with_under(under_sig.args(), under_sig.outputs());
+        cache.borrow_mut().insert(hash, sig);
+        Ok(sig)
+    })
 }
 
 /// An environment that emulates the runtime but only keeps track of the stack.
-struct VirtualEnv<'a> {
-    stack: Vec<BasicValue>,
-    temp_stacks: [Vec<BasicValue>; TempStack::CARDINALITY],
-    function_stack: Vec<Cow<'a, Function>>,
-    array_stack: Vec<usize>,
-    min_height: usize,
-    temp_min_heights: [usize; TempStack::CARDINALITY],
-    popped: Vec<usize>,
+struct VirtualEnv {
+    stack: Stack,
+    under: Stack,
+    node_depth: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default)]
+struct Stack {
+    height: i32,
+    min_height: usize,
+}
+
+impl Stack {
+    // Simulate popping a value. Errors if the stack is empty, which means the function has too many args.
+    fn pop(&mut self) {
+        self.height -= 1;
+        self.set_min_height();
+    }
+    fn pop_n(&mut self, n: usize) {
+        self.height -= n as i32;
+        self.set_min_height();
+    }
+    fn push(&mut self) {
+        self.height += 1;
+    }
+    fn push_n(&mut self, n: usize) {
+        self.height += n as i32;
+    }
+    fn handle_args_outputs(&mut self, args: usize, outputs: usize) {
+        self.pop_n(args);
+        self.push_n(outputs);
+    }
+    /// Set the current stack height as a potential minimum.
+    /// At the end of checking, the minimum stack height is a component in calculating the signature.
+    fn set_min_height(&mut self) {
+        self.min_height = self.min_height.max((-self.height).max(0) as usize);
+    }
+    fn sig(&self) -> Signature {
+        Signature::new(
+            self.min_height,
+            (self.height + self.min_height as i32).max(0) as usize,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SigCheckError {
     pub message: String,
     pub kind: SigCheckErrorKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SigCheckErrorKind {
     Incorrect,
-    Ambiguous,
-    LoopOverreach,
-    LoopExcess,
+    NoInverse,
 }
 
 impl SigCheckError {
-    pub fn ambiguous(self) -> Self {
+    pub fn no_inverse(self) -> Self {
         Self {
-            kind: SigCheckErrorKind::Ambiguous,
-            ..self
-        }
-    }
-    pub fn loop_overreach(self) -> Self {
-        Self {
-            kind: SigCheckErrorKind::LoopOverreach,
-            ..self
-        }
-    }
-    pub fn loop_excess(self) -> Self {
-        Self {
-            kind: SigCheckErrorKind::LoopExcess,
+            kind: SigCheckErrorKind::NoInverse,
             ..self
         }
     }
@@ -109,573 +153,464 @@ impl fmt::Display for SigCheckError {
     }
 }
 
-#[derive(Debug, Clone)]
-enum BasicValue {
-    Num(f64),
-    Arr(Vec<Self>),
-    Other,
-    Unknown(usize),
-}
+const MAX_NODE_DEPTH: usize = if cfg!(debug_assertions) { 26 } else { 50 };
 
-impl BasicValue {
-    fn from_val(value: &Value) -> Self {
-        if let Some(n) = value.as_num_array().and_then(Array::as_scalar) {
-            BasicValue::Num(*n)
-        } else if let Some(n) = value.as_byte_array().and_then(Array::as_scalar) {
-            BasicValue::Num(*n as f64)
-        } else if value.rank() == 1 {
-            BasicValue::Arr(match value {
-                Value::Num(n) => n.data.iter().map(|n| BasicValue::Num(*n)).collect(),
-                Value::Byte(b) => b.data.iter().map(|b| BasicValue::Num(*b as f64)).collect(),
-                Value::Complex(c) => c.data.iter().map(|_| BasicValue::Other).collect(),
-                Value::Char(c) => c.data.iter().map(|_| BasicValue::Other).collect(),
-                Value::Box(b) => b.data.iter().map(|_| BasicValue::Other).collect(),
-            })
-        } else {
-            BasicValue::Other
-        }
-    }
-}
-
-impl FromIterator<f64> for BasicValue {
-    fn from_iter<T>(iter: T) -> Self
-    where
-        T: IntoIterator<Item = f64>,
-    {
-        BasicValue::Arr(iter.into_iter().map(BasicValue::Num).collect())
-    }
-}
-
-fn derive_sig(min_height: usize, final_height: usize) -> Signature {
-    Signature {
-        args: START_HEIGHT.saturating_sub(min_height),
-        outputs: final_height - min_height,
-    }
-}
-
-impl<'a> VirtualEnv<'a> {
-    fn from_instrs(instrs: &'a [Instr]) -> Result<Self, SigCheckError> {
-        let mut temp_stacks = <[_; TempStack::CARDINALITY]>::default();
-        for stack in temp_stacks.iter_mut() {
-            *stack = vec![BasicValue::Other; START_HEIGHT];
-        }
+impl VirtualEnv {
+    fn from_nodes(nodes: &[Node]) -> Result<Self, SigCheckError> {
+        // println!("\ncheck sig: {nodes:?}");
         let mut env = VirtualEnv {
-            stack: (0..START_HEIGHT).rev().map(BasicValue::Unknown).collect(),
-            temp_stacks,
-            function_stack: Vec::new(),
-            array_stack: Vec::new(),
-            min_height: START_HEIGHT,
-            temp_min_heights: [START_HEIGHT; TempStack::CARDINALITY],
-            popped: Vec::new(),
+            stack: Stack::default(),
+            under: Stack::default(),
+            node_depth: 0,
         };
-        env.instrs(instrs)?;
+        env.nodes(nodes)?;
         Ok(env)
     }
-    fn sig(&self) -> Signature {
-        derive_sig(self.min_height, self.stack.len())
+    fn nodes(&mut self, nodes: &[Node]) -> Result<(), SigCheckError> {
+        nodes.iter().try_for_each(|node| self.node(node))
     }
-    fn temp_signatures(&self) -> [Signature; TempStack::CARDINALITY] {
-        let mut sigs = [Signature::new(0, 0); TempStack::CARDINALITY];
-        for ((sig, min_height), stack) in sigs
-            .iter_mut()
-            .zip(&self.temp_min_heights)
-            .zip(&self.temp_stacks)
-        {
-            *sig = derive_sig(*min_height, stack.len());
-        }
-        sigs
-    }
-    fn instrs(&mut self, instrs: &'a [Instr]) -> Result<(), SigCheckError> {
-        let mut i = 0;
-        while i < instrs.len() {
-            match &instrs[i] {
-                Instr::PushSig(sig) => {
-                    let mut depth = 0;
-                    i += 1;
-                    while i < instrs.len() {
-                        match &instrs[i] {
-                            Instr::PushSig(_) => depth += 1,
-                            Instr::PopSig => {
-                                if depth == 0 {
-                                    break;
-                                } else {
-                                    depth -= 1;
-                                }
-                            }
-                            _ => {}
-                        }
-                        i += 1;
-                    }
-                    self.handle_sig(*sig)?;
-                }
-                Instr::PopSig => {
-                    return Err(SigCheckError::from(
-                        "PopSig without PushSig. \
-                        It is a bug in the interpreter for you to see this message.",
-                    ))
-                }
-                instr => self.instr(instr)?,
-            }
-            i += 1;
-        }
+    fn sig_node(&mut self, sn: &SigNode) -> Result<(), SigCheckError> {
+        self.handle_sig(sn.sig);
         Ok(())
     }
-    fn instr(&mut self, instr: &'a Instr) -> Result<(), SigCheckError> {
+    fn node(&mut self, node: &Node) -> Result<(), SigCheckError> {
+        use ImplPrimitive::*;
         use Primitive::*;
-        match instr {
-            Instr::Comment(_) => {}
-            Instr::Push(val) => self.stack.push(BasicValue::from_val(val)),
-            Instr::CallGlobal { call, .. } => {
-                if *call {
-                    self.handle_args_outputs(0, 1)?;
-                }
+        if self.node_depth > MAX_NODE_DEPTH {
+            return Err("Function is too complex".into());
+        }
+        self.node_depth += 1;
+        match node {
+            Node::Run(nodes) => nodes.iter().try_for_each(|node| self.node(node))?,
+            Node::Push(_) => self.push(),
+            Node::Array { len, inner, .. } => {
+                self.node(inner)?;
+                self.stack.pop_n(*len);
+                self.stack.push();
             }
-            Instr::BindGlobal { .. } => {
-                self.pop()?;
-            }
-            Instr::BeginArray => self.array_stack.push(self.stack.len()),
-            Instr::EndArray { .. } => {
-                let bottom = self
-                    .array_stack
-                    .pop()
-                    .ok_or("EndArray without BeginArray")?;
-                let mut items: Vec<_> = self.stack.drain(bottom..).collect();
-                self.set_min_height();
-                items.reverse();
-                self.stack.push(BasicValue::Arr(items));
-            }
-            Instr::Call(_) => {
-                let sig = self.pop_func()?.signature();
-                self.handle_sig(sig)?
-            }
-            Instr::PushLocals { count, .. } => self.handle_args_outputs(*count, 0)?,
-            Instr::PopLocals => {}
-            Instr::GetLocal { .. } => self.stack.push(BasicValue::Other),
-            Instr::PushTemp { count, stack, .. } => {
-                for _ in 0..*count {
-                    let val = self.pop()?;
-                    self.temp_stacks[*stack as usize].push(val);
-                }
-                self.set_min_height();
-            }
-            Instr::CopyToTemp { count, stack, .. } => {
-                let mut vals = Vec::with_capacity(*count);
-                for _ in 0..*count {
-                    vals.push(self.pop()?);
-                }
-                self.set_min_height();
-                for val in vals {
-                    self.temp_stacks[*stack as usize].push(val.clone());
-                    self.stack.push(val);
-                }
-            }
-            Instr::PopTemp { count, stack, .. } => {
-                for _ in 0..*count {
-                    let val = self.pop_temp(*stack)?;
-                    self.stack.push(val);
-                }
-                self.set_min_height();
-            }
-            Instr::Label { .. } => self.handle_args_outputs(1, 1)?,
-            Instr::PushFunc(f) => self.function_stack.push(Cow::Borrowed(f)),
-            &Instr::Switch {
-                count,
-                sig,
-                under_cond,
-                ..
+            Node::Label(..) | Node::RemoveLabel(..) => self.handle_args_outputs(1, 1),
+            Node::Call(func, _) => self.handle_sig(func.sig),
+            Node::CallMacro { sig, .. } | Node::CallGlobal(_, sig) => self.handle_sig(*sig),
+            Node::BindGlobal { .. } => self.handle_args_outputs(1, 0),
+            Node::CustomInverse(cust, _) => self.handle_sig(cust.sig()?),
+            Node::Dynamic(dy) => self.handle_sig(dy.sig),
+            &Node::Switch {
+                sig, under_cond, ..
             } => {
-                for _ in 0..count {
-                    self.pop_func()?;
-                }
-                let cond = self.pop()?;
+                self.pop();
+                self.handle_sig(sig);
                 if under_cond {
-                    self.temp_stacks[TempStack::Under as usize].push(cond);
+                    self.under.push();
                 }
-                self.handle_args_outputs(sig.args, sig.outputs)?;
             }
-            Instr::Format { parts, .. } => {
-                self.handle_args_outputs(parts.len().saturating_sub(1), 1)?
+            Node::Format(parts, ..) => self.handle_args_outputs(parts.len().saturating_sub(1), 1),
+            Node::MatchFormatPattern(parts, ..) => {
+                self.handle_args_outputs(1, parts.len().saturating_sub(1))
             }
-            Instr::MatchFormatPattern { parts, .. } => {
-                self.handle_args_outputs(1, parts.len().saturating_sub(1))?
+            Node::Unpack { count, .. } => self.handle_args_outputs(1, *count),
+            Node::ImplMod(Astar, args, _) | Node::ImplMod(AstarFirst, args, _) => {
+                self.pop();
+                let [neighbors, heuristic, is_goal] = get_args(args)?;
+                let has_costs = neighbors.outputs() == 2;
+                let args = neighbors
+                    .args()
+                    .max(heuristic.args())
+                    .max(is_goal.args())
+                    .saturating_sub(1);
+                self.handle_args_outputs(args, 1 + has_costs as usize);
             }
-            Instr::Dynamic(f) => self.handle_sig(f.signature)?,
-            Instr::Unpack { count, .. } => self.handle_args_outputs(1, *count)?,
-            Instr::TouchStack { count, .. } => self.handle_args_outputs(*count, *count)?,
-            Instr::Prim(prim, _) => match prim {
-                Reduce => {
-                    let sig = self.pop_func()?.signature();
-                    let outputs = match (sig.args, sig.outputs) {
-                        (0, _) => return Err(format!("{prim}'s function has no args").into()),
-                        (1, 0) => 0,
-                        (1, _) => {
-                            return Err(SigCheckError::from(format!(
-                                "{prim}'s function's signature is {sig}"
-                            ))
-                            .ambiguous())
-                        }
-                        (_, 1) => 1,
-                        _ => return Err(format!("{prim}'s function's signature is {sig}").into()),
-                    };
-                    self.handle_args_outputs(1, outputs)?;
-                }
-                Scan => {
-                    let _sig = self.pop_func()?.signature();
-                    self.handle_args_outputs(1, 1)?;
+            Node::ImplMod(AstarTake, args, _) => {
+                self.pop();
+                self.pop();
+                let [neighbors, heuristic, is_goal] = get_args(args)?;
+                let has_costs = neighbors.outputs() == 2;
+                let args = neighbors
+                    .args()
+                    .max(heuristic.args())
+                    .max(is_goal.args())
+                    .saturating_sub(1);
+                self.handle_args_outputs(args, 1 + has_costs as usize);
+            }
+            Node::ImplMod(AstarPop, args, _) => {
+                self.pop();
+                let [neighbors, heuristic, is_goal] = get_args(args)?;
+                let has_costs = neighbors.outputs() == 2;
+                let args = neighbors
+                    .args()
+                    .max(heuristic.args())
+                    .max(is_goal.args())
+                    .saturating_sub(1);
+                self.handle_args_outputs(args, has_costs as usize);
+            }
+            Node::Mod(Path, args, _) | Node::ImplMod(PathFirst, args, _) => {
+                self.pop();
+                let [neighbors, is_goal] = get_args(args)?;
+                let has_costs = neighbors.outputs() == 2;
+                let args = neighbors.args().max(is_goal.args()).saturating_sub(1);
+                self.handle_args_outputs(args, 1 + has_costs as usize);
+            }
+            Node::ImplMod(PathTake, args, _) => {
+                self.pop();
+                self.pop();
+                let [neighbors, is_goal] = get_args(args)?;
+                let has_costs = neighbors.outputs() == 2;
+                let args = neighbors.args().max(is_goal.args()).saturating_sub(1);
+                self.handle_args_outputs(args, 1 + has_costs as usize);
+            }
+            Node::ImplMod(PathPop, args, _) => {
+                self.pop();
+                let [neighbors, is_goal] = get_args(args)?;
+                let has_costs = neighbors.outputs() == 2;
+                let args = neighbors.args().max(is_goal.args()).saturating_sub(1);
+                self.handle_args_outputs(args, has_costs as usize);
+            }
+            Node::Prim(prim, _) => {
+                let args = prim
+                    .args()
+                    .ok_or_else(|| format!("{prim} has indeterminate args"))?;
+                let outputs = prim
+                    .outputs()
+                    .ok_or_else(|| format!("{prim} has indeterminate outputs"))?;
+                self.handle_args_outputs(args, outputs);
+            }
+            Node::ImplPrim(prim, _) => {
+                let args = prim
+                    .args()
+                    .ok_or_else(|| format!("{prim} has indeterminate args"))?;
+                let outputs = prim
+                    .outputs()
+                    .ok_or_else(|| format!("{prim} has indeterminate outputs"))?;
+                self.handle_args_outputs(args, outputs);
+            }
+            Node::Mod(prim, args, _) => match prim {
+                Reduce | Scan => {
+                    let [sig] = get_args(args)?;
+                    let args = sig.args().saturating_sub(sig.outputs());
+                    self.handle_args_outputs(args, sig.outputs());
                 }
                 Each | Rows | Inventory => {
-                    let sig = self.pop_func()?.signature();
-                    self.handle_sig(sig)?
+                    let [f] = get_args_nodes(args)?;
+                    self.sig_node(f)?;
                 }
-                Table => {
-                    let sig = self.pop_func()?.signature();
-                    self.handle_sig(sig)?;
+                Table | Tuples => {
+                    let [sig] = get_args(args)?;
+                    self.handle_sig(sig);
+                }
+                Stencil => {
+                    let [sig] = get_args(args)?;
+                    if sig.args() <= 1 {
+                        self.pop();
+                    }
+                    self.handle_args_outputs(1, sig.outputs());
                 }
                 Group | Partition => {
-                    let sig = self.pop_func()?.signature();
-                    self.handle_args_outputs(2, sig.outputs)?;
+                    let [sig] = get_args(args)?;
+                    self.handle_args_outputs(sig.args().max(1) + 1, sig.outputs());
                 }
                 Spawn | Pool => {
-                    let sig = self.pop_func()?.signature();
-                    self.handle_args_outputs(sig.args, 1)?;
+                    let [sig] = get_args(args)?;
+                    self.handle_args_outputs(sig.args(), 1);
                 }
                 Repeat => {
-                    let f = self.pop_func()?;
-                    let sig = f.signature();
-                    let n = self.pop()?;
-                    if let BasicValue::Num(n) = n {
-                        // If n is a known natural number, then the function can have any signature.
-                        if n.fract() == 0.0 && n >= 0.0 {
-                            let n = n as usize;
-                            if n > 0 {
-                                let (args, outputs) = match sig.args.cmp(&sig.outputs) {
-                                    Ordering::Equal => (sig.args, sig.outputs),
-                                    Ordering::Less => {
-                                        (sig.args, n * (sig.outputs - sig.args) + sig.args)
-                                    }
-                                    Ordering::Greater => {
-                                        ((n - 1) * (sig.args - sig.outputs) + sig.args, sig.outputs)
-                                    }
-                                };
-                                self.handle_args_outputs(args, outputs)?;
-                            }
-                        } else if n.is_infinite() {
-                            match sig.args.cmp(&sig.outputs) {
-                                Ordering::Equal => {}
-                                Ordering::Greater => {
-                                    return Err(SigCheckError::from(format!(
-                                        "repeat with infinity and a function with signature {sig}"
-                                    ))
-                                    .loop_overreach());
-                                }
-                                Ordering::Less => {
-                                    return Err(SigCheckError::from(format!(
-                                        "repeat with infinity and a function with signature {sig}"
-                                    ))
-                                    .loop_excess());
-                                }
-                            }
-                            self.handle_sig(sig)?;
-                        } else {
-                            return Err("repeat without a natural number or infinity".into());
-                        }
-                    } else {
-                        // If n is unknown, then what we do depends on the signature
-                        let sig = f.signature();
-                        match sig.args.cmp(&sig.outputs) {
-                            Ordering::Equal => self.handle_sig(sig)?,
-                            Ordering::Greater => {
-                                return Err(SigCheckError::from(format!(
-                                    "repeat with no number and a function with signature {sig}"
-                                ))
-                                .loop_overreach());
-                            }
-                            Ordering::Less if self.array_stack.is_empty() => {
-                                return Err(SigCheckError::from(format!(
-                                    "repeat with no number and a function with signature {sig}"
-                                ))
-                                .loop_excess());
-                            }
-                            Ordering::Less => self.handle_sig(sig)?,
-                        }
-                    }
+                    let [f] = get_args_nodes(args)?;
+                    self.pop();
+                    self.repeat(f)?;
                 }
                 Do => {
-                    let body = self.pop_func()?;
-                    let cond = self.pop_func()?;
-                    let body_sig = body.signature();
-                    let cond_sig = cond.signature();
-                    let copy_count = cond_sig
-                        .args
-                        .saturating_sub(cond_sig.outputs.saturating_sub(1));
+                    let [body, cond] = get_args(args)?;
+                    let copy_count = cond.args().saturating_sub(cond.outputs().saturating_sub(1));
                     let cond_sub_sig = Signature::new(
-                        cond_sig.args,
-                        (cond_sig.outputs + copy_count).saturating_sub(1),
+                        cond.args(),
+                        (cond.outputs() + copy_count).saturating_sub(1),
                     );
-                    let comp_sig = body_sig.compose(cond_sub_sig);
-                    if comp_sig.args < comp_sig.outputs && self.array_stack.is_empty() {
-                        return Err(SigCheckError::from(format!(
-                            "do with a function with signature {comp_sig}"
-                        ))
-                        .loop_excess());
-                    }
+                    let comp_sig = body.compose(cond_sub_sig);
                     self.handle_args_outputs(
-                        comp_sig.args,
-                        comp_sig.outputs + cond_sub_sig.outputs.saturating_sub(cond_sig.args),
-                    )?;
+                        comp_sig.args(),
+                        comp_sig.outputs() + cond_sub_sig.outputs().saturating_sub(cond.args()),
+                    );
+                    if comp_sig.args() < comp_sig.outputs() {
+                        self.stack.pop_n(comp_sig.args());
+                    }
                 }
-                All => {
-                    let f_sig = self.pop_func()?.signature();
-                    let g_sig = self.pop_func()?.signature();
-                    let lower_arg_count = g_sig.outputs / f_sig.args.saturating_sub(1).max(1);
-                    let args = lower_arg_count;
-                    let outputs = f_sig.outputs * lower_arg_count;
-                    self.handle_args_outputs(args, outputs)?;
+                Un => {
+                    let [sig] = get_args(args)?;
+                    self.handle_sig(sig.inverse());
+                }
+                Anti => {
+                    let [sig] = get_args(args)?;
+                    self.handle_sig(sig.anti().unwrap_or(sig));
                 }
                 Fold => {
-                    let f = self.pop_func()?;
-                    self.handle_sig(f.signature())?;
+                    let [f] = get_args(args)?;
+                    if f.outputs() >= f.args() {
+                        self.handle_args_outputs(f.args(), f.outputs() + 1 - f.args());
+                    } else {
+                        self.handle_sig(f);
+                    }
                 }
                 Try => {
-                    let f_sig = self.pop_func()?.signature();
-                    let _handler_sig = self.pop_func()?.signature();
-                    self.handle_sig(f_sig)?;
+                    let [f_sig, _handler_sig] = get_args(args)?;
+                    self.handle_sig(f_sig);
                 }
-                Fill => {
-                    let fill_sig = self.pop_func()?.signature();
-                    if fill_sig.outputs > 0 {
-                        self.handle_sig(fill_sig)?;
-                    }
-                    self.handle_args_outputs(fill_sig.outputs, 0)?;
-                    let f = self.pop_func()?;
-                    self.handle_sig(f.signature())?;
+                Case => {
+                    let [f] = get_args(args)?;
+                    self.handle_sig(f);
                 }
+                Fill => self.fill(args)?,
                 Content | Memo | Comptime => {
-                    let f = self.pop_func()?;
-                    self.handle_sig(f.signature())?;
+                    let [f] = get_args(args)?;
+                    self.handle_sig(f);
                 }
-                Dup => {
-                    let val = self.pop()?;
-                    self.set_min_height();
-                    self.stack.push(val.clone());
-                    self.stack.push(val);
+                Dump => {
+                    let [_] = get_args(args)?;
                 }
-                Flip => {
-                    let a = self.pop()?;
-                    let b = self.pop()?;
-                    self.set_min_height();
-                    self.stack.push(a);
-                    self.stack.push(b);
+                Fork => {
+                    let [f, g] = get_args(args)?;
+                    self.handle_args_outputs(f.args().max(g.args()), f.outputs() + g.outputs());
                 }
-                Pop => {
-                    if let BasicValue::Unknown(i) = self.pop()? {
-                        self.popped.push(i);
-                    }
-                    self.set_min_height();
+                Bracket => {
+                    let [f, g] = get_args(args)?;
+                    self.handle_args_outputs(f.args() + g.args(), f.outputs() + g.outputs());
+                }
+                Both => {
+                    let [f] = get_args_nodes(args)?;
+                    self.stack.pop_n(f.sig.args());
+                    self.sig_node(f)?;
+                    self.stack.push_n(f.sig.args());
+                    self.sig_node(f)?;
+                }
+                Dip => {
+                    let [f] = get_args_nodes(args)?;
+                    self.pop();
+                    self.sig_node(f)?;
+                    self.push();
+                }
+                Gap => {
+                    let [f] = get_args_nodes(args)?;
+                    self.pop();
+                    self.sig_node(f)?;
+                }
+                Reach => {
+                    let [f] = get_args_nodes(args)?;
+                    self.pop();
+                    self.pop();
+                    self.push();
+                    self.sig_node(f)?;
+                }
+                On => {
+                    let [f] = get_args_nodes(args)?;
+                    self.pop();
+                    self.push();
+                    self.sig_node(f)?;
+                    self.push();
                 }
                 By => {
-                    let sig = self.pop_func()?.signature();
-                    self.handle_args_outputs(sig.args, sig.outputs + 1)?;
+                    let [f] = get_args_nodes(args)?;
+                    self.sig_node(f)?;
+                    self.push();
                 }
-                Over => {
-                    let a = self.pop()?;
-                    let b = self.pop()?;
-                    self.set_min_height();
-                    self.stack.push(b.clone());
-                    self.stack.push(a);
-                    self.stack.push(b);
+                Above | Below => {
+                    let [f] = get_args(args)?;
+                    self.handle_args_outputs(f.args(), f.args() + f.outputs());
                 }
-                Join => {
-                    let a = self.pop()?;
-                    let b = self.pop()?;
-                    self.set_min_height();
-                    match (a, b) {
-                        (BasicValue::Arr(mut a), BasicValue::Arr(b)) => {
-                            a.extend(b);
-                            self.stack.push(BasicValue::Arr(a));
-                        }
-                        (BasicValue::Arr(mut a), b) => {
-                            a.push(b);
-                            self.stack.push(BasicValue::Arr(a));
-                        }
-                        (a, BasicValue::Arr(mut b)) => {
-                            b.insert(0, a);
-                            self.stack.push(BasicValue::Arr(b));
-                        }
-                        (a, b) => {
-                            self.stack.push(BasicValue::Arr(vec![a, b]));
-                        }
+                With | Off => {
+                    let [f] = get_args(args)?;
+                    self.handle_args_outputs(f.args(), f.outputs() + 1);
+                }
+                Sys(SysOp::ReadLines) => {
+                    let [f] = get_args(args)?;
+                    self.handle_sig(f);
+                }
+                Sys(SysOp::AudioStream) => {
+                    let [f] = get_args(args)?;
+                    self.handle_args_outputs(
+                        f.args().saturating_sub(1),
+                        f.outputs().saturating_sub(1),
+                    );
+                }
+                prim if prim.modifier_args().is_some() => {
+                    if let Some(sig) = prim.sig() {
+                        self.handle_sig(sig);
+                    } else {
+                        return Err(SigCheckError::from(format!(
+                            "{} was not checked. This is a bug in the interpreter",
+                            prim.format()
+                        )));
                     }
                 }
-                SetInverse => {
-                    let f = self.pop_func()?;
-                    let _inv = self.pop_func()?;
-                    self.handle_sig(f.signature())?;
+                prim => {
+                    return Err(SigCheckError::from(format!(
+                        "{} was checked as a modifier. This is a bug in the interpreter",
+                        prim.format()
+                    )));
                 }
-                SetUnder => {
-                    let f = self.pop_func()?;
-                    let _before = self.pop_func()?;
-                    let _after = self.pop_func()?;
-                    self.handle_sig(f.signature())?;
+            },
+            Node::ImplMod(prim, args, _) => match prim {
+                &OnSub(n) | &BySub(n) | &WithSub(n) | &OffSub(n) => {
+                    let [sn] = get_args_nodes(args)?;
+                    let args = sn.sig.args().max(n);
+                    self.handle_args_outputs(args, args);
+                    self.sig_node(sn)?;
+                    self.handle_args_outputs(0, n);
                 }
-                This => {
-                    let f = self.pop_func()?;
-                    self.handle_sig(f.signature())?;
+                ReduceContent | ReduceDepth(_) => {
+                    let [sig] = get_args(args)?;
+                    let args = sig.args().saturating_sub(sig.outputs());
+                    self.handle_args_outputs(args, sig.outputs());
                 }
-                Recur => return Err(SigCheckError::from("recur present").ambiguous()),
-                Dump => {
-                    self.pop_func()?;
+                ReduceConjoinInventory => {
+                    let [sig] = get_args(args)?;
+                    self.handle_sig(sig);
+                }
+                RepeatWithInverse => {
+                    let [f, inv] = get_args_nodes(args)?;
+                    if f.sig.inverse() != inv.sig {
+                        return Err(SigCheckError::from(
+                            "repeat inverse does not have inverse signature",
+                        ));
+                    }
+                    self.pop();
+                    self.repeat(f)?;
+                }
+                RepeatCountConvergence => {
+                    let [f] = get_args_nodes(args)?;
+                    self.repeat(f)?;
+                    self.push();
+                }
+                UnFill | SidedFill(_) => self.fill(args)?,
+                UnBracket => {
+                    let [f, g] = get_args(args)?;
+                    self.handle_args_outputs(f.args() + g.args(), f.outputs() + g.outputs());
+                }
+                BothImpl(sub) | UnBothImpl(sub) => {
+                    let [f] = get_args(args)?;
+                    let reused = sub.side.map(|side| side.n.unwrap_or(1)).unwrap_or(0);
+                    let n = sub.num.unwrap_or(2) as usize;
+                    let unique = f.args().saturating_sub(reused) * n;
+                    let sig = Signature::new(unique + reused, n * f.outputs())
+                        .with_under(n * f.under_args(), n * f.under_outputs());
+                    self.handle_sig(sig);
+                }
+                EachSub(_) => {
+                    let [f] = get_args_nodes(args)?;
+                    self.sig_node(f)?;
+                }
+                UndoRows | UndoInventory => {
+                    let [f] = get_args_nodes(args)?;
+                    self.stack.pop();
+                    self.sig_node(f)?;
+                }
+                UnScan => self.handle_args_outputs(1, 1),
+                SplitBy | SplitByScalar | SplitByKeepEmpty => {
+                    let [f] = get_args(args)?;
+                    self.handle_args_outputs(2, f.outputs());
                 }
                 prim => {
                     let args = prim
                         .args()
                         .ok_or_else(|| format!("{prim} has indeterminate args"))?;
-                    for _ in 0..prim.modifier_args().unwrap_or(0) {
-                        self.pop_func()?;
-                    }
                     let outputs = prim
                         .outputs()
                         .ok_or_else(|| format!("{prim} has indeterminate outputs"))?;
-                    self.handle_args_outputs(args, outputs)?;
+                    for _ in 0..args {
+                        self.pop();
+                    }
+                    for _ in 0..outputs {
+                        self.push();
+                    }
                 }
             },
-            Instr::ImplPrim(prim @ ImplPrimitive::ReduceContent, _) => {
-                let sig = self.pop_func()?.signature();
-                let outputs = match (sig.args, sig.outputs) {
-                    (0, _) => return Err(format!("{prim}'s function has no args").into()),
-                    (1, 0) => 0,
-                    (1, _) => {
-                        return Err(SigCheckError::from(format!(
-                            "{prim}'s function's signature is {sig}"
-                        ))
-                        .ambiguous())
-                    }
-                    (_, 1) => 1,
-                    _ => return Err(format!("{prim}'s function's signature is {sig}").into()),
-                };
-                self.handle_args_outputs(1, outputs)?;
-            }
-            Instr::ImplPrim(prim, _) => {
-                let args = prim.args();
-                for _ in 0..prim.modifier_args().unwrap_or(0) {
-                    self.pop_func()?;
-                }
-                for _ in 0..args {
-                    self.pop()?;
-                }
-                self.set_min_height();
-                let outputs = prim.outputs();
-                for _ in 0..outputs {
-                    self.stack.push(BasicValue::Other);
+            Node::SetOutputComment { .. } => {}
+            Node::ValidateType { .. } => self.handle_args_outputs(1, 1),
+            Node::PushUnder(n, _) => {
+                for _ in 0..*n {
+                    self.stack.pop();
+                    self.under.push();
                 }
             }
-            Instr::PushSig(_) | Instr::PopSig => {
-                panic!("PushSig and PopSig should have been handled higher up")
+            Node::CopyToUnder(n, _) => {
+                for _ in 0..*n {
+                    self.stack.pop();
+                    self.under.push();
+                    self.stack.push();
+                }
             }
-            Instr::SetOutputComment { .. } => {}
-            Instr::NoInline => {}
+            Node::PopUnder(n, _) => {
+                for _ in 0..*n {
+                    self.under.pop();
+                    self.stack.push();
+                }
+            }
+            Node::TrackCaller(inner) | Node::NoInline(inner) => self.node(inner)?,
+            Node::WithLocal { inner, .. } => {
+                self.stack.pop();
+                self.sig_node(inner)?;
+            }
+            Node::GetLocal { .. } => self.handle_args_outputs(0, 1),
+            Node::SetLocal { .. } => self.handle_args_outputs(1, 0),
         }
-        // println!("{instr:?} -> {}/{}", self.min_height, self.stack.len());
+        self.node_depth -= 1;
+        // println!("{node:?} -> {} ({})", self.stack.sig(), self.under.sig());
         Ok(())
     }
-    // Simulate popping a value. Errors if the stack is empty, which means the function has too many args.
-    fn pop(&mut self) -> Result<BasicValue, String> {
-        Ok(self.stack.pop().ok_or("function has too many args")?)
+    fn push(&mut self) {
+        self.stack.push();
     }
-    fn pop_temp(&mut self, stack: TempStack) -> Result<BasicValue, String> {
-        Ok(self.temp_stacks[stack as usize]
-            .pop()
-            .ok_or("function has too many args")?)
+    fn pop(&mut self) {
+        self.stack.pop()
     }
-    fn pop_func(&mut self) -> Result<Cow<'a, Function>, String> {
-        self.function_stack
-            .pop()
-            .ok_or_else(|| "expected function. This is an interpreter bug".into())
+    fn handle_args_outputs(&mut self, args: usize, outputs: usize) {
+        self.stack.handle_args_outputs(args, outputs);
     }
-    /// Set the current stack height as a potential minimum.
-    /// At the end of checking, the minimum stack height is a component in calculating the signature.
-    fn set_min_height(&mut self) {
-        self.min_height = self.min_height.min(self.stack.len());
-        if let Some(h) = self.array_stack.last_mut() {
-            *h = (*h).min(self.stack.len());
+    fn handle_sig(&mut self, sig: Signature) {
+        self.stack.handle_args_outputs(sig.args(), sig.outputs());
+        self.under
+            .handle_args_outputs(sig.under_args(), sig.under_outputs());
+    }
+    fn fill(&mut self, args: &[SigNode]) -> Result<(), SigCheckError> {
+        let [fill, f] = get_args_nodes(args)?;
+        if fill.sig.outputs() > 0 || fill.sig.args() > 0 && fill.sig.outputs() != 0 {
+            self.sig_node(fill)?;
         }
-        for (min_height, stack) in self.temp_min_heights.iter_mut().zip(&self.temp_stacks) {
-            *min_height = (*min_height).min(stack.len());
-        }
+        self.handle_args_outputs(fill.sig.outputs(), 0);
+        self.sig_node(f)
     }
-    fn handle_args_outputs(&mut self, args: usize, outputs: usize) -> Result<(), String> {
-        for _ in 0..args {
-            self.pop()?;
-        }
-        self.set_min_height();
-        for _ in 0..outputs {
-            self.stack.push(BasicValue::Other);
+    fn repeat(&mut self, sn: &SigNode) -> Result<(), SigCheckError> {
+        let sig = sn.sig;
+        self.sig_node(sn)?;
+        if sig.outputs() > sig.args() {
+            self.stack.pop_n(sig.args());
         }
         Ok(())
-    }
-    fn handle_sig(&mut self, sig: Signature) -> Result<(), String> {
-        self.handle_args_outputs(sig.args, sig.outputs)
     }
 }
 
-#[cfg(test)]
-mod test {
-    use crate::value::Value;
-
-    use super::*;
-    use Instr::*;
-    use Primitive::*;
-    fn push<T>(val: T) -> Instr
-    where
-        T: Into<Value>,
-    {
-        Push(val.into())
+fn get_args_nodes<const N: usize>(args: &[SigNode]) -> Result<[&SigNode; N], SigCheckError> {
+    if args.len() != N {
+        return Err(format!(
+            "Expected {} operand{}, but got {}",
+            N,
+            if N == 1 { "" } else { "s" },
+            args.len()
+        )
+        .into());
     }
-    #[test]
-    fn instrs_signature() {
-        let check = super::instrs_signature;
-        fn sig(a: usize, o: usize) -> Signature {
-            Signature {
-                args: a,
-                outputs: o,
-            }
-        }
-        assert_eq!(Ok(sig(0, 0)), check(&[]));
-        assert_eq!(Ok(sig(1, 1)), check(&[Prim(Identity, 0)]));
+    Ok(array::from_fn(|i| &args[i]))
+}
 
-        assert_eq!(Ok(sig(0, 1)), check(&[push(10), push(2), Prim(Pow, 0)]));
-        assert_eq!(
-            Ok(sig(1, 1)),
-            check(&[push(10), push(2), Prim(Pow, 0), Prim(Add, 0)])
-        );
-        assert_eq!(Ok(sig(1, 1)), check(&[push(1), Prim(Add, 0)]));
-
-        assert_eq!(
-            Ok(sig(0, 1)),
-            check(&[
-                BeginArray,
-                push(3),
-                push(2),
-                push(1),
-                EndArray {
-                    span: 0,
-                    boxed: false
-                }
-            ])
-        );
-        assert_eq!(
-            Ok(sig(1, 1)),
-            check(&[
-                BeginArray,
-                push(3),
-                push(2),
-                push(1),
-                EndArray {
-                    span: 0,
-                    boxed: false
-                },
-                Prim(Add, 0)
-            ])
-        );
+fn get_args<const N: usize>(args: &[SigNode]) -> Result<[Signature; N], SigCheckError> {
+    let mut res = [Signature::default(); N];
+    if args.len() != N {
+        return Err(format!(
+            "Expected {} operand{}, but got {}",
+            N,
+            if N == 1 { "" } else { "s" },
+            args.len()
+        )
+        .into());
     }
+    for (i, arg) in args.iter().enumerate() {
+        res[i] = arg.sig;
+    }
+    Ok(res)
 }

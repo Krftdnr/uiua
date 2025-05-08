@@ -1,20 +1,21 @@
 use std::{
     collections::{HashMap, HashSet},
     iter::once,
+    time::Duration,
 };
 
 use enum_iterator::all;
-use instant::Duration;
 use leptos::{leptos_dom::helpers::location, *};
 use leptos_meta::*;
 use leptos_router::*;
 use uiua::{PrimClass, Primitive, SysOpClass};
+use uiua_editor::lang;
 use wasm_bindgen::JsCast;
 use web_sys::{Event, EventInit, HtmlInputElement, ScrollBehavior, ScrollIntoViewOptions};
 
 use crate::{
-    element, markdown::Markdown, other::*, primitive::*, tour::Tour, tutorial::TutorialPage,
-    uiuisms::Uiuisms, Hd, Prim,
+    element, idioms::Idioms, markdown::Markdown, other::*, other_tutorial::OtherTutorialPage,
+    primitive::*, tutorial::TutorialPage, uiuisms::Uiuisms, Hd, Prim, Tour,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,10 +30,12 @@ pub enum DocsPage {
     Changelog,
     RightToLeft,
     Constants,
-    StackIdioms,
     Combinators,
+    Subscripts,
     Optimizations,
     FormatConfig,
+    Experimental,
+    Idioms,
 }
 
 impl IntoParam for DocsPage {
@@ -49,10 +52,12 @@ impl IntoParam for DocsPage {
             "changelog" => Ok(Self::Changelog),
             "rtl" => Ok(Self::RightToLeft),
             "constants" => Ok(Self::Constants),
-            "stack-idioms" => Ok(Self::StackIdioms),
             "combinators" => Ok(Self::Combinators),
+            "subscripts" => Ok(Self::Subscripts),
             "optimizations" => Ok(Self::Optimizations),
             "format-config" => Ok(Self::FormatConfig),
+            "experimental" => Ok(Self::Experimental),
+            "idioms" => Ok(Self::Idioms),
             value => Ok(Self::Search(value.into())),
         }
     }
@@ -73,7 +78,7 @@ pub fn Docs() -> impl IntoView {
         let page_view = match page {
             DocsPage::Search(search) => return view!( <DocsHome search=search/>).into_view(),
             DocsPage::Tour => Tour().into_view(),
-            DocsPage::Design => Design().into_view(),
+            DocsPage::Design => title_markdown("Design", "/text/design.md", ()).into_view(),
             DocsPage::Technical => Technical().into_view(),
             DocsPage::Install => Install().into_view(),
             DocsPage::AllFunctions => AllFunctions().into_view(),
@@ -81,12 +86,14 @@ pub fn Docs() -> impl IntoView {
             DocsPage::Changelog => Changelog().into_view(),
             DocsPage::RightToLeft => RightToLeft().into_view(),
             DocsPage::Constants => Constants().into_view(),
-            DocsPage::StackIdioms => StackIdioms().into_view(),
+            DocsPage::Subscripts => Subscripts().into_view(),
             DocsPage::Combinators => Combinators().into_view(),
             DocsPage::Optimizations => Optimizations().into_view(),
             DocsPage::FormatConfig => {
                 title_markdown("Formatter Configuration", "/text/format_config.md", ()).into_view()
             }
+            DocsPage::Experimental => Experimental().into_view(),
+            DocsPage::Idioms => Idioms().into_view(),
         };
 
         view! {
@@ -104,7 +111,7 @@ pub fn Docs() -> impl IntoView {
 
 pub fn title_markdown(title: &str, src: &str, end: impl IntoView) -> impl IntoView {
     view! {
-        <Title text={format!("{} - Uiua Docs", title)}/>
+        <Title text={format!("{} - {} Docs", lang(), title)}/>
         <Markdown src=src/>
         { end }
     }
@@ -132,10 +139,10 @@ fn DocsHome(#[prop(optional)] search: String) -> impl IntoView {
             let clear_search = move |_| {
                 let search_input = element::<HtmlInputElement>("function-search");
                 search_input.set_value("");
-                _ = search_input.dispatch_event(
-                    &Event::new_with_event_init_dict("input", EventInit::new().bubbles(true))
-                        .unwrap(),
-                );
+                let init = EventInit::new();
+                init.set_bubbles(true);
+                _ = search_input
+                    .dispatch_event(&Event::new_with_event_init_dict("input", &init).unwrap());
             };
             Some(view!( {}<button on:click=clear_search>"✕"</button>).into_view())
         });
@@ -143,7 +150,9 @@ fn DocsHome(#[prop(optional)] search: String) -> impl IntoView {
         // Derive allowed primitives
         let allowed = Allowed::from_search(text);
         if !text.is_empty() {
-            scroll_to_docs_functions(ScrollIntoViewOptions::new().behavior(ScrollBehavior::Smooth));
+            let siv_options = ScrollIntoViewOptions::new();
+            siv_options.set_behavior(ScrollBehavior::Smooth);
+            scroll_to_docs_functions(&siv_options);
         }
         if update_location {
             let text = text.to_string();
@@ -175,9 +184,9 @@ fn DocsHome(#[prop(optional)] search: String) -> impl IntoView {
         {
             // Only one result
             let prim = allowed.prims.into_iter().next().unwrap();
-            scroll_to_docs_functions(
-                ScrollIntoViewOptions::new().behavior(ScrollBehavior::Instant),
-            );
+            let siv_options = ScrollIntoViewOptions::new();
+            siv_options.set_behavior(ScrollBehavior::Instant);
+            scroll_to_docs_functions(&siv_options);
             set_result.set(Some(view!( <PrimDocs prim=prim/>).into_view()));
             set_current_prim.set(Some(prim));
         } else {
@@ -189,8 +198,8 @@ fn DocsHome(#[prop(optional)] search: String) -> impl IntoView {
     let update_title = move || {
         current_prim
             .get()
-            .map(|p| format!("{} - Uiua Docs", p.name()))
-            .unwrap_or_else(|| "Uiua Docs".to_owned())
+            .map(|p| format!("{} - {} Docs", lang(), p.name()))
+            .unwrap_or_else(|| format!("{} Docs", lang()))
     };
 
     set_timeout(
@@ -207,15 +216,18 @@ fn DocsHome(#[prop(optional)] search: String) -> impl IntoView {
 
     view! {
         <Title text=update_title/>
-        <h1>"Documentation"</h1>
+        <div id="header">
+            <h1>"Documentation"</h1>
+            <a href="#functions" style="text-decoration: none">"↓ Jump to Functions ↓"</a>
+        </div>
 
         <Hd id="language-tour">"Language Tour"</Hd>
         <p>"If you want to jump right in, check out the "<A href="/docs/tour">"Language Tour"</A>" for a high-level overview!"</p>
         <p>"Otherwise, read on for more detailed documentation."</p>
 
         <Hd id="tutorial">"Tutorial"</Hd>
-        <h3><strong><em>"If you are new to Uiua, you will likely be lost if you don't read this!"</em></strong></h3>
-        <p>"These pages introduce Uiua concepts one at a time, each tutorial building on the previous. They go into much more depth than the language tour."</p>
+        <h3><strong><em>"If you are new to "{lang}", you will likely be lost if you don't read this!"</em></strong></h3>
+        <p>"These pages introduce "{lang}" concepts one at a time, each tutorial building on the previous. They go into much more depth than the language tour."</p>
         <p>"They are meant to be read in order, but feel free to skip around!"</p>
         <ul>{ all::<TutorialPage>()
             .map(|p| view!( <li><A href={format!("/tutorial/{}", p.path())}>{p.title()}</A></li>))
@@ -224,29 +236,35 @@ fn DocsHome(#[prop(optional)] search: String) -> impl IntoView {
 
         <Hd id="other-tutorials">"Other Tutorials"</Hd>
         <p>"These tutorials cover more specific topics. They assume you have read the main tutorial above, but they can be read in any order."</p>
-        <ul>
-            <li><A href="/tutorial/strings">"Strings"</A>" - how to manipulate strings"</li>
-            <li><A href="/tutorial/audio">"Audio"</A>" - how to generate and play audio"</li>
-            <li><A href="/tutorial/images">"Images and GIFs"</A>" - how to generate images and GIFs"</li>
-        </ul>
+        <ul>{ all::<OtherTutorialPage>()
+            .map(|p| view!( <li><A href={format!("/tutorial/{}", p.path())}>{p.title()}</A>" - "{p.description()}</li>))
+            .collect::<Vec<_>>()
+        }</ul>
 
         <Hd id="other-docs">"Other Docs"</Hd>
         <ul>
-            <li><A href="/docs/install">"Installation"</A>" - how to install and use Uiua's interpreter"</li>
+            <li><A href="/docs/install">"Installation"</A>" - how to install and use "{lang}"'s interpreter"</li>
             <li><A href="/docs/changelog">"Changelog"</A>" - what's new in each version"</li>
             <li><A href="/docs/constants">"Constants"</A>" - a list of the shadowable constants"</li>
-            <li><A href="/docs/format-config">"Formatter Configuration"</A>" - how to configure the Uiua formatter"</li>
+            <li><A href="/docs/subscripts">"Subscripts"</A>" - a list of subscript-compatible functions"</li>
+            <li><A href="/docs/format-config">"Formatter Configuration"</A>" - how to configure the "{lang}" formatter"</li>
             <li><A href="/docs/optimizations">"Optimizations"</A>" - a list of optimizations in the interpreter"</li>
-            <li><A href="/docs/stack-idioms">"Stack Idioms"</A>" - common ways of manipulating the stack"</li>
-            <li><A href="/docs/isms">"Uiuisms"</A>" - a curated list of Uiua functions for solving common problems."</li>
+            <li><A href="/docs/experimental">"Experimental Features"</A>" - an overview of experimental features"</li>
+            <li><A href="/docs/idioms">"Idioms"</A>" - commonly useful, non-obvious idioms. Also "<A href="/docs/idioms#aliases">"aliases"</A>"."</li>
         </ul>
 
         <Hd id="other-pages">"Other Pages"</Hd>
         <ul>
-            <li><A href="/docs/design">"Design"</A>" - reasons for some of Uiua's design decisions"</li>
-            <li><A href="/docs/rtl">"Right-to-Left"</A>" - the answer to the most-asked question about Uiua's design gets its own page"</li>
-            <li><A href="/docs/technical">"Technical Details"</A>" - notes on the implementation of the Uiua interpreter and this website"</li>
-            <li><A href="/docs/combinators">"Combinators"</A>" - a list of common combinators implemented in Uiua"</li>
+            <li><A href="/docs/design">"Design"</A>" - reasons for some of "{lang}"'s design decisions"</li>
+            <li><A href="/docs/rtl">"Right-to-Left"</A>" - the answer to the most-asked question about "{lang}"'s design gets its own page"</li>
+            <li><A href="/docs/technical">"Technical Details"</A>" - notes on the implementation of the "{lang}" interpreter and this website"</li>
+            <li><A href="/docs/combinators">"Combinators"</A>" - a list of common combinators implemented in "{lang}</li>
+            <li><a href="https://tankorsmash.unison-services.cloud/s/uiuisms-service/">{
+                match lang() {
+                    "Weewuh" => "Weewisms",
+                    _ => "Uiuisms",
+                }
+            }</a>" - a community catalog of many common "{lang}" snippets"</li>
             <li>
                 <A href="/primitives.json" on:click = |_| _ = location().set_href("/primitives.json")>"Primitives JSON"</A>
                 " - a JSON file of all the primitives, for tooling and other projects"</li>
@@ -279,16 +297,27 @@ struct Allowed {
 }
 
 fn aliases() -> HashMap<&'static str, &'static [Primitive]> {
+    use Primitive::*;
     [
-        ("filter", &[Primitive::Keep] as &[_]),
-        ("search", &[Primitive::Find]),
-        ("intersect", &[Primitive::Member]),
-        ("split", &[Primitive::Partition]),
-        ("while", &[Primitive::Do]),
-        ("for", &[Primitive::Repeat]),
-        ("invert", &[Primitive::Un]),
+        ("filter", &[Keep] as &[_]),
+        ("search", &[Find, Mask]),
+        ("intersect", &[MemberOf]),
+        ("split", &[Partition]),
+        ("while", &[Do]),
+        ("for", &[Repeat]),
+        ("invert", &[Un]),
+        ("encode", &[Bits, Base]),
+        ("decode", &[Bits, Base]),
+        ("prefixes", &[Tuples]),
+        ("suffixes", &[Tuples]),
+        ("flatten", &[Deshape]),
+        ("choose", &[Tuples]),
+        ("permute", &[Tuples]),
+        ("window", &[Stencil]),
     ]
-    .into()
+    .into_iter()
+    .flat_map(|(alias, prims)| (3..=alias.len()).map(move |len| (&alias[..len], prims)))
+    .collect()
 }
 
 thread_local! {
@@ -314,7 +343,7 @@ impl Allowed {
         let mut prims = HashSet::new();
         let all = Primitive::all;
         let prim_matching_part_exactly = |part: &str| -> Option<Primitive> {
-            all().find(|p| {
+            Primitive::non_deprecated().find(|p| {
                 p.name().to_lowercase() == part
                     || p.ascii().is_some_and(|a| a.to_string() == part)
                     || p.glyph().is_some_and(|u| part.chars().all(|c| c == u))
@@ -366,7 +395,7 @@ impl Allowed {
             for (pattern, pat_classes) in [
                 ("stack", [PrimClass::Stack].as_slice()),
                 (
-                    "pervasive",
+                    "pervasive pervade",
                     &[PrimClass::MonadicPervasive, PrimClass::DyadicPervasive],
                 ),
                 ("array", &[PrimClass::MonadicArray, PrimClass::DyadicArray]),
@@ -394,9 +423,9 @@ impl Allowed {
                 ("system", &system_classes),
                 ("function", &function_classes),
                 ("planet", &[PrimClass::Planet]),
-                ("images", &[PrimClass::Sys(SysOpClass::Images)]),
-                ("gifs", &[PrimClass::Sys(SysOpClass::Gifs)]),
-                ("audio", &[PrimClass::Sys(SysOpClass::Audio)]),
+                ("images", &[PrimClass::Sys(SysOpClass::Media)]),
+                ("gifs", &[PrimClass::Sys(SysOpClass::Media)]),
+                ("audio", &[PrimClass::Sys(SysOpClass::Media)]),
                 ("tcp", &[PrimClass::Sys(SysOpClass::Tcp)]),
                 ("env", &[PrimClass::Sys(SysOpClass::Env)]),
                 ("command", &[PrimClass::Sys(SysOpClass::Command)]),
@@ -405,7 +434,8 @@ impl Allowed {
                 ("stdio", &[PrimClass::Sys(SysOpClass::StdIO)]),
                 ("thread", &[PrimClass::Thread]),
                 ("map", &[PrimClass::Map]),
-                ("local", &[PrimClass::Local]),
+                ("encoding encode", &[PrimClass::Encoding]),
+                ("ffi", &[PrimClass::Sys(SysOpClass::Ffi)]),
                 ("misc", &[PrimClass::Sys(SysOpClass::Misc)]),
             ] {
                 if pattern.split_whitespace().any(|pat| pat.starts_with(part)) {
@@ -445,11 +475,17 @@ impl Allowed {
                 PrimClass::AggregatingModifier => "aggregating-modifiers",
                 PrimClass::IteratingModifier => "iterating-modifiers",
                 PrimClass::InversionModifier => "inversion-modifiers",
-                PrimClass::OtherModifier => "other-modifiers",
                 PrimClass::Planet => "planet-modifiers",
+                PrimClass::Comptime => "comptime-modifiers",
+                PrimClass::OtherModifier => "other-modifiers",
+                PrimClass::Debug => "debug",
                 PrimClass::Thread => "threads",
                 PrimClass::Map => "map-functions",
-                PrimClass::Local => "locals",
+                PrimClass::Encoding => "encoding",
+                PrimClass::Algorithm => "algorithms",
+                PrimClass::Rng => "rng",
+                PrimClass::Time => "time",
+                PrimClass::Environment => "environment",
                 PrimClass::Misc => "misc-functions",
                 PrimClass::Sys(_) => "system-functions",
             };
@@ -457,10 +493,9 @@ impl Allowed {
                 .filter(|p| self.prims.contains(p) && p.class() == class)
                 .map(|p| {
                     let exp = if p.is_experimental() {
-                        view!(<span class="code-hover" data-title="Experimental">"🧪"</span>)
-                            .into_view()
+                        Some(view!(<span class="experimental-icon" data-title="Experimental!">"🧪"</span>))
                     } else {
-                        View::default()
+                        None
                     };
                     let style = if p.is_deprecated() {
                         "text-decoration: line-through;"
@@ -516,14 +551,23 @@ impl Allowed {
                     "Inversion Modifiers".into_view(),
                     "Work with the inverses of functions",
                 ),
-                PrimClass::OtherModifier => ("Other Modifiers".into_view(), ""),
                 PrimClass::Planet => (
-                    view!(<a class="clean" href="/tutorial/advancedstack#planet-notation">"🌎 Planet 🪐"</a>).into_view(),
+                    view!(<a class="clean" href="/tutorial/morestack#planet-notation">"🌎 Planet 🪐"</a>).into_view(),
                     "Advanced stack manipulation",
                 ),
+                PrimClass::Comptime => (
+                    "Comptime".into_view(),
+                    "Do things at compile time",
+                ),
+                PrimClass::OtherModifier => ("Other Modifiers".into_view(), ""),
+                PrimClass::Debug => ("Debug".into_view(), "Debug your code"),
                 PrimClass::Thread => ("Thread".into_view(), "Work with OS threads"),
                 PrimClass::Map => ("Map".into_view(), "Use arrays as hash maps"),
-                PrimClass::Local => ("Local".into_view(), "Bind local values"),
+                PrimClass::Encoding => ("Encoding".into_view(), "Convert to and from different encodings"),
+                PrimClass::Algorithm => ("Algorithms".into_view(), "Useful, specific algorithms"),
+                PrimClass::Rng => ("Random Number Generation".into_view(), "Generate random numbers"),
+                PrimClass::Time => ("Time".into_view(), "Work with time"),
+                PrimClass::Environment => ("Environment".into_view(), "Get information about the environment"),
                 PrimClass::Misc => ("Miscellaneous".into_view(), ""),
                 PrimClass::Sys(class) => {
                     match class {
@@ -532,10 +576,9 @@ impl Allowed {
                         SysOpClass::Env => ("System - Environment".into_view(), "Query the environment"),
                         SysOpClass::Stream => ("System - Streams".into_view(), "Read from and write to streams"),
                         SysOpClass::Command => ("System - Commands".into_view(), "Execute commands"),
-                        SysOpClass::Audio => ("System - Audio".into_view(), "Work with audio"),
-                        SysOpClass::Images => ("System - Images".into_view(), "Work with static images"),
-                        SysOpClass::Gifs => ("System - GIFs".into_view(), "Work with animated GIFs"),
+                        SysOpClass::Media => ("System - Media".into_view(), "Present media"),
                         SysOpClass::Tcp => ("System - TCP".into_view(), "Work with TCP sockets"),
+                        SysOpClass::Ffi => ("System - FFI".into_view(), "Foreign function interface"),
                         SysOpClass::Misc => ("System - Misc".into_view(), ""),
                     }
                 }

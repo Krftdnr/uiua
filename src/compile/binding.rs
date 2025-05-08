@@ -1,76 +1,167 @@
 //! Compiler code for bindings
 
+use crate::BindingMeta;
+
 use super::*;
 
 impl Compiler {
-    pub(super) fn binding(&mut self, binding: Binding, comment: Option<Arc<str>>) -> UiuaResult {
+    pub(super) fn binding(&mut self, binding: Binding, prelude: BindingPrelude) -> UiuaResult {
         let public = binding.public;
 
+        let last_word = binding.words.iter().last();
+
+        // If marked external and already bound, don't bind again
+        let is_external = prelude.external
+            || last_word.is_some_and(|w| {
+                matches!(w.value, Word::SemanticComment(SemanticComment::External))
+            });
+        if is_external
+            && self.scopes().any(|sc| {
+                sc.names
+                    .get(&binding.name.value)
+                    .is_some_and(|b| self.asm.bindings[b.index].meta.external)
+            })
+        {
+            return Ok(());
+        }
+
+        // Get data def if this is a method
+        let mut data_def = None;
+        let is_method = if let Some(tilde_span) = binding.tilde_span {
+            self.experimental_error(&tilde_span, || {
+                "Methods are experimental. To use them, add \
+                `# Experimental!` to the top of the file."
+            });
+            if let Some(def) = self.scope.data_def.clone() {
+                let span = self.add_span(tilde_span);
+                data_def = Some((def, span));
+            } else {
+                self.add_error(
+                    tilde_span,
+                    "Method has no data definition defined before it",
+                );
+            }
+            true
+        } else {
+            false
+        };
+
+        // Create meta
+        let comment = prelude
+            .comment
+            .map(|text| DocComment::from(text.as_str()))
+            .or_else(|| {
+                last_word.and_then(|w| match &w.value {
+                    Word::Comment(c) => Some(DocComment::from(c.as_str())),
+                    _ => None,
+                })
+            });
+        let deprecation = prelude.deprecation.or_else(|| {
+            last_word.and_then(|w| match &w.value {
+                Word::SemanticComment(SemanticComment::Deprecated(s)) => Some(s.clone()),
+                _ => None,
+            })
+        });
+        let meta = BindingMeta {
+            comment,
+            deprecation,
+            counts: Some(binding.counts),
+            external: false,
+        };
+
         // Alias re-bound imports
-        if binding.words.iter().filter(|w| w.value.is_code()).count() == 1 {
+        let name = binding.name.value;
+        let ident_margs = ident_modifier_args(&name);
+        if ident_margs == 0
+            && meta.comment.is_none()
+            && binding.words.iter().filter(|w| w.value.is_code()).count() == 1
+        {
             if let Some(r) = binding.words.iter().find_map(|w| match &w.value {
-                Word::Ref(r) if !r.path.is_empty() => Some(r),
+                Word::Ref(r)
+                    if ident_modifier_args(&r.name.value) == 0
+                        && !(r.path.is_empty() && r.name.value == name) =>
+                {
+                    Some(r)
+                }
                 _ => None,
             }) {
-                if let Ok((path_locals, local)) = self.ref_local(r) {
-                    self.validate_local(&r.name.value, local, &r.name.span);
-                    (self.code_meta.global_references).insert(binding.name.clone(), local.index);
-                    for (local, comp) in path_locals.into_iter().zip(&r.path) {
-                        (self.code_meta.global_references).insert(comp.module.clone(), local.index);
+                if let Ok(Some((path_locals, local))) = self.ref_local(r) {
+                    let is_noadic_function = match &self.asm.bindings[local.index].kind {
+                        BindingKind::Func(f) if f.sig.args() == 0 => true,
+                        _ => false,
+                    };
+                    if !is_noadic_function {
+                        self.validate_local(&r.name.value, local, &r.name.span);
+                        (self.code_meta.global_references)
+                            .insert(binding.name.span.clone(), local.index);
+                        for (local, comp) in path_locals.into_iter().zip(&r.path) {
+                            (self.code_meta.global_references)
+                                .insert(comp.module.span.clone(), local.index);
+                        }
+                        (self.code_meta.global_references).insert(r.name.span.clone(), local.index);
+                        let local = LocalName { public, ..local };
+                        self.scope.names.insert(name, local);
+                        return Ok(());
                     }
-                    (self.code_meta.global_references).insert(r.name.clone(), local.index);
-                    self.scope.names.insert(
-                        binding.name.value,
-                        LocalName {
-                            index: local.index,
-                            public,
-                        },
-                    );
-                    return Ok(());
                 }
             }
         }
 
-        let name = binding.name.value;
         let span = &binding.name.span;
 
-        let span_index = self.add_span(span.clone());
+        let spandex = self.add_span(span.clone());
         let local = LocalName {
             index: self.next_global,
             public,
         };
         self.next_global += 1;
 
-        let comment = comment.or_else(|| {
-            binding.words.iter().last().and_then(|w| match &w.value {
-                Word::Comment(c) => Some(c.as_str().into()),
-                _ => None,
-            })
-        });
-
         // Handle macro
-        let ident_margs = ident_modifier_args(&name);
-        if binding.array_macro {
-            // Array macro
+        let max_placeholder = max_placeholder(&binding.words);
+        if binding.code_macro {
+            if is_external {
+                self.add_error(span.clone(), "Macros cannot be external");
+            }
+            if is_method {
+                self.add_error(span.clone(), "Methods cannot be macros");
+            }
+            if max_placeholder.is_some() {
+                return Err(self.error(span.clone(), "Code macros may not contain placeholders"));
+            }
+            // Code macro
             if ident_margs == 0 {
                 self.add_error(
                     span.clone(),
                     format!(
-                        "Array macros must take at least 1 operand, \
+                        "Code macros must take at least 1 operand, \
                         but `{name}`'s name suggests it takes 0",
                     ),
                 );
             }
-            let instrs = self.compile_words(binding.words, true)?;
-            let sig = match instrs_signature(&instrs) {
-                Ok(s) => s,
+            let node = self.words(binding.words)?;
+            let sig = match node.sig() {
+                Ok(s) => {
+                    if let Some(declared) = binding.signature {
+                        if s != declared.value {
+                            self.add_error(
+                                span.clone(),
+                                format!(
+                                    "Code macro signature mismatch: \
+                                    declared {} but inferred {s}",
+                                    declared.value
+                                ),
+                            );
+                        }
+                    }
+                    s
+                }
                 Err(e) => {
                     if let Some(sig) = binding.signature {
                         sig.value
                     } else {
                         self.add_error(
                             span.clone(),
-                            format!("Cannot infer array macro signature: {e}"),
+                            format!("Cannot infer code macro signature: {e}"),
                         );
                         Signature::new(1, 1)
                     }
@@ -85,7 +176,7 @@ impl Compiler {
                 self.add_error(
                     span.clone(),
                     format!(
-                        "Array macros must have a signature of {} or {}, \
+                        "Code macros must have a signature of {} or {}, \
                         but a signature of {} was inferred",
                         Signature::new(1, 1),
                         Signature::new(2, 1),
@@ -93,26 +184,24 @@ impl Compiler {
                     ),
                 );
             }
-            let function = self.make_function(FunctionId::Named(name.clone()), sig, instrs);
             self.scope.names.insert(name.clone(), local);
-            (self.asm).add_global_at(
+            self.asm.add_binding_at(
                 local,
-                BindingKind::Macro,
+                BindingKind::CodeMacro(node.clone()),
                 Some(span.clone()),
-                comment.clone(),
+                meta,
             );
-            let mac = ArrayMacro {
-                function,
+            let mac = CodeMacro {
+                root: SigNode::new(sig, node),
                 names: self.scope.names.clone(),
             };
-            self.array_macros.insert(local.index, mac);
+            self.code_macros.insert(local.index, mac);
             return Ok(());
         }
-        // Stack macro
-        let placeholder_count = count_placeholders(&binding.words);
-        match (ident_margs > 0, placeholder_count > 0) {
-            (true, true) | (false, false) => {}
-            (true, false) => {
+        // Index macro
+        match (ident_margs, max_placeholder) {
+            (0, None) => {}
+            (_, None) => {
                 self.add_error(
                     span.clone(),
                     format!(
@@ -121,7 +210,7 @@ impl Compiler {
                     ),
                 );
             }
-            (false, true) => {
+            (0, Some(_)) => {
                 self.add_error(
                     span.clone(),
                     format!(
@@ -131,70 +220,97 @@ impl Compiler {
                 );
                 return Ok(());
             }
+            (n, Some(max)) => {
+                if max + 1 > n {
+                    self.emit_diagnostic(
+                        format!(
+                            "`{name}`'s name suggest at most ^{}, \
+                            but it contains a ^{max}",
+                            n - 1
+                        ),
+                        DiagnosticKind::Warning,
+                        span.clone(),
+                    );
+                }
+            }
         }
-        if placeholder_count > 0 || ident_margs > 0 {
+        if max_placeholder.is_some() || ident_margs > 0 {
+            if is_external {
+                self.add_error(span.clone(), "Macros cannot be external");
+            }
+            if is_method {
+                self.add_error(span.clone(), "Methods cannot be macros");
+            }
+
             self.scope.names.insert(name.clone(), local);
-            (self.asm).add_global_at(
+            self.asm.add_binding_at(
                 local,
-                BindingKind::Macro,
+                BindingKind::IndexMacro(ident_margs),
                 Some(span.clone()),
-                comment.clone(),
+                meta,
             );
-            let mut words = binding.words.clone();
-            recurse_words(&mut words, &mut |word| match &word.value {
-                Word::Ref(r) => {
-                    if let Ok((path_locals, local)) = self.ref_local(r) {
-                        self.validate_local(&r.name.value, local, &r.name.span);
-                        (self.code_meta.global_references).insert(r.name.clone(), local.index);
-                        for (local, comp) in path_locals.into_iter().zip(&r.path) {
-                            (self.code_meta.global_references)
-                                .insert(comp.module.clone(), local.index);
-                        }
-                    }
+            let words = binding.words.clone();
+            let mut recursive = false;
+            self.analyze_macro_body(&name, &words, false, &mut recursive);
+            if recursive {
+                self.experimental_error(span, || {
+                    "Recursive index macros are experimental. \
+                    Add `# Experimental!` to the top of the file to use them."
+                });
+                if binding.signature.is_none() {
+                    self.add_error(
+                        span.clone(),
+                        "Recursive index macro must have a \
+                        signature declared after the ←",
+                    );
                 }
-                Word::IncompleteRef { path, in_macro_arg } => {
-                    if let Ok(Some((_, path_locals))) = self.ref_path(path, *in_macro_arg) {
-                        for (local, comp) in path_locals.into_iter().zip(path) {
-                            (self.code_meta.global_references)
-                                .insert(comp.module.clone(), local.index);
-                        }
-                    }
-                }
-                _ => {}
-            });
-            let mac = StackMacro {
+            }
+            let mac = IndexMacro {
                 words,
                 names: self.scope.names.clone(),
+                sig: binding.signature.map(|s| s.value),
+                recursive,
             };
-            self.stack_macros.insert(local.index, mac);
+            self.index_macros.insert(local.index, mac);
             return Ok(());
         }
 
-        let mut make_fn: Rc<dyn Fn(_, _, &mut Compiler) -> _> = Rc::new(
-            |instrs: EcoVec<Instr>, sig: Signature, comp: &mut Compiler| {
+        // A non-macro binding
+
+        let is_func = binding
+            .words
+            .iter()
+            .any(|w| matches!(w.value, Word::Func(_)));
+
+        let make_fn = {
+            let name = name.clone();
+            move |mut node: Node, sig: Signature, comp: &mut Compiler| {
                 // Diagnostic for function that doesn't consume its arguments
-                if let Some((Instr::Prim(Primitive::Dup, span), rest)) = instrs.split_first() {
+                if let [Node::Prim(Primitive::Dup, span), rest @ ..] = node.as_slice() {
                     if let Span::Code(dup_span) = comp.get_span(*span) {
-                        if let Ok(rest_sig) = instrs_signature(rest) {
-                            if rest_sig.args == sig.args && rest_sig.outputs + 1 == sig.outputs {
+                        if let Ok(rest_sig) = nodes_sig(rest) {
+                            if rest_sig.args() == sig.args()
+                                && rest_sig.outputs() + 1 == sig.outputs()
+                            {
                                 comp.emit_diagnostic(
-                                    format!(
-                                        "Functions should consume their arguments. \
-                                        Try removing this {}.",
-                                        Primitive::Dup.format()
-                                    ),
+                                    "Functions should consume their arguments. \
+                                        Try removing this.",
                                     DiagnosticKind::Style,
                                     dup_span,
                                 );
-                                comp.flush_diagnostics();
                             }
                         }
                     }
                 }
-
-                comp.make_function(FunctionId::Named(name.clone()), sig, instrs)
-            },
-        );
+                if prelude.track_caller {
+                    node = Node::TrackCaller(node.into());
+                }
+                if prelude.no_inline {
+                    node = Node::NoInline(node.into());
+                }
+                comp.asm.add_function(FunctionId::Named(name), sig, node)
+            }
+        };
         let words_span = (binding.words.first())
             .zip(binding.words.last())
             .map(|(f, l)| f.span.clone().merge(l.span.clone()))
@@ -205,83 +321,116 @@ impl Compiler {
             });
 
         // Compile the body
-        self.current_binding = Some(CurrentBinding {
+        let in_function = self
+            .scopes()
+            .any(|sc| matches!(sc.kind, ScopeKind::Function));
+        self.current_bindings.push(CurrentBinding {
             name: name.clone(),
             signature: binding.signature.as_ref().map(|s| s.value),
-            referenced: false,
+            recurses: 0,
             global_index: local.index,
         });
-        let mut binding_code_words = binding.words.iter().filter(|w| w.value.is_code());
-        let is_single_func = binding_code_words.clone().count() == 1
-            && (binding_code_words.next()).is_some_and(|w| matches!(&w.value, Word::Func(_)));
-        let instrs_start = self.asm.instrs.len();
-        let instrs = self.compile_words(binding.words, !is_single_func);
-        let self_referenced = self.current_binding.take().unwrap().referenced;
-        let mut instrs = instrs?;
+        let no_code_words = binding.words.iter().all(|w| !w.value.is_code());
+        let compile = |comp: &mut Compiler| -> UiuaResult<Node> {
+            // Compile the words
+            let node = comp.line(binding.words, false);
+            // Add an error binding if there was an error
+            let mut node = match node {
+                Ok(node) => node,
+                Err(e) => {
+                    comp.asm.add_binding_at(
+                        local,
+                        BindingKind::Error,
+                        Some(span.clone()),
+                        meta.clone(),
+                    );
+                    return Err(e);
+                }
+            };
+            // Apply the signature comment
+            if let Some(comment_sig) = meta.comment.as_ref().and_then(|c| c.sig.as_ref()) {
+                comp.apply_node_comment(
+                    &mut node,
+                    comment_sig,
+                    &format!("{name}'s"),
+                    &binding.name.span,
+                );
+            }
+            Ok(node)
+        };
+        // We may need to compile the words in the context of a data definition method
+        let mut node = if let Some((def, _)) = &data_def {
+            self.in_method(def, compile)?
+        } else {
+            compile(self)?
+        };
+        let self_referenced = self.current_bindings.pop().unwrap().recurses > 0;
+        let is_obverse = node
+            .iter()
+            .any(|n| matches!(n, Node::CustomInverse(cust, _) if cust.is_obverse));
 
-        if self_referenced {
-            let name = name.clone();
-            let make = make_fn.clone();
-            make_fn = Rc::new(move |instrs, sig, comp: &mut Compiler| {
-                let mut f = make(instrs, sig, comp);
-                f.recursive = true;
-                let instrs = vec![Instr::PushFunc(f), Instr::Prim(Primitive::This, span_index)];
-                comp.make_function(FunctionId::Named(name.clone()), sig, instrs)
-            });
+        // Normalize external
+        if is_external {
+            if node.is_empty() {
+                let Some(sig) = &binding.signature else {
+                    return Err(self.error(
+                        span.clone(),
+                        "Empty external functions must have a signature declared",
+                    ));
+                };
+                let sig = sig.value;
+                let span = self.add_span(span.clone());
+                let zero = Value::from(0);
+                for _ in 0..sig.args() {
+                    node.push(Node::Prim(Primitive::Pop, span));
+                }
+                for _ in 0..sig.outputs() {
+                    node.push(Node::Push(zero.clone()));
+                }
+                node.prepend(Node::Prim(Primitive::Assert, span));
+                node.prepend(Node::new_push("Unbound external function"));
+                node.prepend(Node::Push(zero));
+            } else {
+                node = Node::NoInline(node.into());
+            }
+            self.externals
+                .insert(name.clone(), self.asm.functions.len());
         }
 
         // Resolve signature
-        match instrs_signature(&instrs) {
+        match node.sig() {
             Ok(mut sig) => {
-                // Validate signature
-                if let Some(declared_sig) = &binding.signature {
-                    let sig_to_check = if let [Instr::PushFunc(f)] = instrs.as_slice() {
-                        // If this is a function wrapped in parens, check the signature of the
-                        // function rather than the signature of the binding's words
-                        f.signature()
-                    } else if instrs.is_empty() {
-                        Signature::new(0, 1)
-                    } else {
-                        sig
-                    };
-                    if declared_sig.value != sig_to_check {
-                        self.add_error(
-                            declared_sig.span.clone(),
-                            format!(
-                                "Function signature mismatch: declared {} but inferred {}",
-                                declared_sig.value, sig_to_check
-                            ),
-                        );
+                let binds_above = !in_function && node.is_empty() && no_code_words && !is_method;
+                if !binds_above {
+                    // Validate signature
+                    if let Some(declared_sig) = &binding.signature {
+                        node = self.force_sig(node, declared_sig.value, &declared_sig.span);
+                        sig = declared_sig.value;
                     }
                 }
 
-                #[rustfmt::skip]
-                let is_setinv = matches!(
-                    instrs.as_slice(),
-                    [Instr::PushFunc(_), Instr::PushFunc(_), Instr::Prim(Primitive::SetInverse, _)]
-                );
-                #[rustfmt::skip]
-                let is_setund = matches!(
-                    instrs.as_slice(),
-                    [Instr::PushFunc(_), Instr::PushFunc(_), Instr::PushFunc(_), Instr::Prim(Primitive::SetUnder, _)]
-                );
-                if let [Instr::PushFunc(f)] = instrs.as_slice() {
-                    // Binding is a single inline function
-                    sig = f.signature();
-                    let func = make_fn(f.instrs(self).into(), f.signature(), self);
-                    self.compile_bind_function(&name, local, func, span_index, comment)?;
-                } else if sig == (0, 1) && !is_setinv && !is_setund {
-                    if let &[Instr::Prim(Primitive::Tag, span)] = instrs.as_slice() {
-                        instrs.push(Instr::Label {
-                            label: name.clone(),
-                            span,
-                        })
-                    }
+                // Add data def local wrapper
+                if let Some((def, span)) = data_def {
+                    node = Node::WithLocal {
+                        def: def.def_index,
+                        inner: SigNode::new(sig, node).into(),
+                        span,
+                    };
+                    sig.update_args(|a| a + 1);
+                }
+
+                if sig == (0, 1)
+                    && !self_referenced
+                    && !is_func
+                    && !is_obverse
+                    && !is_method
+                    && !is_external
+                {
                     // Binding is a constant
-                    let val = if let [Instr::Push(v)] = instrs.as_slice() {
+                    let val = if let [Node::Push(v)] = node.as_slice() {
                         Some(v.clone())
-                    } else {
-                        match self.comptime_instrs(instrs.clone()) {
+                    } else if node.is_pure(Purity::Pure, &self.asm) {
+                        match self.comptime_node(&node) {
                             Ok(Some(vals)) => vals.into_iter().next(),
                             Ok(None) => None,
                             Err(e) => {
@@ -289,71 +438,70 @@ impl Compiler {
                                 None
                             }
                         }
+                    } else {
+                        None
                     };
+
                     let is_const = val.is_some();
-                    self.asm.bind_const(local, val, span_index, comment);
-                    self.scope.names.insert(name.clone(), local);
-                    if is_const {
-                        self.asm.instrs.truncate(instrs_start);
-                    } else {
-                        // Add binding instrs to top slices
-                        instrs.push(Instr::BindGlobal {
-                            span: span_index,
+                    self.compile_bind_const(name, local, val, spandex, meta);
+                    if !is_const {
+                        // Add binding instrs to unevaluated constants
+                        if node.is_pure(Purity::Pure, &self.asm) {
+                            self.macro_env
+                                .rt
+                                .unevaluated_constants
+                                .insert(local.index, node.clone());
+                        }
+                        // Add binding instrs to root
+                        self.asm.root.push(node);
+                        self.asm.root.push(Node::BindGlobal {
                             index: local.index,
-                        });
-                        let start = self.asm.instrs.len();
-                        (self.asm.instrs).extend(optimize_instrs(instrs, true, &self.asm));
-                        let end = self.asm.instrs.len();
-                        self.asm.top_slices.push(FuncSlice {
-                            start,
-                            len: end - start,
+                            span: spandex,
                         });
                     }
-                } else if instrs.is_empty() {
+                } else if binds_above {
                     // Binding binds the value above
-                    match &mut self.scope.stack_height {
-                        Ok(height) => {
-                            if *height > 0 {
-                                sig = Signature::new(0, 1);
-                            }
-                            *height = height.saturating_sub(1);
-                        }
-                        Err(sp) => {
-                            let sp = sp.clone();
-                            self.add_error(
-                                sp.span,
-                                format!(
-                                    "This line's signature is undefined: {}. \
-                                    This prevents the later binding of {}.",
-                                    sp.value, name
-                                ),
-                            );
+                    let mut has_stack_value = false;
+                    for i in 0..self.asm.root.len() {
+                        let nodes = &self.asm.root[self.asm.root.len() - 1 - i..];
+                        let Ok(sig) = nodes_sig(nodes) else {
+                            break;
+                        };
+                        if sig.outputs() > 0 {
+                            has_stack_value = true;
+                            break;
                         }
                     }
-                    if let Some(Instr::Push(val)) = self.asm.instrs.last() {
+                    if has_stack_value {
+                        sig = Signature::new(0, 1);
+                    }
+                    if let Some(Node::Push(val)) = self.asm.root.last() {
+                        // Actually binds the constant
                         let val = val.clone();
-                        self.asm.instrs.pop();
-                        self.asm.bind_const(local, Some(val), span_index, comment);
-                        if let Some(last_slice) = self.asm.top_slices.last_mut() {
-                            last_slice.len -= 1;
-                            if last_slice.len == 0 {
-                                self.asm.top_slices.pop();
-                            }
+                        self.asm.root.pop();
+                        self.compile_bind_const(name, local, Some(val), spandex, meta);
+                    } else if sig == (0, 0) {
+                        // Empty function
+                        let mut node = Node::empty();
+                        // Validate signature
+                        if let Some(declared_sig) = &binding.signature {
+                            node = self.force_sig(node, declared_sig.value, &declared_sig.span);
+                            sig = declared_sig.value;
                         }
+                        let func = make_fn(node, sig, self);
+                        self.compile_bind_function(name, local, func, spandex, meta)?;
                     } else {
-                        self.asm.bind_const(local, None, span_index, comment);
-                        let start = self.asm.instrs.len();
-                        self.asm.instrs.push(Instr::BindGlobal {
-                            span: span_index,
+                        // Binds some |0.1 code
+                        self.compile_bind_const(name, local, None, spandex, meta);
+                        self.asm.root.push(Node::BindGlobal {
                             index: local.index,
+                            span: spandex,
                         });
-                        self.asm.top_slices.push(FuncSlice { start, len: 1 });
                     }
-                    self.scope.names.insert(name.clone(), local);
                 } else {
                     // Binding is a normal function
-                    let func = make_fn(instrs, sig, self);
-                    self.compile_bind_function(&name, local, func, span_index, comment)?;
+                    let func = make_fn(node, sig, self);
+                    self.compile_bind_function(name, local, func, spandex, meta)?;
                 }
 
                 self.code_meta.function_sigs.insert(
@@ -362,28 +510,76 @@ impl Compiler {
                         sig,
                         explicit: binding.signature.is_some(),
                         inline: false,
+                        set_inverses: Default::default(),
                     },
                 );
             }
-            Err(e) => {
-                if let Some(sig) = binding.signature {
-                    // Binding is a normal function
-                    instrs.insert(0, Instr::NoInline);
-                    let func = make_fn(instrs, sig.value, self);
-                    self.compile_bind_function(&name, local, func, span_index, comment)?;
-                } else {
-                    self.add_error(
-                        binding.name.span.clone(),
-                        format!(
-                            "Cannot infer function signature: {e}{}",
-                            if e.kind == SigCheckErrorKind::Ambiguous {
-                                ". A signature can be declared after the `←`."
-                            } else {
-                                ""
-                            }
-                        ),
-                    );
+            Err(e) => self.add_error(
+                binding.name.span.clone(),
+                format!("Cannot infer function signature: {e}"),
+            ),
+        }
+        Ok(())
+    }
+    pub(super) fn module(&mut self, m: Sp<ScopedModule>, prelude: BindingPrelude) -> UiuaResult {
+        let m = m.value;
+        let (scope_kind, name_and_local) = match m.kind {
+            ModuleKind::Named(name) => {
+                let global_index = self.next_global;
+                self.next_global += 1;
+                let local = LocalName {
+                    index: global_index,
+                    public: true,
+                };
+                let meta = BindingMeta {
+                    comment: prelude.comment.as_deref().map(DocComment::from),
+                    deprecation: prelude.deprecation.clone(),
+                    ..Default::default()
+                };
+                self.asm.add_binding_at(
+                    local,
+                    BindingKind::Scope(self.higher_scopes.len() + 1),
+                    Some(name.span.clone()),
+                    meta,
+                );
+                // Add local
+                self.scope.add_module_name(name.value.clone(), local);
+                (self.code_meta.global_references).insert(name.span.clone(), local.index);
+                (ScopeKind::Module(name.value.clone()), Some((name, local)))
+            }
+            ModuleKind::Test => (ScopeKind::Test, None),
+        };
+        let (module, ()) = self.in_scope(scope_kind, |comp| {
+            comp.items(m.items, ItemCompMode::TopLevel)?;
+            comp.end_enum()?;
+            Ok(())
+        })?;
+        if let Some((name, local)) = name_and_local {
+            // Named module
+            // Add imports
+            if let Some(line) = m.imports {
+                for item in line.items {
+                    if let Some(mut local) = module.names.get(&item.value).copied() {
+                        local.public = false;
+                        (self.code_meta.global_references).insert(item.span.clone(), local.index);
+                        self.scope.names.insert(item.value, local);
+                    } else {
+                        self.add_error(
+                            item.span.clone(),
+                            format!("{} does not exist in {}", item.value, name.value),
+                        );
+                    }
                 }
+            }
+            // Update global
+            self.asm.bindings.make_mut()[local.index].kind = BindingKind::Module(module);
+        } else {
+            // Test module
+            if let Some(line) = &m.imports {
+                self.add_error(
+                    line.tilde_span.clone(),
+                    "Items cannot be imported from test modules",
+                );
             }
         }
         Ok(())
@@ -391,7 +587,7 @@ impl Compiler {
     pub(super) fn import(
         &mut self,
         import: crate::ast::Import,
-        prev_com: Option<Arc<str>>,
+        prev_com: Option<EcoString>,
     ) -> UiuaResult {
         // Import module
         let module_path = self.import_module(&import.path.value, &import.path.span)?;
@@ -404,24 +600,27 @@ impl Compiler {
                 index: global_index,
                 public: true,
             };
-            self.asm.add_global_at(
+            self.asm.add_binding_at(
                 local,
-                BindingKind::Module(module_path.clone()),
+                BindingKind::Import(module_path.clone()),
                 Some(name.span.clone()),
-                prev_com.or_else(|| imported.comment.clone()),
+                BindingMeta {
+                    comment: prev_com
+                        .or_else(|| imported.comment.clone())
+                        .map(|text| DocComment::from(text.as_str())),
+                    ..Default::default()
+                },
             );
-            self.scope.names.insert(name.value.clone(), local);
+            self.scope.add_module_name(name.value.clone(), local);
         }
         // Bind items
         for item in import.items() {
-            if let Some(local) = self
-                .imports
-                .get(&module_path)
+            if let Some(local) = (self.imports.get(&module_path))
                 .and_then(|i| i.names.get(item.value.as_str()))
                 .copied()
             {
                 self.validate_local(&item.value, local, &item.span);
-                (self.code_meta.global_references).insert(item.clone(), local.index);
+                (self.code_meta.global_references).insert(item.span.clone(), local.index);
                 self.scope.names.insert(
                     item.value.clone(),
                     LocalName {
@@ -441,5 +640,136 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+    fn analyze_macro_body(
+        &mut self,
+        macro_name: &str,
+        words: &[Sp<Word>],
+        mut code_macro: bool,
+        recursive: &mut bool,
+    ) {
+        for word in words {
+            let mut path_locals = None;
+            let mut name_local = None;
+            match &word.value {
+                Word::Strand(items) => {
+                    self.analyze_macro_body(macro_name, items, code_macro, recursive)
+                }
+                Word::Array(arr) => {
+                    if self.analyze_macro_items(macro_name, &arr.lines, code_macro, recursive) {
+                        return;
+                    }
+                }
+                Word::Func(func) => {
+                    if self.analyze_macro_items(macro_name, &func.lines, code_macro, recursive) {
+                        return;
+                    }
+                }
+                Word::Pack(pack) => {
+                    for branch in &pack.branches {
+                        if self.analyze_macro_items(
+                            macro_name,
+                            &branch.value.lines,
+                            code_macro,
+                            recursive,
+                        ) {
+                            return;
+                        }
+                    }
+                }
+                Word::Ref(r) => match self.ref_local(r) {
+                    Ok(Some((pl, l))) => {
+                        path_locals = Some((&r.path, pl));
+                        name_local = Some((&r.name, l));
+                    }
+                    Ok(None) => {}
+                    Err(e) => self.errors.push(e),
+                },
+                Word::IncompleteRef { path, in_macro_arg } => {
+                    match self.ref_path(path, *in_macro_arg) {
+                        Ok(Some((_, pl))) => path_locals = Some((path, pl)),
+                        Ok(None) => {}
+                        Err(e) => self.errors.push(e),
+                    }
+                }
+                Word::Modified(m) => {
+                    if let Modifier::Ref(r) = &m.modifier.value {
+                        match self.ref_local(r) {
+                            Ok(Some((pl, l))) => {
+                                path_locals = Some((&r.path, pl));
+                                name_local = Some((&r.name, l));
+                                code_macro |= self.code_macros.contains_key(&l.index);
+                            }
+                            Ok(None) => {}
+                            Err(e) => self.errors.push(e),
+                        }
+                        if let Some(BindingKind::Module(module)) = name_local
+                            .as_ref()
+                            .and_then(|(_, local)| self.asm.bindings.get(local.index))
+                            .map(|b| &b.kind)
+                        {
+                            let names = module.names.clone();
+                            let recursive = &mut *recursive;
+                            if let Err(e) = self.in_scope(ScopeKind::AllInModule, move |comp| {
+                                comp.scope.names.extend(names);
+                                comp.analyze_macro_body(macro_name, &m.operands, false, recursive);
+                                Ok(())
+                            }) {
+                                self.errors.push(e);
+                            }
+                        } else {
+                            // Name errors are ignored in code macros
+                            let error_count = self.errors.len();
+                            self.analyze_macro_body(macro_name, &m.operands, code_macro, recursive);
+                            if code_macro {
+                                self.errors.truncate(error_count);
+                            }
+                        }
+                    } else {
+                        self.analyze_macro_body(macro_name, &m.operands, code_macro, recursive)
+                    }
+                }
+                _ => {}
+            }
+            if let Some((nm, local)) = name_local {
+                if nm.value == macro_name
+                    && path_locals.as_ref().is_none_or(|(pl, _)| pl.is_empty())
+                {
+                    *recursive = true;
+                }
+                self.validate_local(&nm.value, local, &nm.span);
+                (self.code_meta.global_references).insert(nm.span.clone(), local.index);
+            }
+            if let Some((path, locals)) = path_locals {
+                for (local, comp) in locals.into_iter().zip(path) {
+                    (self.code_meta.global_references)
+                        .insert(comp.module.span.clone(), local.index);
+                }
+            }
+        }
+    }
+    /// Returns true if an error was found
+    fn analyze_macro_items(
+        &mut self,
+        macro_name: &str,
+        items: &[Item],
+        code_macro: bool,
+        recursive: &mut bool,
+    ) -> bool {
+        for item in items {
+            match item {
+                Item::Words(words) => {
+                    self.analyze_macro_body(macro_name, words, code_macro, recursive)
+                }
+                item => {
+                    self.add_error(
+                        item.span().unwrap_or_else(CodeSpan::dummy),
+                        format!("Cannot have {}s in index macros", item.kind_str()),
+                    );
+                    return true;
+                }
+            }
+        }
+        false
     }
 }

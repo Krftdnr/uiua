@@ -49,7 +49,7 @@ comp.print_diagnostics(true);
 let asm = comp.load_str("+ 3 5").unwrap().finish();
 
 let mut uiua = Uiua::with_native_sys();
-uiua.run_asm(&asm).unwrap();
+uiua.run_asm(asm).unwrap();
 let res = uiua.pop_int().unwrap();
 assert_eq!(res, 8);
 ```
@@ -95,13 +95,13 @@ uiua.run_str("
 ").unwrap();
 
 let x = uiua.bound_values().remove("X").unwrap();
-assert_eq!(x.as_int(&uiua, "").unwrap(), 5);
+assert_eq!(x.as_int(&uiua, None).unwrap(), 5);
 
 let f = uiua.bound_functions().remove("F").unwrap();
 let mut comp = Compiler::new().with_assembly(uiua.take_asm());
 comp.create_bind_function("AddTwo", (1, 1), move |uiua| {
-    uiua.call(f.clone())?;
-    uiua.call(f.clone())
+    uiua.call(&f)?;
+    uiua.call(&f)
 }).unwrap();
 comp.load_str("AddTwo 3").unwrap();
 uiua.run_asm(comp.finish()).unwrap();
@@ -135,7 +135,12 @@ The `uiua` crate has the following noteable feature flags:
 - `raw_mode`: Enables the `&raw` system function
 */
 
-#![allow(clippy::single_match, clippy::needless_range_loop)]
+#![allow(
+    clippy::single_match,
+    clippy::needless_range_loop,
+    clippy::mutable_key_type,
+    clippy::match_like_matches_macro
+)]
 #![warn(missing_docs)]
 
 mod algorithm;
@@ -146,15 +151,16 @@ mod boxed;
 mod check;
 mod compile;
 mod complex;
+mod constant;
 mod cowslice;
 mod error;
 mod ffi;
+mod fill;
 pub mod format;
 mod function;
 mod grid_fmt;
 mod lex;
 pub mod lsp;
-mod optimize;
 mod parse;
 mod primitive;
 #[doc(hidden)]
@@ -165,34 +171,39 @@ mod shape;
 #[doc(hidden)]
 pub mod stand;
 mod sys;
-#[cfg(feature = "native_sys")]
-mod sys_native;
+mod tree;
+mod types;
 mod value;
+#[cfg(feature = "window")]
+#[doc(hidden)]
+pub mod window;
 
 #[allow(unused_imports)]
 pub use self::{
+    algorithm::media,
     array::*,
     assembly::*,
     boxed::*,
     compile::*,
+    complex::*,
+    constant::*,
     error::*,
     ffi::*,
     function::*,
     lex::is_ident_char,
     lex::*,
-    lsp::{spans, SpanKind},
+    lsp::{SpanKind, Spans},
     parse::{ident_modifier_args, parse, ParseError},
     primitive::*,
     run::*,
     shape::*,
     sys::*,
+    tree::*,
     value::*,
 };
 
-#[cfg(feature = "native_sys")]
-pub use self::sys_native::*;
+use self::algorithm::get_ops;
 
-pub use complex::*;
 use ecow::EcoString;
 
 /// The Uiua version
@@ -204,6 +215,9 @@ pub type Ident = EcoString;
 #[cfg(test)]
 mod tests {
     use std::path::*;
+
+    use crate::{Compiler, Uiua};
+
     fn test_files(filter: impl Fn(&Path) -> bool) -> impl Iterator<Item = PathBuf> {
         std::fs::read_dir("tests")
             .unwrap()
@@ -217,61 +231,103 @@ mod tests {
     #[cfg(feature = "native_sys")]
     fn suite() {
         use super::*;
-        for path in test_files(|path| {
+        use std::thread;
+
+        let threads: Vec<_> = test_files(|path| {
             !(path.file_stem().unwrap())
                 .to_string_lossy()
                 .contains("error")
-        }) {
-            let code = std::fs::read_to_string(&path).unwrap();
+        })
+        .map(|path| {
+            thread::spawn(move || {
+                let code = std::fs::read_to_string(&path).unwrap();
+                // Test running
+                let mut env = Uiua::with_native_sys();
+                let mut comp = Compiler::new();
+                if let Err(e) = comp
+                    .load_str_src(&code, &path)
+                    .and_then(|comp| env.run_asm(comp.asm.clone()))
+                {
+                    panic!("Test failed in {}:\n{}", path.display(), e.report());
+                }
+                if let Some(diag) = comp
+                    .take_diagnostics()
+                    .into_iter()
+                    .find(|d| d.kind > DiagnosticKind::Advice)
+                {
+                    panic!("Test failed in {}:\n{}", path.display(), diag.report());
+                }
+                let (stack, under_stack) = env.take_stacks();
+                if !stack.is_empty() {
+                    panic!("{} had a non-empty stack", path.display());
+                }
+                if !under_stack.is_empty() {
+                    panic!("{} had a non-empty under stack", path.display());
+                }
+
+                // Make sure lsp spans doesn't panic
+                _ = Spans::from_input(&code);
+            })
+        })
+        .collect();
+        for thread in threads {
+            if let Err(e) = thread.join() {
+                if let Some(s) = e.downcast_ref::<String>() {
+                    panic!("{}", s);
+                } else {
+                    panic!("{:?}", e);
+                }
+            }
+        }
+        _ = std::fs::remove_file("example.ua");
+    }
+
+    #[test]
+    #[cfg(feature = "native_sys")]
+    fn error_dont_crash() {
+        use super::*;
+        let path = Path::new("tests_special/error.ua");
+        let mut code = std::fs::read_to_string(path).unwrap();
+        if code.contains('\r') {
+            code = code.replace('\r', "");
+        }
+        for section in code.split("\n\n") {
             let mut env = Uiua::with_native_sys();
             let mut comp = Compiler::new();
-            if let Err(e) = comp
-                .load_str_src(&code, &path)
-                .and_then(|comp| env.run_asm(&comp.finish()))
+            let res = comp
+                .load_str_src(section, path)
+                .and_then(|comp| env.run_asm(comp.finish()));
+            if res.is_ok()
+                && comp
+                    .take_diagnostics()
+                    .into_iter()
+                    .filter(|diag| diag.kind > DiagnosticKind::Advice)
+                    .count()
+                    == 0
             {
-                panic!("Test failed in {}:\n{}", path.display(), e.report());
-            }
-            if let Some(diag) = comp
-                .take_diagnostics()
-                .into_iter()
-                .find(|d| d.kind < DiagnosticKind::Advice)
-            {
-                panic!("Test failed in {}:\n{}", path.display(), diag.report());
-            }
-            if env.run_str("◌").is_ok() {
-                panic!("{} had a non-empty stack", path.display());
+                panic!(
+                    "Test succeeded when it should have failed in {}:\n{}",
+                    path.display(),
+                    section
+                );
             }
         }
     }
 
     #[test]
     #[cfg(feature = "native_sys")]
-    fn errors() {
+    fn assembly_round_trip() {
         use super::*;
-        for path in test_files(|path| {
-            (path.file_stem().unwrap())
-                .to_string_lossy()
-                .contains("error")
-        }) {
-            let mut code = std::fs::read_to_string(&path).unwrap();
-            if code.contains('\r') {
-                code = code.replace('\r', "");
-            }
-            for section in code.split("\n\n") {
-                let mut env = Uiua::with_native_sys();
-                let mut comp = Compiler::new();
-                let res = comp
-                    .load_str_src(section, &path)
-                    .and_then(|comp| env.run_asm(&comp.finish()));
-                if res.is_ok() && comp.take_diagnostics().is_empty() {
-                    panic!(
-                        "Test succeeded when it should have failed in {}:\n{}",
-                        path.display(),
-                        section
-                    );
-                }
-            }
-        }
+        let path = Path::new("tests_special/uasm.ua");
+        let mut comp = Compiler::new();
+        comp.load_file(path).unwrap();
+        let asm = comp.finish();
+        let root = asm.root.clone();
+        let uasm = asm.to_uasm();
+        let asm = Assembly::from_uasm(&uasm).unwrap();
+        assert_eq!(asm.root, root);
+        let mut env = Uiua::with_native_sys();
+        env.run_asm(asm).unwrap();
     }
 
     #[test]
@@ -279,41 +335,123 @@ mod tests {
         use super::*;
         for path in test_files(|_| true) {
             let code = std::fs::read_to_string(&path).unwrap();
-            spans(&code);
+            Spans::from_input(&code);
+        }
+    }
+
+    fn recurse_dirs(dir: &std::path::Path, f: &impl Fn(&std::path::Path)) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.to_string_lossy().contains("target") {
+                continue;
+            }
+            if path.is_dir() {
+                recurse_dirs(&path, f);
+            } else {
+                f(&path);
+            }
         }
     }
 
     #[test]
     fn no_dbgs() {
-        fn recurse_dirs(dir: &std::path::Path, f: &impl Fn(&std::path::Path)) {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let entry = entry.unwrap();
-                let path = entry.path();
-                if path.to_string_lossy().contains("target") {
-                    continue;
-                }
-                if path.is_dir() {
-                    recurse_dirs(&path, f);
-                } else {
-                    f(&path);
-                }
-            }
-        }
         recurse_dirs(std::path::Path::new("."), &|path| {
-            if path.extension().is_some_and(|ext| ext == "rs") {
-                if path.canonicalize().unwrap()
+            if path.extension().is_none_or(|ext| ext != "rs")
+                || path.canonicalize().unwrap()
                     == std::path::Path::new(file!()).canonicalize().unwrap()
-                {
-                    return;
-                }
-                let contents = std::fs::read_to_string(path).unwrap();
-                if contents.contains("dbg!") {
+            {
+                return;
+            }
+            let contents = std::fs::read_to_string(path).unwrap();
+            for line in contents.lines() {
+                if line.contains("dbg!") && !line.trim().starts_with("//") {
                     panic!("File {} contains a dbg! macro", path.display());
                 }
             }
         });
-        if crate::algorithm::invert::DEBUG {
-            panic!("invert::DEBUG is true");
+        if crate::compile::invert::DEBUG {
+            panic!("compile::invert::DEBUG is true");
         }
+        if crate::ffi::DEBUG {
+            panic!("ffi::DEBUG is true");
+        }
+        if crate::compile::optimize::DEBUG {
+            panic!("compile::optimize::DEBUG is true");
+        }
+        if crate::compile::algebra::DEBUG {
+            panic!("compile::algebra::DEBUG is true");
+        }
+    }
+
+    #[test]
+    fn no_printlns() {
+        recurse_dirs(std::path::Path::new("."), &|path| {
+            if path.extension().is_none_or(|ext| ext != "rs")
+                || path.canonicalize().unwrap()
+                    == std::path::Path::new(file!()).canonicalize().unwrap()
+                || path
+                    .components()
+                    .any(|c| c.as_os_str() == "main.rs" || c.as_os_str() == "profile.rs")
+            {
+                return;
+            }
+            let contents = std::fs::read_to_string(path).unwrap();
+            for line in contents.lines() {
+                if line.contains("println!")
+                    && !(line.trim().starts_with("//")
+                        || line.contains("eprintln!")
+                        || line.contains("// Allow println"))
+                {
+                    panic!("File {} contains a println! macro", path.display());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn external_bind_before() {
+        let mut comp = Compiler::new();
+        comp.create_bind_function("F", (2, 1), |env| {
+            let a = env.pop_num().unwrap();
+            let b = env.pop_num().unwrap();
+            env.push(a + b);
+            Ok(())
+        })
+        .unwrap();
+        comp.load_str(
+            "F = |2 # External!\n\
+             F 1 2",
+        )
+        .unwrap();
+
+        let mut env = Uiua::with_native_sys();
+        env.run_compiler(&mut comp)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let res = env.pop_int().unwrap();
+        assert_eq!(res, 3);
+    }
+
+    #[test]
+    fn external_bind_after() {
+        let mut comp = Compiler::new();
+        comp.load_str(
+            "F = |2 # External!\n\
+             F 1 2",
+        )
+        .unwrap();
+        comp.create_bind_function("F", (2, 1), |env| {
+            let a = env.pop_num().unwrap();
+            let b = env.pop_num().unwrap();
+            env.push(a + b);
+            Ok(())
+        })
+        .unwrap();
+
+        let mut env = Uiua::with_native_sys();
+        env.run_compiler(&mut comp)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let res = env.pop_int().unwrap();
+        assert_eq!(res, 3);
     }
 }

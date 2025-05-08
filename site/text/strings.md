@@ -25,27 +25,25 @@ It can also be used on arrays of boxed strings.
 
 As discussed in the [Thinking With Arrays](/tutorial/thinkingwitharrays) tutorial, [`partition`]() can be used to split an array by a delimiter.
 
-First, we create a mask of places where the delimiter is *not* using [`not equals ≠`](). In this case, we'll use the space character.
+First, we create a mask of places where the delimiter is *not* using [`by`]() [`not equals ≠`](). In this case, we'll use the space character.
 ```uiua
-≠@ . "Split this string"
+⊸≠@  "Split this string"
 ```
-[`partition`]() will then split the strings at the places where the mask changes, ommitting `0`s.
+[`partition`]() will then split the strings at the places where the mask changes, omitting `0`s.
 ```uiua
-⊜□ ≠@ . "Split this string"
+⊜□ ⊸≠@  "Split this string"
+```
+Notice that this reads almost as a description of what it does: "Partition box by not equals space"
+
+This can be nested to split by multiple delimiters.
+```uiua
+"A string\nwith multiple\nlines"
+⊜(□⊜□⊸≠@ )⊸≠@\n
 ```
 
-[`partition`]() has an alternate functionality when its function has signature `|2.1` instead of `|1.1`. This will perform a reduction operation, similar to [`reduce`]().
-
-Using [planet notation](/tutorial/advancedstack#planet-notation), we can select the first or last split section.
-```uiua
-⊜⊙◌ ≠@ . "Split this string"
-```
-```uiua
-⊜⋅∘ ≠@ . "Split this string"
-```
 For parts of the string that are not the first or last, we can simply [`box`]() and [`select`]().
 ```uiua
-⊏1_3 ⊜□≠@,. "lorem,ipsum,dolor,sit,amet"
+⊏1_3 ⊜□⊸≠@, "lorem,ipsum,dolor,sit,amet"
 ```
 
 [`partition`]() can be nested to split by multiple delimiters.
@@ -53,43 +51,44 @@ For parts of the string that are not the first or last, we can simply [`box`]() 
 For example, if you were reading from a file that contained rows of numbers separated by spaces, you could use [`partition`]() to create a multi-dimensional array.
 
 Here, the contents of the file will be represented as a multi-line string. We use [`parse`]() as the inner function to parse the numbers.
+
 ```uiua
 $ 1  8   4 99
 $ 5  20  0 0
 $ 78 101 1 8
-⊜(⊜⋕≠@ .)≠@\n.
+⊜(⊜⋕⊸≠@ )⊸≠@\n
 ```
 
-This assumes that the two delimiters delimit different dimensions of the array. If they delimit the same dimension, we can use [`not`]()[`member`]().
+This assumes that the two delimiters delimit different dimensions of the array. If they delimit the same dimension, we can use [`not`]() and [`memberof`]().
 ```uiua
 $ 1  8   4 99
 $ 5  20  0 0
 $ 78 101 1 8
-⊜⋕¬∊," \n"
+⊜⋕¬⊸∊" \n"
 ```
 
 ## Finding substrings with [`mask`]()
 
 What if we want to split by a non-scalar delimiter? Simply dropping a string delimiter into the code above produces an error.
-```uiua
-⊜□ ≠" - ". "foo - bar - ba-az"
+```uiua should fail
+⊜□ ⊸≠" - " "foo - bar - ba-az"
 ```
 We might try [`find`](). While there may be cases when this output is useful, it is not quite what we want here.
 ```uiua
-    ⌕" - "  "foo - bar - ba-az"
-⊜□ ¬⌕" - ". "foo - bar - ba-az"
+    ⊸⌕" - " "foo - bar - ba-az"
+⊜□ ¬⊸⌕" - " "foo - bar - ba-az"
 ```
 This is because [`find`]() only marks the start of each matching substring.
 
 [`mask`]() marks each substring with an increasing number.
 ```uiua
-⦷" - ". "foo - bar - ba-az"
+⊸⦷" - " "foo - bar - ba-az"
 ```
 This works great with [`partition`]() to split the string how we want.
 ```uiua
-    ⦷" - "  "foo - bar - ba-az"
-   ¬⦷" - "  "foo - bar - ba-az"
-⊜□ ¬⦷" - ". "foo - bar - ba-az"
+    ⊸⦷" - " "foo - bar - ba-az"
+   ¬⊸⦷" - " "foo - bar - ba-az"
+⊜□ ¬⊸⦷" - " "foo - bar - ba-az"
 ```
 Notice that while [`not`]() leaves parts of the mask negative, [`partition`]() ignores all sections that are not positive.
 
@@ -99,20 +98,76 @@ Because [`under`]() works with [`partition`](), we can use it with [`mask`]() to
 
 In this example, we replace each row of the [`partition`]()ed array with the string `"orb"`.
 ```uiua
-           ⦷ "ab"  "abracadabra"
- ⊜∘        ⦷ "ab". "abracadabra"
-⍜⊜∘≡⋅"orb" ⦷ "ab". "abracadabra"
+           ⊸⦷ "ab" "abracadabra"
+ ⊜∘        ⊸⦷ "ab" "abracadabra"
+⍜⊜∘≡⋅"orb" ⊸⦷ "ab" "abracadabra"
 ```
 This can even be used to replace the matches with different strings.
 ```uiua
-⍜⊜□◌ ⦷ "ab". "abracadabra" {"[first]" "[second]"}
+⍜⊜□◌ ⊸⦷ "ab" "abracadabra" {"[first]" "[second]"}
 ```
 Here is how you might replace with a variable number of strings.
 ```uiua
-F ← ⍜⊜□(↙⧻) ⦷ "ab".:°⋕⇡10
+F ← ⍜⊜□(↙⧻) ⊸⦷ "ab" :°⋕⇡10
 F "abracadabra"
 F "abcdefg"
 F "ababab|abababab"
+```
+
+## Format String Tricks
+
+As discussed [in the main tutorial](/tutorial/functions#format-strings), format strings allow you to create strings with interpolated values.
+
+```uiua
+$"_ + _ = _" 1 2 3
+```
+
+Format strings have some non-obvious uses though.
+
+You can use [`reduce`]() with a format string to intersperse a delimiter between formatted items.
+
+```uiua
+/$"_ - _" ⇡5
+```
+
+```uiua
+/$"_ and _" {"red" "blue" "green"}
+```
+
+[`un`]() with a format string attempts to match and extract substrings, a sort of simplified [`regex`]().
+
+```uiua
+°$"_(_) = _" "f(x) = x^2"
+```
+
+```uiua
+°$"_,_" "1,2,3,4"
+```
+
+[`un`]() [`reduce`]() with a format string splits by a delimiter. The results are [`box`]()ed.
+
+```uiua
+°/$"_;_" "5;cool;26;([])"
+```
+
+By combining these with [`under`](), you can modify certain substrings.
+
+```uiua
+⍜(⋕°$"_,_"|×10) "2,3,4"
+```
+
+```uiua
+⍜°/$"_;_"(⍚⊂⊙@s) "apple;banana;cherry;durian"
+```
+
+You can use [`fork`]() or [`bracket`]() to pre-format certain fragments of the string.
+
+While this example could be written shorter with other stack manipulation modifiers, using [`fork`]() in this way makes it easier to understand what is happening, as each `_` in the format string gets its own branch in the [`fork`]().
+
+```uiua
+F ← $"_ is _ year_ old." ⊃(∘|⋅∘|▽⊙@s≠1⋅∘)
+F "Dave" 31
+F "Remi" 1
 ```
 
 ## [`regex`]()
@@ -129,7 +184,7 @@ regex "\\d{3,4}" "(555) 310-1984"
 regex "a([bc])" "abracadabra"
 ```
 Optional captures may need [`fill`]() to avoid errors.
-```uiua
+```uiua should fail
 regex "foo(bar)?(baz)?" "foobar\nfoobaz"
 ```
 ```uiua

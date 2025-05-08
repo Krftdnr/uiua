@@ -3,14 +3,15 @@ use comrak::{
     *,
 };
 use leptos::*;
-use uiua::Primitive;
+use uiua::{Inputs, Primitive, Token};
+use uiua_editor::{backend::fetch, Editor};
 
-use crate::{backend::fetch, editor::Editor, Hd, NotFound, Prim};
+use crate::{examples::LOGO, Hd, NotFound, Prim, ScrollToHash};
 
 #[component]
 #[allow(unused_braces)]
 pub fn Markdown<S: Into<String>>(src: S) -> impl IntoView {
-    view!(<Fetch src={src.into()} f=markdown/>)
+    view!(<Fetch src={src.into()} f=markdown_view/>)
 }
 
 #[component]
@@ -23,21 +24,40 @@ pub fn Fetch<S: Into<String>, F: Fn(&str) -> View + 'static>(src: S, f: F) -> im
     );
     view! {{
         move || match once.get() {
-            Some(text) if text.is_empty() || text.starts_with("<!DOCTYPE html>") => view!(<NotFound/>).into_view(),
-            Some(text) => f(&text),
+            Some(text) if text.starts_with("<!DOCTYPE html>") => view!(<NotFound/>).into_view(),
+            Some(text) => view!(<ScrollToHash/>{f(&text)}).into_view(),
             None => view! {<h3 class="running-text">"Loading..."</h3>}.into_view(),
         }
     }}
 }
 
-pub fn markdown(text: &str) -> View {
+pub fn markdown_view(text: &str) -> View {
+    let arena = Arena::new();
+    let text = text
+        .replace("`` ` ``", "<code backtick>")
+        .replace("```", "<code block delim>")
+        .replace("``", "` `")
+        .replace("<code block delim>", "```")
+        .replace("<code backtick>", "`` ` ``");
+    let root = parse_document(&arena, &text, &ComrakOptions::default());
+    node_view(root)
+}
+
+#[cfg(test)]
+pub fn markdown_html(text: &str) -> String {
     let arena = Arena::new();
     let text = text
         .replace("```", "<code block delim>")
         .replace("``", "` `")
         .replace("<code block delim>", "```");
     let root = parse_document(&arena, &text, &ComrakOptions::default());
-    node_view(root)
+    let body = format!(r#"<body><div id=top>{}</div></body>"#, node_html(root));
+    let head = r#"
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <link rel="stylesheet" href="https://uiua.org/styles.css">
+    "#;
+    format!("<!DOCTYPE html><html><head>{}</head>{}</html>", head, body)
 }
 
 fn node_view<'a>(node: &'a AstNode<'a>) -> View {
@@ -78,16 +98,47 @@ fn node_view<'a>(node: &'a AstNode<'a>) -> View {
         NodeValue::Item(_) => view!(<li>{children}</li>).into_view(),
         NodeValue::Paragraph => view!(<p>{children}</p>).into_view(),
         NodeValue::Code(code) => {
-            if let Some(prim) = Primitive::from_name(&code.literal) {
-                view!(<Prim prim=prim glyph_only=true/>).into_view()
+            let mut lit = code.literal.clone();
+            if lit.contains("<backtick>") {
+                lit = lit.replace("<backtick>", "`");
+            }
+            let mut inputs = Inputs::default();
+            let (tokens, errors, _) = uiua::lex(&lit, (), &mut inputs);
+            if errors.is_empty() && lit != "---" {
+                let mut frags = Vec::new();
+                for token in tokens {
+                    let text = token.span.as_str(&inputs, |s| s.to_string());
+                    match token.value {
+                        Token::Glyph(prim)
+                            if prim.name() == text
+                                || prim.glyph().is_some_and(|c| c.to_string() == text) =>
+                        {
+                            frags.push(view!(<Prim prim=prim glyph_only=true/>).into_view())
+                        }
+                        _ => {
+                            frags = vec![view!(<code>{lit.clone()}</code>).into_view()];
+                            break;
+                        }
+                    }
+                }
+                view!(<span>{frags}</span>).into_view()
             } else {
-                view!(<code>{&code.literal}</code>).into_view()
+                view!(<code>{code.literal.clone()}</code>).into_view()
             }
         }
         NodeValue::Link(link) => {
             let text = leaf_text(node).unwrap_or_default();
-            let name = text.rsplit_once(' ').map(|(name, _)| name).unwrap_or(&text);
-            if let Some(prim) = Primitive::from_name(name) {
+            let name = text
+                .rsplit_once(' ')
+                .map(|(a, b)| {
+                    if a.chars().count() > b.chars().count() {
+                        a
+                    } else {
+                        b
+                    }
+                })
+                .unwrap_or(&text);
+            if let Some(prim) = Primitive::from_name(name).or_else(|| Primitive::from_name(&text)) {
                 view!(<Prim prim=prim/>).into_view()
             } else {
                 if name.chars().count() == 1 {
@@ -95,7 +146,7 @@ fn node_view<'a>(node: &'a AstNode<'a>) -> View {
                         return view!(<Prim prim=prim glyph_only=true/>).into_view();
                     }
                 }
-                view!(<a href={&link.url} title={&link.title}>{text}</a>).into_view()
+                view!(<a href={&link.url} title={&link.title}>{children}</a>).into_view()
             }
         }
         NodeValue::Emph => view!(<em>{children}</em>).into_view(),
@@ -103,7 +154,9 @@ fn node_view<'a>(node: &'a AstNode<'a>) -> View {
         NodeValue::Strikethrough => view!(<del>{children}</del>).into_view(),
         NodeValue::LineBreak => view!(<br/>).into_view(),
         NodeValue::CodeBlock(block) => {
-            if (block.info.is_empty() || block.info == "uiua")
+            if block.literal.trim() == "LOGO" {
+                view!(<Editor example=LOGO/>).into_view()
+            } else if (block.info.is_empty() || block.info.starts_with("uiua"))
                 && uiua::parse(&block.literal, (), &mut Default::default())
                     .1
                     .is_empty()
@@ -114,7 +167,191 @@ fn node_view<'a>(node: &'a AstNode<'a>) -> View {
             }
         }
         NodeValue::ThematicBreak => view!(<hr/>).into_view(),
+        NodeValue::Image(image) => {
+            let mut class = "";
+            let mut alt = leaf_text(node).unwrap_or_default();
+            if let Some(a) = alt.strip_suffix("(invert)") {
+                alt = a.trim_end().into();
+                class = "image-visibility";
+            }
+            view!(<img src={&image.url} alt={alt.clone()} title=alt class=class/>).into_view()
+        }
         _ => children.into_view(),
+    }
+}
+
+#[cfg(test)]
+fn node_html<'a>(node: &'a AstNode<'a>) -> String {
+    use uiua::{Compiler, SafeSys, Uiua, UiuaErrorKind, Value};
+    use uiua_editor::prim_class;
+
+    use crate::prim_html;
+
+    let children: String = node.children().map(node_html).collect();
+    match &node.data.borrow().value {
+        NodeValue::Text(text) => {
+            if let Some(text) = text
+                .strip_prefix('[')
+                .and_then(|text| text.strip_suffix(']'))
+            {
+                if let Some(prim) = Primitive::from_name(text) {
+                    return format!("{:?}", prim);
+                }
+            }
+            text.clone()
+        }
+        NodeValue::Heading(heading) => {
+            let id = all_text(node).to_lowercase().replace(' ', "-");
+            format!(
+                "<h{} id={:?}>{}</h{}>",
+                heading.level, id, children, heading.level
+            )
+        }
+        NodeValue::List(list) => match list.list_type {
+            ListType::Bullet => format!("<ul>{}</ul>", children),
+            ListType::Ordered => format!("<ol>{}</ol>", children),
+        },
+        NodeValue::Item(_) => format!("<li>{}</li>", children),
+        NodeValue::Paragraph => format!("<p>{}</p>", children),
+        NodeValue::Code(code) => {
+            let mut inputs = Inputs::default();
+            let (tokens, errors, _) = uiua::lex(&code.literal, (), &mut inputs);
+            if errors.is_empty() && code.literal != "---" {
+                let mut s = "<code>".to_string();
+                for token in tokens {
+                    let text = token.span.as_str(&inputs, |s| s.to_string());
+                    match token.value {
+                        Token::Glyph(prim)
+                            if prim.name() == text
+                                || prim.glyph().is_some_and(|c| c.to_string() == text) =>
+                        {
+                            s.push_str(&prim_html(prim, true, false))
+                        }
+                        _ => return format!("<code>{}</code>", code.literal),
+                    }
+                }
+                s.push_str("</code>");
+                s
+            } else {
+                format!("<code>{}</code>", code.literal)
+            }
+        }
+        NodeValue::Link(link) => {
+            let text = leaf_text(node).unwrap_or_default();
+            let name = text
+                .rsplit_once(' ')
+                .map(|(a, b)| {
+                    if a.chars().count() > b.chars().count() {
+                        a
+                    } else {
+                        b
+                    }
+                })
+                .unwrap_or(&text);
+            if let Some(prim) = Primitive::from_name(name).or_else(|| Primitive::from_name(&text)) {
+                let symbol_class = format!("prim-glyph {}", prim_class(prim));
+                let symbol = prim.to_string();
+                let name = if symbol != prim.name() {
+                    format!(" {}", prim.name())
+                } else {
+                    "".to_string()
+                };
+                format!(
+                    r#"<a 
+                        href="https://uiua.org/docs/{}" 
+                        data-title={:?}
+                        class="prim_code_a"
+                        style="text-decoration: none;">
+                        <code><span class={symbol_class:?}>{symbol}</span>{name}</code>
+                    </a>"#,
+                    prim.name(),
+                    prim.doc().short_text()
+                )
+            } else {
+                format!(
+                    "<a href={:?} data-title={}>{}</a>",
+                    link.url, link.title, text
+                )
+            }
+        }
+        NodeValue::Emph => format!("<em>{}</em>", children),
+        NodeValue::Strong => format!("<strong>{}</strong>", children),
+        NodeValue::Strikethrough => format!("<del>{}</del>", children),
+        NodeValue::LineBreak => "<br/>".into(),
+        NodeValue::CodeBlock(block) => {
+            let mut lines: Vec<String> = if block.literal.trim() == "LOGO" {
+                LOGO
+            } else {
+                block.literal.as_str()
+            }
+            .lines()
+            .map(Into::into)
+            .collect();
+            let max_len = lines
+                .iter()
+                .map(|s| {
+                    s.chars()
+                        .position(|c| c == '#')
+                        .map(|i| i + 1)
+                        .unwrap_or_else(|| s.chars().count() + 2)
+                })
+                .max()
+                .unwrap_or(0);
+            let mut comp = Compiler::with_backend(SafeSys::new());
+            let mut env = Uiua::default();
+            for line in &mut lines {
+                let line_len = line.chars().count();
+                if line_len < max_len {
+                    line.push_str(&" ".repeat(max_len - line_len));
+                }
+                match comp.load_str(line).and_then(|comp| env.run_compiler(comp)) {
+                    Ok(_) => {
+                        let values = env.take_stack();
+                        if !values.is_empty() && !values.iter().any(|v| v.shape.elements() > 200) {
+                            let formatted: Vec<String> = values.iter().map(Value::show).collect();
+                            if formatted.iter().any(|s| s.contains('\n')) {
+                                line.push('\n');
+                                for formatted in formatted {
+                                    for fline in formatted.lines() {
+                                        line.push_str(&format!("\n# {fline}"));
+                                    }
+                                }
+                            } else {
+                                line.push('#');
+                                for formatted in formatted.into_iter().rev() {
+                                    line.push(' ');
+                                    line.push_str(&formatted);
+                                }
+                            }
+                        }
+                    }
+                    Err(e)
+                        if matches!(e.kind, UiuaErrorKind::Parse(..))
+                            || e.to_string().contains("git modules")
+                            || e.to_string().contains("was empty") =>
+                    {
+                        break;
+                    }
+                    Err(e) => line.push_str(&format!("# {e}")),
+                }
+            }
+            let text = lines.join("\n");
+            format!("<code class=\"code-block\">{text}</code>")
+        }
+        NodeValue::ThematicBreak => "<hr/>".into(),
+        NodeValue::Image(image) => {
+            let mut class = "";
+            let mut alt = leaf_text(node).unwrap_or_default();
+            if let Some(a) = alt.strip_suffix("(invert)") {
+                alt = a.trim_end().into();
+                class = "image-visibility";
+            }
+            format!(
+                r#"<img src="{}" alt="{alt}" title="{alt}" class="{class}"/>"#,
+                image.url
+            )
+        }
+        _ => children,
     }
 }
 
@@ -136,4 +373,66 @@ fn all_text<'a>(node: &'a AstNode<'a>) -> String {
         }
     }
     text
+}
+
+#[cfg(test)]
+#[test]
+fn text_code_blocks() {
+    use uiua_editor::backend::WebBackend;
+
+    for entry in std::fs::read_dir("text").unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        eprintln!("Testing code blocks in {:?}", path.display());
+        let text = std::fs::read_to_string(path).unwrap();
+        let arena = Arena::new();
+        let text = text
+            .replace("```", "<code block delim>")
+            .replace("``", "` `")
+            .replace("<code block delim>", "```");
+        let root = parse_document(&arena, &text, &ComrakOptions::default());
+
+        fn text_code_blocks<'a>(node: &'a AstNode<'a>) -> Vec<(String, bool)> {
+            let mut blocks = Vec::new();
+            for child in node.children() {
+                match &child.data.borrow().value {
+                    NodeValue::CodeBlock(block) if block.info.contains("uiua") => {
+                        let should_fail = block.info.contains("should fail");
+                        let literal = if block.literal.trim() == "LOGO" {
+                            LOGO
+                        } else {
+                            block.literal.as_str()
+                        };
+                        blocks.push((literal.into(), should_fail))
+                    }
+                    _ => blocks.extend(text_code_blocks(child)),
+                }
+            }
+            blocks
+        }
+
+        for (block, should_fail) in text_code_blocks(root) {
+            eprintln!("Code block:\n{}", block);
+            let mut comp = uiua::Compiler::with_backend(WebBackend::default());
+            let mut env = uiua::Uiua::with_backend(WebBackend::default());
+            let res = comp
+                .load_str(&block)
+                .and_then(|comp| env.run_compiler(comp));
+            let failure_report = match res {
+                Ok(_) => comp
+                    .take_diagnostics()
+                    .into_iter()
+                    .next()
+                    .map(|diag| diag.report()),
+                Err(e) => Some(e.report()),
+            };
+            if let Some(report) = failure_report {
+                if !should_fail {
+                    panic!("\nBlock failed:\n{block}\n{report}")
+                }
+            } else if should_fail {
+                panic!("\nBlock should have failed:\n{block}")
+            }
+        }
+    }
 }

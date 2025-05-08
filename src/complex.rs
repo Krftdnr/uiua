@@ -1,10 +1,14 @@
+//! The [`Complex`] type
+
 use std::{f64::consts::E, fmt, ops::*};
 
+use bytemuck::{Pod, Zeroable};
 use serde::*;
 
 /// Uiua's complex number type
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialOrd, Default, Serialize, Deserialize, Pod, Zeroable)]
 #[serde(from = "(f64, f64)", into = "(f64, f64)")]
+#[repr(C)]
 pub struct Complex {
     /// The real part
     pub re: f64,
@@ -23,6 +27,14 @@ impl From<Complex> for (f64, f64) {
         (c.re, c.im)
     }
 }
+
+impl PartialEq for Complex {
+    fn eq(&self, other: &Self) -> bool {
+        self.re == other.re && self.im == other.im
+    }
+}
+
+impl Eq for Complex {}
 
 impl Complex {
     /// The complex number 0 + 0i
@@ -74,7 +86,8 @@ impl Complex {
     }
     /// Get the absolute value of a complex number
     pub fn abs(self) -> f64 {
-        self.re.hypot(self.im)
+        // Do not use `self.re.hypot(self.im)` because it is slower, especially on WASM
+        (self.re * self.re + self.im * self.im).sqrt()
     }
     /// Get the arctangent of a complex number
     pub fn atan2(self, x: impl Into<Self>) -> Complex {
@@ -107,12 +120,7 @@ impl Complex {
     pub fn powc(self, power: impl Into<Self>) -> Self {
         let power = power.into();
         if power.im == 0.0 {
-            if self.im == 0.0 {
-                return Self::new(self.re.powf(power.re), 0.0);
-            }
-            if power.re == 0.0 {
-                return Self::ONE;
-            }
+            return self.powf(power.re);
         }
         let (r, theta) = self.to_polar();
         ((r.ln() + Self::I * theta) * power).exp()
@@ -122,8 +130,8 @@ impl Complex {
         if power == 0.0 {
             return Self::ONE;
         }
-        if power.fract() == 0.0 {
-            return Self::new(self.re.powf(power), self.im.powf(power));
+        if power.fract() == 0.0 && self.im == 0.0 {
+            return self.re.powf(power).into();
         }
         let (r, theta) = self.to_polar();
         Self::from_polar(r.powf(power), theta * power)
@@ -144,6 +152,13 @@ impl Complex {
     }
     /// Calculate the square root of a complex number
     pub fn sqrt(self) -> Self {
+        if self.im == 0.0 {
+            return if self.re >= 0.0 {
+                Self::new(self.re.sqrt(), 0.0)
+            } else {
+                Self::new(0.0, self.re.abs().sqrt())
+            };
+        }
         let (r, theta) = self.to_polar();
         Self::from_polar(r.sqrt(), theta / 2.0)
     }
@@ -168,6 +183,18 @@ impl Complex {
     /// Calculate the arc cosine of a complex number
     pub fn acos(self) -> Self {
         -Self::I * (Self::I * (Self::ONE - self * self).sqrt() + self).ln()
+    }
+    /// Check if either real or imaginary part is NaN
+    pub fn is_nan(&self) -> bool {
+        self.re.is_nan() || self.im.is_nan()
+    }
+    /// Get the complex number as a real number
+    pub fn into_real(self) -> Option<f64> {
+        if self.im.abs() < f64::EPSILON {
+            Some(self.re)
+        } else {
+            None
+        }
     }
 }
 
@@ -318,10 +345,7 @@ impl Div<Complex> for f64 {
 impl Rem for Complex {
     type Output = Self;
     fn rem(self, rhs: Self) -> Self::Output {
-        Self {
-            re: self.re.rem_euclid(rhs.re),
-            im: self.im.rem_euclid(rhs.im),
-        }
+        self - (self / rhs).floor() * rhs
     }
 }
 
@@ -352,5 +376,41 @@ impl Neg for Complex {
             re: -self.re,
             im: -self.im,
         }
+    }
+}
+
+impl<T> AddAssign<T> for Complex
+where
+    Complex: Add<T, Output = Complex>,
+{
+    fn add_assign(&mut self, rhs: T) {
+        *self = *self + rhs;
+    }
+}
+
+impl<T> SubAssign<T> for Complex
+where
+    Complex: Sub<T, Output = Complex>,
+{
+    fn sub_assign(&mut self, rhs: T) {
+        *self = *self - rhs;
+    }
+}
+
+impl<T> MulAssign<T> for Complex
+where
+    Complex: Mul<T, Output = Complex>,
+{
+    fn mul_assign(&mut self, rhs: T) {
+        *self = *self * rhs;
+    }
+}
+
+impl<T> DivAssign<T> for Complex
+where
+    Complex: Div<T, Output = Complex>,
+{
+    fn div_assign(&mut self, rhs: T) {
+        *self = *self / rhs;
     }
 }

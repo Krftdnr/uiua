@@ -2,20 +2,28 @@
 .idea
 /target
 /docs
+/site/blog/*.html
 site/dist
 /uiua-modules
 
 *.wav
 *.png
+*.jpg
 *.txt
-!*/uiua-logo.png
+*.db
+!*/assets/*
+!src/primitive/assets/*
 
 *.ua
 *.uasm
 *.dll
 profile.yaml
 uiua.tmLanguage.json
-!/tests/*
+!/tests*/*
+!/examples/*
+!/site/*.ua
+!/site/text/*.ua
 
 # symlink created by `nix build`
 result
+.direnv

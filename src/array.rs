@@ -1,19 +1,28 @@
 use std::{
+    any::TypeId,
     cmp::Ordering,
+    f64::consts::{PI, TAU},
     fmt,
     hash::{Hash, Hasher},
+    ops::{Deref, DerefMut},
     sync::Arc,
 };
 
 use bitflags::bitflags;
+use bytemuck::must_cast;
 use ecow::{EcoString, EcoVec};
+use rayon::prelude::*;
 use serde::{de::DeserializeOwned, *};
 
 use crate::{
-    algorithm::map::{MapKeys, EMPTY_NAN, TOMBSTONE_NAN},
+    algorithm::{
+        map::{MapKeys, EMPTY_NAN, TOMBSTONE_NAN},
+        ArrayCmpSlice,
+    },
     cowslice::{cowslice, CowSlice},
-    grid_fmt::GridFmt,
-    Boxed, Complex, HandleKind, Shape, Uiua, Value,
+    fill::{Fill, FillValue},
+    grid_fmt::{ElemAlign, GridFmt},
+    Boxed, Complex, ExactDoubleIterator, HandleKind, Shape, Value,
 };
 
 /// Uiua's array type
@@ -28,14 +37,18 @@ use crate::{
 )]
 #[repr(C)]
 pub struct Array<T> {
-    pub(crate) shape: Shape,
+    /// The array's shape
+    pub shape: Shape,
     pub(crate) data: CowSlice<T>,
-    pub(crate) meta: Option<Arc<ArrayMeta>>,
+    /// The array's metadata
+    pub meta: ArrayMeta,
 }
 
 /// Non-shape metadata for an array
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ArrayMeta {
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(C)]
+#[non_exhaustive]
+pub struct ArrayMetaInner {
     /// The label
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<EcoString>,
@@ -47,20 +60,234 @@ pub struct ArrayMeta {
     pub map_keys: Option<MapKeys>,
     /// The pointer value for FFI
     #[serde(skip)]
-    pub pointer: Option<usize>,
+    pub pointer: Option<MetaPtr>,
     /// The kind of system handle
     #[serde(skip)]
     pub handle_kind: Option<HandleKind>,
 }
 
+/// Default metadata for an array
+static DEFAULT_META_INNER: ArrayMetaInner = ArrayMetaInner {
+    label: None,
+    flags: ArrayFlags::NONE,
+    map_keys: None,
+    pointer: None,
+    handle_kind: None,
+};
+
+/// Non-shape metadata for an array
+///
+/// This wraps an optional pointer to a [`ArrayMetaInner`], whose fields can be accessed via `Deref` and `DerefMut`.
+///
+/// Mutably accessing the fields via the `DerefMut` implementation will populate the metadata.
+/// To avoid this, use [`ArrayMeta::get_mut`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+#[repr(C)]
+pub struct ArrayMeta(Option<Arc<ArrayMetaInner>>);
+
+impl Deref for ArrayMeta {
+    type Target = ArrayMetaInner;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_deref().unwrap_or(&DEFAULT_META_INNER)
+    }
+}
+
+impl DerefMut for ArrayMeta {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(self.0.get_or_insert_with(Default::default))
+    }
+}
+
+impl ArrayMeta {
+    fn get_inner_mut(&mut self) -> Option<&mut ArrayMetaInner> {
+        self.0.as_mut().map(Arc::make_mut)
+    }
+    /// Get a mutable reference to the metadata, but only if any exists
+    pub fn get_mut(&mut self) -> Option<&mut Self> {
+        self.0.is_some().then_some(self)
+    }
+    /// Get a mutable reference to the map keys, if any exist
+    pub fn map_keys_mut(&mut self) -> Option<&mut MapKeys> {
+        self.get_inner_mut()?.map_keys.as_mut()
+    }
+    /// Check if the metadata is the default
+    pub fn is_default(&self) -> bool {
+        self.label.is_none()
+            && self.map_keys.is_none()
+            && self.handle_kind.is_none()
+            && self.pointer.is_none()
+            && self.flags.is_empty()
+    }
+    /// Check if the array is sorted ascending
+    pub fn is_sorted_up(&self) -> bool {
+        self.flags.contains(ArrayFlags::SORTED_UP)
+    }
+    /// Check if the array is sorted descending
+    pub fn is_sorted_down(&self) -> bool {
+        self.flags.contains(ArrayFlags::SORTED_DOWN)
+    }
+    /// Take the persistent metadata
+    pub fn take_per_meta(&mut self) -> PersistentMeta {
+        self.get_inner_mut()
+            .map(|inner| {
+                let label = inner.label.take();
+                let map_keys = inner.map_keys.take();
+                PersistentMeta { label, map_keys }
+            })
+            .unwrap_or_default()
+    }
+    /// Take the label from the metadata
+    pub fn take_label(&mut self) -> Option<EcoString> {
+        let inner = self.get_inner_mut()?;
+        if inner.label.is_some() {
+            inner.label.take()
+        } else {
+            None
+        }
+    }
+    /// Take the map keys from the metadata
+    pub fn take_map_keys(&mut self) -> Option<MapKeys> {
+        self.get_inner_mut()?.map_keys.take()
+    }
+    /// Take the sorted flags
+    pub fn take_sorted_flags(&mut self) -> ArrayFlags {
+        let flags = self.flags & ArrayFlags::SORTEDNESS;
+        self.flags &= !flags;
+        flags
+    }
+    /// Take the value flags
+    pub fn take_value_flags(&mut self) -> ArrayFlags {
+        let flags = self.flags & ArrayFlags::VALUE;
+        self.flags &= !flags;
+        flags
+    }
+    /// Set the label for the value
+    pub fn set_label(&mut self, label: Option<EcoString>) {
+        if label.is_none() && self.label.is_none() {
+            return;
+        }
+        self.label = label;
+    }
+    /// Set the persistent metadata
+    pub fn set_per_meta(&mut self, per_meta: PersistentMeta) {
+        if self.map_keys.is_some() != per_meta.map_keys.is_some() {
+            self.map_keys = per_meta.map_keys;
+        }
+        if self.label.is_some() != per_meta.label.is_some() {
+            self.label = per_meta.label;
+        }
+    }
+    /// Or the sorted flags
+    pub fn or_sorted_flags(&mut self, mut flags: ArrayFlags) {
+        flags &= ArrayFlags::SORTEDNESS;
+        if flags == ArrayFlags::NONE {
+            return;
+        }
+        self.flags |= flags;
+    }
+    /// Or with reversed sorted flags
+    pub fn or_sorted_flags_rev(&mut self, mut flags: ArrayFlags) {
+        flags &= ArrayFlags::SORTEDNESS;
+        if flags == ArrayFlags::NONE {
+            return;
+        }
+        flags.reverse_sorted();
+        self.flags |= flags;
+    }
+    /// Mark the array as sorted ascending
+    ///
+    /// It is a logic error to set this to `true` when it is not the case
+    pub(crate) fn mark_sorted_up(&mut self, sorted: bool) {
+        if sorted {
+            self.flags.insert(ArrayFlags::SORTED_UP);
+        } else if let Some(inner) = self.get_inner_mut() {
+            inner.flags.remove(ArrayFlags::SORTED_UP);
+        }
+    }
+    /// Mark the array as sorted descending
+    ///
+    /// It is a logic error to set this to `true` when it is not the case
+    pub(crate) fn mark_sorted_down(&mut self, sorted: bool) {
+        if sorted {
+            self.flags.insert(ArrayFlags::SORTED_DOWN);
+        } else if let Some(inner) = self.get_inner_mut() {
+            inner.flags.remove(ArrayFlags::SORTED_DOWN);
+        }
+    }
+    /// Combine the metadata with another
+    pub fn combine(&mut self, other: &Self) {
+        if let Some(other) = other.0.as_deref() {
+            self.flags &= other.flags;
+            self.map_keys = None;
+            if self.handle_kind != other.handle_kind {
+                self.handle_kind = None;
+            }
+        }
+    }
+    /// Reset the flags
+    pub fn reset_flags(&mut self) {
+        self.flags.reset();
+    }
+}
+
+/// Array pointer metadata
+#[derive(Debug, Clone, Copy)]
+pub struct MetaPtr {
+    /// The pointer value
+    pub ptr: usize,
+    /// Whether the pointer should prevent the array's value from being shown
+    pub raw: bool,
+}
+
+impl MetaPtr {
+    /// Get a null metadata pointer
+    pub const fn null() -> Self {
+        Self { ptr: 0, raw: true }
+    }
+    /// Create a new metadata pointer
+    pub fn new<T: ?Sized>(ptr: *const T, raw: bool) -> Self {
+        Self {
+            ptr: ptr as *const () as usize,
+            raw,
+        }
+    }
+    /// Get the pointer as a raw pointer
+    pub fn get<T>(&self) -> *const T {
+        self.ptr as *const T
+    }
+    /// Get the pointer as a raw pointer
+    pub fn get_mut<T>(&self) -> *mut T {
+        self.ptr as *mut T
+    }
+}
+
+impl PartialEq for MetaPtr {
+    fn eq(&self, other: &Self) -> bool {
+        self.ptr == other.ptr
+    }
+}
+
+impl Eq for MetaPtr {}
+
 bitflags! {
     /// Flags for an array
-    #[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
     pub struct ArrayFlags: u8 {
         /// No flags
         const NONE = 0;
         /// The array is boolean
         const BOOLEAN = 1;
+        /// The array was *created from* a boolean
+        const BOOLEAN_LITERAL = 2;
+        /// The array is sorted ascending
+        const SORTED_UP = 4;
+        /// The array is sorted descending
+        const SORTED_DOWN = 8;
+        /// Value-related flags that are true about the rows as well
+        const VALUE = Self::BOOLEAN.bits() | Self::BOOLEAN_LITERAL.bits();
+        /// Sortedness-related flags
+        const SORTEDNESS = Self::SORTED_UP.bits() | Self::SORTED_DOWN.bits();
     }
 }
 
@@ -73,22 +300,20 @@ impl ArrayFlags {
     pub fn reset(&mut self) {
         *self = Self::NONE;
     }
+    /// Reverse the sorted flags
+    pub fn reverse_sorted(&mut self) {
+        let sorted_up = self.contains(Self::SORTED_UP);
+        let sorted_down = self.contains(Self::SORTED_DOWN);
+        self.set(Self::SORTED_UP, sorted_down);
+        self.set(Self::SORTED_DOWN, sorted_up);
+    }
 }
-
-/// Default metadata for an array
-pub static DEFAULT_META: ArrayMeta = ArrayMeta {
-    label: None,
-    flags: ArrayFlags::NONE,
-    map_keys: None,
-    pointer: None,
-    handle_kind: None,
-};
 
 /// Array metadata that can be persisted across operations
 #[derive(Clone, Default)]
 pub struct PersistentMeta {
-    label: Option<EcoString>,
-    map_keys: Option<MapKeys>,
+    pub(crate) label: Option<EcoString>,
+    pub(crate) map_keys: Option<MapKeys>,
 }
 
 impl PersistentMeta {
@@ -132,7 +357,7 @@ impl<T: ArrayValue> Default for Array<T> {
         Self {
             shape: 0.into(),
             data: CowSlice::new(),
-            meta: None,
+            meta: ArrayMeta::default(),
         }
     }
 }
@@ -160,7 +385,7 @@ where
                     if i > 0 {
                         write!(f, "{}", T::format_sep())?;
                     }
-                    write!(f, "{}", x)?;
+                    write!(f, "{x}")?;
                 }
                 write!(f, "{}", end)
             }
@@ -173,16 +398,28 @@ where
 
 #[track_caller]
 #[inline(always)]
-fn validate_shape<T>(shape: &[usize], data: &[T]) {
-    debug_assert_eq!(
-        shape.iter().product::<usize>(),
-        data.len(),
-        "shape {shape:?} does not match data length {}",
-        data.len()
-    );
+pub(crate) fn validate_shape(_shape: &[usize], _len: usize) {
+    #[cfg(debug_assertions)]
+    {
+        let elems = if _shape.contains(&0) {
+            0
+        } else {
+            _shape.iter().product()
+        };
+        assert_eq!(
+            elems, _len,
+            "shape {_shape:?} does not match data length {_len}"
+        )
+    }
 }
 
 impl<T> Array<T> {
+    /// An empty list
+    pub const EMPTY_LIST: Self = Array {
+        shape: Shape::EMPTY_LIST,
+        data: CowSlice::new(),
+        meta: ArrayMeta(None),
+    };
     #[track_caller]
     /// Create an array from a shape and data
     ///
@@ -191,110 +428,43 @@ impl<T> Array<T> {
     pub fn new(shape: impl Into<Shape>, data: impl Into<CowSlice<T>>) -> Self {
         let shape = shape.into();
         let data = data.into();
-        validate_shape(&shape, &data);
+        validate_shape(&shape, data.len());
         Self {
             shape,
             data,
-            meta: None,
+            meta: ArrayMeta::default(),
         }
     }
-    #[track_caller]
-    #[inline(always)]
-    /// Debug-only function to validate that the shape matches the data length
-    pub(crate) fn validate_shape(&self) {
-        validate_shape(&self.shape, &self.data);
-    }
     /// Get the number of rows in the array
+    #[inline(always)]
     pub fn row_count(&self) -> usize {
-        self.shape.first().copied().unwrap_or(1)
+        self.shape.row_count()
     }
     /// Get the number of elements in the array
     pub fn element_count(&self) -> usize {
         self.data.len()
     }
     /// Get the number of elements in a row
+    #[inline(always)]
     pub fn row_len(&self) -> usize {
-        self.shape.iter().skip(1).product()
+        self.shape.row_len()
     }
     /// Get the rank of the array
+    #[inline(always)]
     pub fn rank(&self) -> usize {
         self.shape.len()
     }
-    /// Get the shape of the array
-    pub fn shape(&self) -> &Shape {
-        &self.shape
-    }
-    /// Get a mutable reference to the shape of the array
-    pub fn shape_mut(&mut self) -> &mut Shape {
-        &mut self.shape
-    }
-    /// Get the metadata of the array
-    pub fn meta(&self) -> &ArrayMeta {
-        self.meta.as_deref().unwrap_or(&DEFAULT_META)
-    }
-    pub(crate) fn meta_mut_impl(meta: &mut Option<Arc<ArrayMeta>>) -> &mut ArrayMeta {
-        let meta = meta.get_or_insert_with(Default::default);
-        Arc::make_mut(meta)
-    }
-    /// Get a mutable reference to the metadata of the array if it exists
-    pub fn get_meta_mut(&mut self) -> Option<&mut ArrayMeta> {
-        self.meta.as_mut().map(Arc::make_mut)
-    }
-    /// Get a mutable reference to the metadata of the array
-    pub fn meta_mut(&mut self) -> &mut ArrayMeta {
-        Self::meta_mut_impl(&mut self.meta)
-    }
-    /// Take the label from the metadata
-    pub fn take_label(&mut self) -> Option<EcoString> {
-        self.get_meta_mut().and_then(|meta| meta.label.take())
-    }
-    /// Take the map keys from the metadata
-    pub fn take_map_keys(&mut self) -> Option<MapKeys> {
-        self.get_meta_mut().and_then(|meta| meta.map_keys.take())
-    }
-    /// The the persistent metadata of the array
-    pub fn take_per_meta(&mut self) -> PersistentMeta {
-        if let Some(meta) = self.get_meta_mut() {
-            let label = meta.label.take();
-            let map_keys = meta.map_keys.take();
-            PersistentMeta { label, map_keys }
-        } else {
-            PersistentMeta::default()
-        }
-    }
-    /// Set the map keys in the metadata
-    pub fn set_per_meta(&mut self, per_meta: PersistentMeta) {
-        if let Some(keys) = per_meta.map_keys {
-            self.meta_mut().map_keys = Some(keys);
-        } else if let Some(meta) = self.get_meta_mut() {
-            meta.map_keys = None;
-        }
-        if let Some(label) = per_meta.label {
-            self.meta_mut().label = Some(label);
-        } else if let Some(meta) = self.get_meta_mut() {
-            meta.label = None;
-        }
-    }
-    /// Get a reference to the map keys
-    pub fn map_keys(&self) -> Option<&MapKeys> {
-        self.meta().map_keys.as_ref()
-    }
-    /// Get a mutable reference to the map keys
-    pub fn map_keys_mut(&mut self) -> Option<&mut MapKeys> {
-        self.get_meta_mut().and_then(|meta| meta.map_keys.as_mut())
-    }
-    /// Reset all metadata
-    pub fn reset_meta(&mut self) {
-        self.meta = None;
-    }
-    /// Reset all metadata flags
-    pub fn reset_meta_flags(&mut self) {
-        if self.meta.is_some() {
-            self.meta_mut().flags.reset();
-        }
+    /// Iterate over the elements of the array
+    pub fn elements(&self) -> impl ExactDoubleIterator<Item = &T> {
+        self.data.iter()
     }
     /// Get an iterator over the row slices of the array
-    pub fn row_slices(&self) -> impl ExactSizeIterator<Item = &[T]> + DoubleEndedIterator + Clone {
+    pub fn row_slices(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &[T]> + DoubleEndedIterator + Clone + Send + Sync
+    where
+        T: Send + Sync,
+    {
         (0..self.row_count()).map(move |row| self.row_slice(row))
     }
     /// Get a slice of a row
@@ -303,22 +473,38 @@ impl<T> Array<T> {
         let row_len = self.row_len();
         &self.data[row * row_len..(row + 1) * row_len]
     }
-    /// Combine the metadata of two arrays
-    pub fn combine_meta(&mut self, other: &ArrayMeta) {
-        if let Some(meta) = self.get_meta_mut() {
-            meta.flags &= other.flags;
-            meta.map_keys = None;
-            if meta.handle_kind != other.handle_kind {
-                meta.handle_kind = None;
-            }
+}
+
+impl<T: Clone> Array<T> {
+    /// Get a row array
+    #[track_caller]
+    pub fn row(&self, row: usize) -> Self {
+        if self.rank() == 0 {
+            let mut row = self.clone();
+            row.meta.take_map_keys();
+            row.meta.take_label();
+            return row;
         }
+        let row_count = self.row_count();
+        if row >= row_count {
+            panic!("row index out of bounds: {} >= {}", row, row_count);
+        }
+        let row_len = self.row_len();
+        let start = row * row_len;
+        let end = start + row_len;
+        let mut row = Self::new(&self.shape[1..], self.data.slice(start..end));
+        let value_flags = self.meta.flags & ArrayFlags::VALUE;
+        if value_flags != ArrayFlags::NONE {
+            row.meta.flags = value_flags;
+        }
+        row
     }
 }
 
 impl<T: ArrayValue> Array<T> {
     /// Create a scalar array
     pub fn scalar(data: T) -> Self {
-        Self::new(Shape::scalar(), cowslice![data])
+        Self::new(Shape::SCALAR, cowslice![data])
     }
     /// Attempt to convert the array into a scalar
     pub fn into_scalar(self) -> Result<T, Self> {
@@ -345,11 +531,28 @@ impl<T: ArrayValue> Array<T> {
         }
     }
     /// Get an iterator over the row arrays of the array
-    pub fn rows(&self) -> impl ExactSizeIterator<Item = Self> + DoubleEndedIterator + '_ {
-        (0..self.row_count()).map(|row| self.row(row))
+    pub fn rows(&self) -> impl ExactDoubleIterator<Item = Self> + '_ {
+        let value_flags = self.meta.flags & ArrayFlags::VALUE;
+        let set_value_flags = value_flags != ArrayFlags::NONE;
+        let row_len = self.row_len();
+        (0..self.row_count()).map(move |row| {
+            if self.rank() == 0 {
+                let mut row = self.clone();
+                row.meta.take_map_keys();
+                row.meta.take_label();
+                return row;
+            }
+            let start = row * row_len;
+            let end = start + row_len;
+            let mut row = Array::<T>::new(&self.shape[1..], self.data.slice(start..end));
+            if set_value_flags {
+                row.meta.flags = value_flags;
+            }
+            row
+        })
     }
     pub(crate) fn row_shaped_slice(&self, index: usize, row_shape: Shape) -> Self {
-        let row_len: usize = row_shape.iter().product();
+        let row_len = row_shape.elements();
         let start = index * row_len;
         let end = start + row_len;
         Self::new(row_shape, self.data.slice(start..end))
@@ -358,8 +561,8 @@ impl<T: ArrayValue> Array<T> {
     pub fn row_shaped_slices(
         &self,
         row_shape: Shape,
-    ) -> impl ExactSizeIterator<Item = Self> + DoubleEndedIterator + '_ {
-        let row_len: usize = row_shape.iter().product();
+    ) -> impl ExactDoubleIterator<Item = Self> + '_ {
+        let row_len = row_shape.elements();
         let row_count = self.element_count() / row_len;
         (0..row_count).map(move |i| {
             let start = i * row_len;
@@ -369,7 +572,7 @@ impl<T: ArrayValue> Array<T> {
     }
     /// Get an iterator over the row arrays of the array that have the given shape
     pub fn into_row_shaped_slices(self, row_shape: Shape) -> impl DoubleEndedIterator<Item = Self> {
-        let row_len: usize = row_shape.iter().product();
+        let row_len = row_shape.elements();
         let zero_count = if row_len == 0 { self.row_count() } else { 0 };
         let row_sh = row_shape.clone();
         let nonzero = self
@@ -379,30 +582,12 @@ impl<T: ArrayValue> Array<T> {
         let zero = (0..zero_count).map(move |_| Self::new(row_shape.clone(), CowSlice::new()));
         nonzero.chain(zero)
     }
-    /// Get a row array
-    #[track_caller]
-    pub fn row(&self, row: usize) -> Self {
-        if self.rank() == 0 {
-            let mut row = self.clone();
-            row.take_map_keys();
-            row.take_label();
-            return row;
-        }
-        let row_count = self.row_count();
-        if row >= row_count {
-            panic!("row index out of bounds: {} >= {}", row, row_count);
-        }
-        let row_len = self.row_len();
-        let start = row * row_len;
-        let end = start + row_len;
-        Self::new(&self.shape[1..], self.data.slice(start..end))
-    }
     #[track_caller]
     pub(crate) fn depth_row(&self, depth: usize, row: usize) -> Self {
         if self.rank() <= depth {
             let mut row = self.clone();
-            row.take_map_keys();
-            row.take_label();
+            row.meta.take_map_keys();
+            row.meta.take_label();
             return row;
         }
         let row_count: usize = self.shape[..depth + 1].iter().product();
@@ -414,8 +599,37 @@ impl<T: ArrayValue> Array<T> {
         let end = start + row_len;
         Self::new(&self.shape[depth + 1..], self.data.slice(start..end))
     }
+    #[track_caller]
+    pub(crate) fn depth_rows(&self, depth: usize) -> impl ExactDoubleIterator<Item = Self> + '_ {
+        let row_count: usize = self.shape[..depth].iter().product();
+        let row_len: usize = self.shape[depth..].iter().product();
+        (0..row_count).map(move |row| {
+            let start = row * row_len;
+            let end = start + row_len;
+            Self::new(&self.shape[depth..], self.data.slice(start..end))
+        })
+    }
+    #[track_caller]
+    /// Create an array that is a slice of this array's rows
+    ///
+    /// Generally doesn't allocate
+    ///
+    /// - `start` must be <= `end`
+    /// - `start` must be < `self.row_count()`
+    /// - `end` must be <= `self.row_count()`
+    pub fn slice_rows(&self, start: usize, end: usize) -> Self {
+        assert!(start <= end);
+        assert!(start < self.row_count());
+        assert!(end <= self.row_count());
+        let row_len = self.row_len();
+        let mut shape = self.shape.clone();
+        shape[0] = end - start;
+        let start = start * row_len;
+        let end = end * row_len;
+        Self::new(shape, self.data.slice(start..end))
+    }
     /// Consume the array and get an iterator over its rows
-    pub fn into_rows(self) -> impl ExactSizeIterator<Item = Self> + DoubleEndedIterator {
+    pub fn into_rows(self) -> impl ExactDoubleIterator<Item = Self> {
         (0..self.row_count()).map(move |i| self.row(i))
     }
     pub(crate) fn first_dim_zero(&self) -> Self {
@@ -439,7 +653,7 @@ impl<T: ArrayValue> Array<T> {
         let data = self.data.split_off(self.data.len() - self.row_len());
         self.shape[0] -= 1;
         let shape: Shape = self.shape[1..].into();
-        self.validate_shape();
+        self.validate();
         Some(Self::new(shape, data))
     }
     /// Get a mutable slice of a row
@@ -448,36 +662,82 @@ impl<T: ArrayValue> Array<T> {
         let row_len = self.row_len();
         &mut self.data.as_mut_slice()[row * row_len..(row + 1) * row_len]
     }
-    /// Add a 1-length dimension to the front of the array's shape
-    pub fn fix(&mut self) {
-        self.fix_depth(0);
+    /// Set the sortedness flags according to the array's data
+    pub fn derive_sortedness(&mut self) {
+        let mut sorted_up = true;
+        let mut sorted_down = true;
+        let mut rows = self.row_slices().map(ArrayCmpSlice);
+        if let Some(mut prev) = rows.next() {
+            for row in rows {
+                match prev.cmp(&row) {
+                    Ordering::Equal => {}
+                    Ordering::Less => {
+                        sorted_down = false;
+                        if !sorted_up {
+                            break;
+                        }
+                    }
+                    Ordering::Greater => {
+                        sorted_up = false;
+                        if !sorted_down {
+                            break;
+                        }
+                    }
+                }
+                prev = row;
+            }
+        } else {
+            drop(rows);
+        }
+        self.meta.mark_sorted_up(sorted_up);
+        self.meta.mark_sorted_down(sorted_down);
     }
-    pub(crate) fn fix_depth(&mut self, depth: usize) {
-        let depth = depth.min(self.rank());
-        self.shape.insert(depth, 1);
-        if depth == 0 {
-            if let Some(keys) = self.map_keys_mut() {
-                keys.fix();
+    #[track_caller]
+    #[inline(always)]
+    /// Debug-only to ensure the array's invariants are upheld
+    pub(crate) fn validate(&self) {
+        #[cfg(debug_assertions)]
+        {
+            validate_shape(&self.shape, self.data.len());
+            let is_sorted_up = self.meta.is_sorted_up();
+            let is_sorted_down = self.meta.is_sorted_down();
+            if is_sorted_up || is_sorted_down {
+                let mut rows = (0..self.row_count()).map(|i| self.row_slice(i));
+                if let Some(prev) = rows.next() {
+                    let mut prev = ArrayCmpSlice(prev);
+                    for row in rows {
+                        let row = ArrayCmpSlice(row);
+                        assert!(
+                            !is_sorted_up || prev <= row,
+                            "{} array marked as sorted up is not.",
+                            T::NAME
+                        );
+                        assert!(
+                            !is_sorted_down || prev >= row,
+                            "{} array marked as sorted down is not.",
+                            T::NAME
+                        );
+                        prev = row;
+                    }
+                }
             }
         }
-    }
-    /// Remove a 1-length dimension from the front of the array's shape
-    pub fn unfix(&mut self) -> bool {
-        if let Some(keys) = self.map_keys_mut() {
-            keys.unfix();
-        }
-        self.shape.unfix()
     }
 }
 
 impl<T: Clone> Array<T> {
     /// Convert the elements of the array
+    #[inline(always)]
     pub fn convert<U>(self) -> Array<U>
     where
-        T: Into<U>,
-        U: Clone,
+        T: Into<U> + 'static,
+        U: Clone + 'static,
     {
-        self.convert_with(Into::into)
+        if TypeId::of::<T>() == TypeId::of::<U>() {
+            unsafe { std::mem::transmute::<Array<T>, Array<U>>(self) }
+        } else {
+            self.convert_with(Into::into)
+        }
     }
     /// Convert the elements of the array with a function
     pub fn convert_with<U: Clone>(self, f: impl FnMut(T) -> U) -> Array<U> {
@@ -516,6 +776,14 @@ impl<T: Clone> Array<T> {
     }
 }
 
+impl Array<u8> {
+    pub(crate) fn json_bool(b: bool) -> Self {
+        let mut arr = Self::from(b);
+        arr.meta.flags |= ArrayFlags::BOOLEAN_LITERAL;
+        arr
+    }
+}
+
 impl Array<Boxed> {
     /// Attempt to unbox a scalar box array
     pub fn into_unboxed(self) -> Result<Value, Self> {
@@ -536,10 +804,10 @@ impl Array<Boxed> {
 
 impl<T: ArrayValue + ArrayCmp<U>, U: ArrayValue> PartialEq<Array<U>> for Array<T> {
     fn eq(&self, other: &Array<U>) -> bool {
-        if self.shape() != other.shape() {
+        if self.shape != other.shape {
             return false;
         }
-        if self.map_keys() != other.map_keys() {
+        if self.meta.map_keys != other.meta.map_keys {
             return false;
         }
         self.data
@@ -576,16 +844,16 @@ impl<T: ArrayValue> Ord for Array<T> {
 
 impl<T: ArrayValue> Hash for Array<T> {
     fn hash<H: Hasher>(&self, hasher: &mut H) {
-        if let Some(keys) = self.map_keys() {
+        if let Some(keys) = &self.meta.map_keys {
             keys.hash(hasher);
         }
+        T::TYPE_ID.hash(hasher);
         if let Some(scalar) = self.as_scalar() {
             if let Some(value) = scalar.nested_value() {
                 value.hash(hasher);
                 return;
             }
         }
-        T::TYPE_ID.hash(hasher);
         self.shape.hash(hasher);
         self.data.iter().for_each(|x| x.array_hash(hasher));
     }
@@ -623,7 +891,13 @@ impl<T: ArrayValue> FromIterator<T> for Array<T> {
 
 impl From<String> for Array<char> {
     fn from(s: String) -> Self {
-        Self::new(s.len(), s.chars().collect::<CowSlice<_>>())
+        s.chars().collect()
+    }
+}
+
+impl From<&str> for Array<char> {
+    fn from(s: &str) -> Self {
+        s.chars().collect()
     }
 }
 
@@ -638,7 +912,9 @@ impl From<Vec<bool>> for Array<u8> {
 
 impl From<bool> for Array<u8> {
     fn from(data: bool) -> Self {
-        Self::new(Shape::scalar(), cowslice![u8::from(data)])
+        let mut arr = Self::new(Shape::SCALAR, cowslice![u8::from(data)]);
+        arr.meta.flags |= ArrayFlags::BOOLEAN;
+        arr
     }
 }
 
@@ -662,10 +938,21 @@ impl FromIterator<String> for Array<Boxed> {
     }
 }
 
+impl<'a> FromIterator<&'a str> for Array<Boxed> {
+    fn from_iter<I: IntoIterator<Item = &'a str>>(iter: I) -> Self {
+        Array::from(
+            iter.into_iter()
+                .map(Value::from)
+                .map(Boxed)
+                .collect::<CowSlice<_>>(),
+        )
+    }
+}
+
 /// A trait for types that can be used as array elements
 #[allow(unused_variables)]
 pub trait ArrayValue:
-    Clone + fmt::Debug + fmt::Display + GridFmt + ArrayCmp + Send + Sync + 'static
+    Default + Clone + fmt::Debug + fmt::Display + GridFmt + ArrayCmp + Send + Sync + 'static
 {
     /// The type name
     const NAME: &'static str;
@@ -673,8 +960,10 @@ pub trait ArrayValue:
     const SYMBOL: char;
     /// An ID for the type
     const TYPE_ID: u8;
-    /// Get the fill value from the environment
-    fn get_fill(env: &Uiua) -> Result<Self, &'static str>;
+    /// Get the scalar fill value from the environment
+    fn get_scalar_fill(fill: &Fill) -> Result<FillValue<Self>, &'static str>;
+    /// Get the array fill value from the environment
+    fn get_array_fill(fill: &Fill) -> Result<FillValue<Array<Self>>, &'static str>;
     /// Hash the value
     fn array_hash<H: Hasher>(&self, hasher: &mut H);
     /// Get the proxy value
@@ -692,38 +981,91 @@ pub trait ArrayValue:
         " "
     }
     /// Delimiters for grid formatting
-    fn grid_fmt_delims(boxed: bool) -> (char, char) {
-        if boxed {
-            ('⟦', '⟧')
-        } else {
-            ('[', ']')
-        }
+    fn grid_fmt_delims() -> (char, char) {
+        ('[', ']')
     }
     /// Whether to compress all items of a list when grid formatting
     fn compress_list_grid() -> bool {
+        false
+    }
+    /// Whether to divide cells with box drawing lines when grid formatting
+    fn box_lines() -> bool {
         false
     }
     /// Get a nested value
     fn nested_value(&self) -> Option<&Value> {
         None
     }
+    /// Check if this element has the wildcard value
+    fn has_wildcard(&self) -> bool {
+        false
+    }
+    /// Summarize the elements of an array of this type
+    fn summarize(elems: &[Self]) -> String {
+        String::new()
+    }
+    /// The minimum number of elements that require a summary
+    fn summary_min_elems() -> usize {
+        3600
+    }
+    /// How to align elements when formatting
+    fn alignment() -> ElemAlign {
+        ElemAlign::Left
+    }
+    /// How to determine the maximum width of a formatted column
+    fn max_col_width<'a>(rows: impl Iterator<Item = &'a [char]> + Clone) -> usize {
+        rows.map(|row| row.len()).max().unwrap_or(0)
+    }
+    /// Sort a list of this type
+    fn sort_list(list: &mut [Self], up: bool) {
+        default_sort_list(list, up)
+    }
 }
 
+fn default_sort_list<T: ArrayCmp + Send>(list: &mut [T], up: bool) {
+    if up {
+        list.par_sort_unstable_by(T::array_cmp);
+    } else {
+        list.par_sort_unstable_by(|a, b| b.array_cmp(a));
+    }
+}
+
+// NOTE: must_cast to f64 only works if f64 and u64 have same endianness.
+//       This is true of all currently supported platforms for rust,
+//       but may not be true in general. Swap out for f64::from_bits when
+//       the MSRV passes 1.83 to ensure correctness on all future platforms.
 /// A NaN value that always compares as equal
-pub const WILDCARD_NAN: f64 =
-    unsafe { std::mem::transmute(0x7ff8_0000_0000_0000u64 | 0x0000_0000_0000_0003) };
+pub const WILDCARD_NAN: f64 = must_cast(0x7ff8_0000_0000_0000u64 | 0x0000_0000_0000_0003);
 /// A character value used as a wildcard that will equal any character
-pub const WILDCARD_CHAR: char = '\u{E000}';
+pub const WILDCARD_CHAR: char = '\u{100000}';
+
+/// Round to a number of significant decimal places
+fn round_sig_dec(f: f64, n: i32) -> f64 {
+    if f.fract() == 0.0 || f.is_infinite() || [PI / 2.0, PI, TAU].contains(&f) {
+        return f;
+    }
+    let mul = 10f64.powf(n as f64 - f.fract().abs().log10().ceil());
+    (f * mul).round() / mul
+}
 
 impl ArrayValue for f64 {
     const NAME: &'static str = "number";
     const SYMBOL: char = 'ℝ';
     const TYPE_ID: u8 = 0;
-    fn get_fill(env: &Uiua) -> Result<Self, &'static str> {
-        env.num_fill()
+    fn get_scalar_fill(fill: &Fill) -> Result<FillValue<Self>, &'static str> {
+        fill.num_scalar()
+    }
+    fn get_array_fill(fill: &Fill) -> Result<FillValue<Array<Self>>, &'static str> {
+        fill.num_array()
     }
     fn array_hash<H: Hasher>(&self, hasher: &mut H) {
-        let v = if self.is_nan() {
+        let v = if self.to_bits() == EMPTY_NAN.to_bits() {
+            EMPTY_NAN
+        } else if self.to_bits() == TOMBSTONE_NAN.to_bits() {
+            TOMBSTONE_NAN
+        } else if self.to_bits() == WILDCARD_NAN.to_bits() {
+            WILDCARD_NAN
+        } else if self.is_nan() {
             f64::NAN
         } else if *self == 0.0 && self.is_sign_negative() {
             0.0
@@ -735,14 +1077,103 @@ impl ArrayValue for f64 {
     fn proxy() -> Self {
         0.0
     }
+    fn has_wildcard(&self) -> bool {
+        self.to_bits() == WILDCARD_NAN.to_bits()
+    }
+    fn summarize(elems: &[Self]) -> String {
+        if elems.is_empty() {
+            return String::new();
+        }
+        if elems.iter().all(|&n| n.is_nan()) {
+            return "all NaN".into();
+        }
+        let mut min = f64::NAN;
+        let mut max = f64::NAN;
+        let mut nan_count = elems.iter().take_while(|n| n.is_nan()).count();
+        let mut mean = 0.0;
+        let mut i = 0;
+        let mut inf_balance = 0i64;
+        for &elem in &elems[nan_count..] {
+            if elem.is_nan() {
+                nan_count += 1;
+            } else if elem.is_infinite() {
+                inf_balance += elem.is_sign_positive() as i64;
+                min = min.min(elem);
+                max = max.max(elem);
+            } else {
+                min = min.min(elem);
+                max = max.max(elem);
+                mean += (elem - mean) / (i + 1) as f64;
+                i += 1;
+            }
+        }
+        if inf_balance != 0 {
+            mean = inf_balance.signum() as f64 * f64::INFINITY;
+        }
+        if min == max {
+            if nan_count == 0 {
+                format!("all {}", min.grid_string(false))
+            } else {
+                format!(
+                    "{} {}s and {} NaNs",
+                    elems.len() - nan_count,
+                    min.grid_string(false),
+                    nan_count
+                )
+            }
+        } else {
+            let mut s = format!(
+                "{}-{} μ{}",
+                round_sig_dec(min, 4).grid_string(false),
+                round_sig_dec(max, 4).grid_string(false),
+                round_sig_dec(mean, 4).grid_string(false)
+            );
+            if nan_count > 0 {
+                s.push_str(&format!(
+                    " ({nan_count} NaN{})",
+                    if nan_count > 1 { "s" } else { "" }
+                ));
+            }
+            s
+        }
+    }
+    fn alignment() -> ElemAlign {
+        ElemAlign::DelimOrRight(".")
+    }
+    fn max_col_width<'a>(rows: impl Iterator<Item = &'a [char]>) -> usize {
+        let mut max_whole_len = 0;
+        let mut max_dec_len: Option<usize> = None;
+        for row in rows {
+            if let Some(dot_pos) = row.iter().position(|&c| c == '.') {
+                max_whole_len = max_whole_len.max(dot_pos);
+                max_dec_len = max_dec_len.max(Some(row.len() - dot_pos - 1));
+            } else {
+                max_whole_len = max_whole_len.max(row.len());
+            }
+        }
+        if let Some(dec_len) = max_dec_len {
+            max_whole_len + dec_len + 1
+        } else {
+            max_whole_len
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn f64_summarize() {
+    assert_eq!(f64::summarize(&[2.0, 6.0, 1.0]), "1-6 μ3");
 }
 
 impl ArrayValue for u8 {
     const NAME: &'static str = "number";
     const SYMBOL: char = 'ℝ';
     const TYPE_ID: u8 = 0;
-    fn get_fill(env: &Uiua) -> Result<Self, &'static str> {
-        env.byte_fill()
+    fn get_scalar_fill(fill: &Fill) -> Result<FillValue<Self>, &'static str> {
+        fill.byte_scalar()
+    }
+    fn get_array_fill(fill: &Fill) -> Result<FillValue<Array<Self>>, &'static str> {
+        fill.byte_array()
     }
     fn array_hash<H: Hasher>(&self, hasher: &mut H) {
         (*self as f64).to_bits().hash(hasher)
@@ -750,14 +1181,70 @@ impl ArrayValue for u8 {
     fn proxy() -> Self {
         0
     }
+    fn summarize(elems: &[Self]) -> String {
+        if elems.is_empty() {
+            return String::new();
+        }
+        let mut min = u8::MAX;
+        let mut max = 0;
+        for &elem in elems {
+            min = min.min(elem);
+            max = max.max(elem);
+        }
+        let mut mean = elems[0] as f64;
+        for (i, &elem) in elems.iter().enumerate().skip(1) {
+            mean += (elem as f64 - mean) / (i + 1) as f64;
+        }
+        if min == max {
+            format!("all {}", min.grid_string(false))
+        } else {
+            format!(
+                "{}-{} μ{}",
+                min.grid_string(false),
+                max.grid_string(false),
+                round_sig_dec(mean, 4).grid_string(false)
+            )
+        }
+    }
+    fn alignment() -> ElemAlign {
+        ElemAlign::Right
+    }
+    fn sort_list(list: &mut [Self], up: bool) {
+        let mut counts: [usize; 256] = [0; 256];
+        for x in &mut *list {
+            counts[*x as usize] += 1;
+        }
+        let mut i = 0;
+        if up {
+            for (j, &count) in counts.iter().enumerate() {
+                let n = j as u8;
+                for _ in 0..count {
+                    list[i] = n;
+                    i += 1;
+                }
+            }
+        } else {
+            let offset = list.len().saturating_sub(1);
+            for (j, &count) in counts.iter().enumerate() {
+                let n = j as u8;
+                for _ in 0..count {
+                    list[offset - i] = n;
+                    i += 1;
+                }
+            }
+        }
+    }
 }
 
 impl ArrayValue for char {
     const NAME: &'static str = "character";
     const SYMBOL: char = '@';
-    const TYPE_ID: u8 = 2;
-    fn get_fill(env: &Uiua) -> Result<Self, &'static str> {
-        env.char_fill()
+    const TYPE_ID: u8 = 1;
+    fn get_scalar_fill(fill: &Fill) -> Result<FillValue<Self>, &'static str> {
+        fill.char_scalar()
+    }
+    fn get_array_fill(fill: &Fill) -> Result<FillValue<Array<Self>>, &'static str> {
+        fill.char_array()
     }
     fn format_delims() -> (&'static str, &'static str) {
         ("", "")
@@ -771,24 +1258,93 @@ impl ArrayValue for char {
     fn proxy() -> Self {
         ' '
     }
-    fn grid_fmt_delims(boxed: bool) -> (char, char) {
-        if boxed {
-            ('⌜', '⌟')
-        } else {
-            ('"', '"')
-        }
+    fn grid_fmt_delims() -> (char, char) {
+        ('"', '"')
     }
     fn compress_list_grid() -> bool {
         true
+    }
+    fn has_wildcard(&self) -> bool {
+        *self == WILDCARD_CHAR
+    }
+    fn summarize(elems: &[Self]) -> String {
+        if elems.is_empty() {
+            return String::new();
+        }
+        let mut parts = Vec::new();
+        let lowercase = elems.iter().any(|c| c.is_lowercase());
+        let uppercase = elems.iter().any(|c| c.is_uppercase());
+        let writing = elems
+            .iter()
+            .any(|c| c.is_alphabetic() && !(c.is_lowercase() || c.is_uppercase()));
+        let numeric = elems.iter().any(|c| c.is_numeric() && !c.is_ascii_digit());
+        let digit = elems.iter().any(|c| c.is_ascii_digit());
+        let punct = elems.iter().any(|c| c.is_ascii_punctuation());
+        let whitespace = elems.iter().any(|c| c.is_whitespace());
+        let control = elems.iter().any(|c| c.is_control());
+        let other = (elems.iter()).any(|c| {
+            !(c.is_lowercase()
+                || c.is_uppercase()
+                || c.is_alphabetic()
+                || c.is_numeric()
+                || c.is_ascii_punctuation()
+                || c.is_whitespace()
+                || c.is_control())
+        });
+        if writing {
+            parts.push("writing");
+        } else if lowercase && uppercase {
+            parts.push("letters");
+        } else if lowercase {
+            parts.push("lower");
+        } else if uppercase {
+            parts.push("upper");
+        }
+        if numeric {
+            parts.push("nums");
+        }
+        if digit {
+            parts.push("digits");
+        }
+        if punct {
+            parts.push("punct");
+        }
+        if whitespace {
+            parts.push("whitespace");
+        }
+        if control {
+            parts.push("control");
+        }
+        if other {
+            parts.push("other");
+        }
+        match parts.len() {
+            0 => String::new(),
+            1 => parts[0].to_string(),
+            2 => format!("{} and {}", parts[0], parts[1]),
+            _ => {
+                let mut s = String::new();
+                for (i, &part) in parts.iter().enumerate() {
+                    if i > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(part);
+                }
+                s
+            }
+        }
     }
 }
 
 impl ArrayValue for Boxed {
     const NAME: &'static str = "box";
     const SYMBOL: char = '□';
-    const TYPE_ID: u8 = 3;
-    fn get_fill(env: &Uiua) -> Result<Self, &'static str> {
-        env.box_fill()
+    const TYPE_ID: u8 = 2;
+    fn get_scalar_fill(fill: &Fill) -> Result<FillValue<Self>, &'static str> {
+        fill.box_scalar()
+    }
+    fn get_array_fill(fill: &Fill) -> Result<FillValue<Array<Self>>, &'static str> {
+        fill.box_array()
     }
     fn array_hash<H: Hasher>(&self, hasher: &mut H) {
         self.0.hash(hasher);
@@ -802,14 +1358,70 @@ impl ArrayValue for Boxed {
     fn nested_value(&self) -> Option<&Value> {
         Some(&self.0)
     }
+    fn has_wildcard(&self) -> bool {
+        self.0.has_wildcard()
+    }
+    fn box_lines() -> bool {
+        true
+    }
+    fn summarize(elems: &[Self]) -> String {
+        if elems.is_empty() {
+            return String::new();
+        }
+        let smallest_rank = elems.iter().map(|e| e.0.rank()).min().unwrap();
+        let largest_rank = elems.iter().map(|e| e.0.rank()).max().unwrap();
+        let smallest_shape = (elems.iter().map(|e| &e.0.shape))
+            .min_by_key(|s| s.elements())
+            .unwrap();
+        let largest_shape = (elems.iter().map(|e| &e.0.shape))
+            .max_by_key(|s| s.elements())
+            .unwrap();
+        let rank_summary = if smallest_rank == largest_rank {
+            format!("all rank {smallest_rank}")
+        } else {
+            format!("ranks {smallest_rank}-{largest_rank}")
+        };
+        let shape_summary = if smallest_shape == largest_shape {
+            format!("all shape {smallest_shape}")
+        } else {
+            format!("shapes {smallest_shape}-{largest_shape}")
+        };
+        format!("{rank_summary}, {shape_summary}")
+    }
+    fn summary_min_elems() -> usize {
+        1000
+    }
+    fn alignment() -> ElemAlign {
+        ElemAlign::DelimOrLeft(": ")
+    }
+    fn max_col_width<'a>(rows: impl Iterator<Item = &'a [char]>) -> usize {
+        let mut max_labelled_len = 0;
+        let mut max_unlabelled_len = 0;
+        let mut max_label_len: Option<usize> = None;
+        for row in rows {
+            if let Some(delim_pos) = (0..row.len()).find(|&i| row[i..].starts_with(&[':', ' '])) {
+                max_labelled_len = max_labelled_len.max(row.len() - delim_pos - 2);
+                max_label_len = max_label_len.max(Some(delim_pos));
+            }
+            max_unlabelled_len = max_unlabelled_len.max(row.len());
+        }
+        if let Some(label_len) = max_label_len {
+            (max_labelled_len + label_len + 2).max(max_unlabelled_len)
+        } else {
+            max_unlabelled_len
+        }
+    }
 }
 
 impl ArrayValue for Complex {
     const NAME: &'static str = "complex";
     const SYMBOL: char = 'ℂ';
-    const TYPE_ID: u8 = 1;
-    fn get_fill(env: &Uiua) -> Result<Self, &'static str> {
-        env.complex_fill()
+    const TYPE_ID: u8 = 3;
+    fn get_scalar_fill(fill: &Fill) -> Result<FillValue<Self>, &'static str> {
+        fill.complex_scalar()
+    }
+    fn get_array_fill(fill: &Fill) -> Result<FillValue<Array<Self>>, &'static str> {
+        fill.complex_array()
     }
     fn array_hash<H: Hasher>(&self, hasher: &mut H) {
         for n in [self.re, self.im] {
@@ -821,6 +1433,91 @@ impl ArrayValue for Complex {
     }
     fn empty_list_inner() -> &'static str {
         "ℂ"
+    }
+    fn summarize(elems: &[Self]) -> String {
+        if elems.is_empty() {
+            return String::new();
+        }
+        let (mut re_min, mut im_min) = (f64::INFINITY, f64::INFINITY);
+        let (mut re_max, mut im_max) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let (mut re_mean, mut im_mean) = (0.0, 0.0);
+        let (mut re_nan_count, mut im_nan_count) = (0, 0);
+        let (mut re_inf_balance, mut im_inf_balance) = (0i64, 0i64);
+        let (mut re_i, mut im_i) = (0, 0);
+        for &elem in elems {
+            for ((elem, i), (min, max, mean), (nan_count, inf_balance)) in [
+                (
+                    (elem.re, &mut re_i),
+                    (&mut re_min, &mut re_max, &mut re_mean),
+                    (&mut re_nan_count, &mut re_inf_balance),
+                ),
+                (
+                    (elem.im, &mut im_i),
+                    (&mut im_min, &mut im_max, &mut im_mean),
+                    (&mut im_nan_count, &mut im_inf_balance),
+                ),
+            ] {
+                if elem.is_nan() {
+                    *nan_count += 1;
+                } else if elem.is_infinite() {
+                    *inf_balance += elem.is_sign_positive() as i64;
+                    *min = min.min(elem);
+                    *max = max.max(elem);
+                } else {
+                    *min = min.min(elem);
+                    *max = max.max(elem);
+                    *mean += (elem - *mean) / (*i + 1) as f64;
+                    *i += 1;
+                }
+            }
+        }
+        for (inf_balance, mean) in [
+            (re_inf_balance, &mut re_mean),
+            (im_inf_balance, &mut im_mean),
+        ] {
+            if inf_balance != 0 {
+                *mean = inf_balance.signum() as f64 * f64::INFINITY;
+            }
+        }
+        if re_min == re_max && im_min == im_max {
+            format!("all {}", Complex::new(re_min, im_min).grid_string(false))
+        } else {
+            let min = Complex::new(round_sig_dec(re_min, 3), round_sig_dec(im_min, 3));
+            let max = Complex::new(round_sig_dec(re_max, 3), round_sig_dec(im_max, 3));
+            let mean = Complex::new(round_sig_dec(re_mean, 3), round_sig_dec(im_mean, 3));
+            format!(
+                "{} - {} μ{}",
+                min.grid_string(false),
+                max.grid_string(false),
+                mean.grid_string(false)
+            )
+        }
+    }
+}
+
+/// Trait for [`ArrayValue`]s that are real numbers
+pub trait RealArrayValue: ArrayValue + Copy {
+    /// Whether the value is an integer
+    fn is_int(&self) -> bool;
+    /// Convert the value to an `f64`
+    fn to_f64(&self) -> f64;
+}
+
+impl RealArrayValue for f64 {
+    fn is_int(&self) -> bool {
+        self.fract().abs() < f64::EPSILON
+    }
+    fn to_f64(&self) -> f64 {
+        *self
+    }
+}
+
+impl RealArrayValue for u8 {
+    fn is_int(&self) -> bool {
+        true
+    }
+    fn to_f64(&self) -> f64 {
+        *self as f64
     }
 }
 
@@ -863,10 +1560,14 @@ impl ArrayCmp for Complex {
 
 impl ArrayCmp for char {
     fn array_eq(&self, other: &Self) -> bool {
-        *self == WILDCARD_CHAR || *other == WILDCARD_CHAR || *self == *other
+        *self == *other || *self == WILDCARD_CHAR || *other == WILDCARD_CHAR
     }
     fn array_cmp(&self, other: &Self) -> Ordering {
-        self.cmp(other)
+        if *self == WILDCARD_CHAR || *other == WILDCARD_CHAR {
+            Ordering::Equal
+        } else {
+            self.cmp(other)
+        }
     }
 }
 
@@ -890,15 +1591,15 @@ impl ArrayCmp<u8> for f64 {
 
 /// A formattable shape
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct FormatShape<'a>(pub &'a [usize]);
+pub struct FormatShape<'a, T = usize>(pub &'a [T]);
 
-impl<'a> fmt::Debug for FormatShape<'a> {
+impl<T: fmt::Display> fmt::Debug for FormatShape<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self}")
     }
 }
 
-impl<'a> fmt::Display for FormatShape<'a> {
+impl<T: fmt::Display> fmt::Display for FormatShape<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[")?;
         for (i, dim) in self.0.iter().enumerate() {
@@ -911,30 +1612,33 @@ impl<'a> fmt::Display for FormatShape<'a> {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 #[serde(bound(
     serialize = "T: ArrayValueSer + Serialize",
     deserialize = "T: ArrayValueSer + Deserialize<'de>"
 ))]
 enum ArrayRep<T: ArrayValueSer> {
-    Scalar(T),
     List(T::Collection),
+    Scalar(T::Scalar),
+    Map(Shape, Value, T::Collection),
     Metaless(Shape, T::Collection),
-    Full(
-        Shape,
-        T::Collection,
-        #[serde(with = "meta_ser")] Arc<ArrayMeta>,
-    ),
+    Full(Shape, T::Collection, ArrayMeta),
 }
 
 impl<T: ArrayValueSer> From<ArrayRep<T>> for Array<T> {
     fn from(rep: ArrayRep<T>) -> Self {
         match rep {
-            ArrayRep::Scalar(data) => Self::new([], [data]),
+            ArrayRep::Scalar(data) => Self::new([], [data.into()]),
             ArrayRep::List(data) => {
                 let data = T::make_data(data);
                 Self::new(data.len(), data)
+            }
+            ArrayRep::Map(shape, keys, data) => {
+                let data = T::make_data(data);
+                let mut arr = Self::new(shape, data);
+                _ = arr.map(keys, &());
+                arr
             }
             ArrayRep::Metaless(shape, data) => {
                 let data = T::make_data(data);
@@ -942,11 +1646,7 @@ impl<T: ArrayValueSer> From<ArrayRep<T>> for Array<T> {
             }
             ArrayRep::Full(shape, data, meta) => {
                 let data = T::make_data(data);
-                Self {
-                    shape,
-                    data,
-                    meta: Some(meta),
-                }
+                Self { shape, data, meta }
             }
         }
     }
@@ -954,44 +1654,113 @@ impl<T: ArrayValueSer> From<ArrayRep<T>> for Array<T> {
 
 impl<T: ArrayValueSer> From<Array<T>> for ArrayRep<T> {
     fn from(mut arr: Array<T>) -> Self {
-        if let Some(meta) = arr.meta.take().filter(|meta| **meta != DEFAULT_META) {
-            return ArrayRep::Full(arr.shape, T::make_collection(arr.data), meta);
+        if let Some(inner) = (arr.meta.0.take()).filter(|meta| **meta != DEFAULT_META_INNER) {
+            let mut inner = Arc::unwrap_or_clone(inner);
+            let map_keys = inner.map_keys.take();
+            if inner == DEFAULT_META_INNER {
+                if let Some(map_keys) = map_keys {
+                    let keys = map_keys.normalized();
+                    return ArrayRep::Map(arr.shape, keys, T::make_collection(arr.data));
+                }
+            } else {
+                inner.map_keys = map_keys;
+            }
+            inner.flags &= !ArrayFlags::BOOLEAN;
+            if inner != DEFAULT_META_INNER {
+                return ArrayRep::Full(
+                    arr.shape,
+                    T::make_collection(arr.data),
+                    ArrayMeta(Some(inner.into())),
+                );
+            }
         }
         match arr.rank() {
-            0 => ArrayRep::Scalar(arr.data[0].clone()),
+            0 if !T::no_scalar() => ArrayRep::Scalar(arr.data[0].clone().into()),
             1 => ArrayRep::List(T::make_collection(arr.data)),
             _ => ArrayRep::Metaless(arr.shape, T::make_collection(arr.data)),
         }
     }
 }
 
-trait ArrayValueSer: Clone {
-    type Collection: Serialize + DeserializeOwned;
+trait ArrayValueSer: ArrayValue + fmt::Debug {
+    type Scalar: Serialize + DeserializeOwned + fmt::Debug + From<Self> + Into<Self>;
+    type Collection: Serialize + DeserializeOwned + fmt::Debug;
     fn make_collection(data: CowSlice<Self>) -> Self::Collection;
     fn make_data(collection: Self::Collection) -> CowSlice<Self>;
+    /// Do not use the [`ArrayRep::Scalar`] variant
+    fn no_scalar() -> bool {
+        false
+    }
 }
 
-macro_rules! array_value_ser {
-    ($ty:ty) => {
-        impl ArrayValueSer for $ty {
-            type Collection = CowSlice<$ty>;
-            fn make_collection(data: CowSlice<Self>) -> Self::Collection {
-                data
-            }
-            fn make_data(collection: Self::Collection) -> CowSlice<Self> {
-                collection
-            }
+impl ArrayValueSer for u8 {
+    type Scalar = u8;
+    type Collection = CowSlice<u8>;
+    fn make_collection(data: CowSlice<Self>) -> Self::Collection {
+        data
+    }
+    fn make_data(collection: Self::Collection) -> CowSlice<Self> {
+        collection
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum BoxCollection {
+    #[serde(rename = "empty_boxes")]
+    Empty([Boxed; 0]),
+    #[serde(untagged)]
+    List(CowSlice<Boxed>),
+}
+
+impl ArrayValueSer for Boxed {
+    type Scalar = Boxed;
+    type Collection = BoxCollection;
+    fn make_collection(data: CowSlice<Self>) -> Self::Collection {
+        if data.is_empty() {
+            BoxCollection::Empty([])
+        } else {
+            BoxCollection::List(data)
         }
-    };
+    }
+    fn make_data(collection: Self::Collection) -> CowSlice<Self> {
+        match collection {
+            BoxCollection::Empty(_) => CowSlice::new(),
+            BoxCollection::List(data) => data,
+        }
+    }
 }
 
-array_value_ser!(u8);
-array_value_ser!(isize);
-array_value_ser!(usize);
-array_value_ser!(Boxed);
-array_value_ser!(Complex);
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum ComplexCollection {
+    #[serde(rename = "empty_complex")]
+    Empty([Complex; 0]),
+    #[serde(untagged)]
+    List(CowSlice<Complex>),
+}
+
+impl ArrayValueSer for Complex {
+    type Scalar = Complex;
+    type Collection = ComplexCollection;
+    fn make_collection(data: CowSlice<Self>) -> Self::Collection {
+        if data.is_empty() {
+            ComplexCollection::Empty([])
+        } else {
+            ComplexCollection::List(data)
+        }
+    }
+    fn make_data(collection: Self::Collection) -> CowSlice<Self> {
+        match collection {
+            ComplexCollection::Empty(_) => CowSlice::new(),
+            ComplexCollection::List(data) => data,
+        }
+    }
+    fn no_scalar() -> bool {
+        true
+    }
+}
 
 impl ArrayValueSer for f64 {
+    type Scalar = F64Rep;
     type Collection = Vec<F64Rep>;
     fn make_collection(data: CowSlice<Self>) -> Self::Collection {
         data.iter().map(|&n| n.into()).collect()
@@ -1002,6 +1771,7 @@ impl ArrayValueSer for f64 {
 }
 
 impl ArrayValueSer for char {
+    type Scalar = char;
     type Collection = String;
     fn make_collection(data: CowSlice<Self>) -> Self::Collection {
         data.iter().collect()
@@ -1009,9 +1779,12 @@ impl ArrayValueSer for char {
     fn make_data(collection: Self::Collection) -> CowSlice<Self> {
         collection.chars().collect()
     }
+    fn no_scalar() -> bool {
+        true
+    }
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 enum F64Rep {
     #[serde(rename = "NaN")]
     NaN,
@@ -1059,176 +1832,5 @@ impl From<F64Rep> for f64 {
             F64Rep::NegInfinity => f64::NEG_INFINITY,
             F64Rep::Num(n) => n,
         }
-    }
-}
-
-mod meta_ser {
-    use super::*;
-    pub fn serialize<S: Serializer>(meta: &Arc<ArrayMeta>, s: S) -> Result<S::Ok, S::Error> {
-        meta.serialize(s)
-    }
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<ArrayMeta>, D::Error> {
-        ArrayMeta::deserialize(d).map(Arc::new)
-    }
-}
-
-/// Convert value into a string that can be understood by the interpreter
-/// Prefer to use `Value::representation()`
-pub(crate) fn dbg_value(value: &Value, depth: usize, prefix: bool) -> String {
-    value.generic_ref(
-        |a| dbg_array::<f64>(a, depth, prefix),
-        |a| dbg_array::<u8>(a, depth, prefix),
-        |a| dbg_array::<Complex>(a, depth, prefix),
-        |a| dbg_array::<char>(a, depth, prefix),
-        |a: &Array<Boxed>| {
-            if a.meta().map_keys.is_none() {
-                dbg_array(a, depth, prefix)
-            } else {
-                use crate::algorithm::map::remove_empty_rows;
-                let data = a.data.as_slice();
-                let keys = remove_empty_rows(data[0].as_value().rows());
-                let values = remove_empty_rows(data[1].as_value().rows());
-                let depth = depth + 1;
-                format!(
-                    "{{{keys}\n{padding}{values}}}",
-                    keys = dbg_value(&keys, depth, true),
-                    values = dbg_value(&values, depth, true),
-                    padding = " ".repeat(depth)
-                )
-            }
-        },
-    )
-}
-
-/// Convert array into a string that can be understood by the interpreter
-/// * `depth` - recursion/indentation depth. 0 by default
-/// * `prefix` - whether singular chars and boxes need a prefix. true by default
-pub(crate) fn dbg_array<T>(array: &Array<T>, depth: usize, prefix: bool) -> String
-where
-    T: DebugArrayValue,
-{
-    let mut buffer = String::with_capacity(array.element_count());
-    dbg_array_inner(
-        &mut buffer,
-        array.data.as_slice(),
-        array.shape(),
-        depth,
-        prefix,
-    );
-    buffer
-}
-
-/// Recursive inner function for representation printing
-fn dbg_array_inner<T: DebugArrayValue>(
-    buffer: &mut String,
-    array: &[T],
-    shape: &[usize],
-    depth: usize,
-    prefix: bool,
-) {
-    let (delims, separator) = match shape.len() {
-        0 => {
-            if !array.is_empty() {
-                buffer.push_str(&array[0].debug_string(depth, prefix))
-            };
-            return;
-        }
-        1 => (T::debug_delims(), T::debug_separator()),
-        _ => (("[", "]"), "\n"),
-    };
-    let padding = if separator.contains('\n') {
-        " ".repeat(depth + 1)
-    } else {
-        "".into()
-    };
-    let row_size = shape.iter().skip(1).product();
-    let row_count = shape[0];
-    buffer.push_str(delims.0);
-    if row_size == 0 {
-        for i in 0..row_count {
-            if i != 0 {
-                buffer.push_str(&padding);
-            }
-            dbg_array_inner(buffer, array, &shape[1..], depth + 1, false);
-            if i != row_count - 1 {
-                buffer.push_str(separator);
-            }
-        }
-    } else {
-        for (i, row) in array.chunks(row_size).enumerate() {
-            if i != 0 {
-                buffer.push_str(&padding);
-            }
-            dbg_array_inner(buffer, row, &shape[1..], depth + 1, false);
-            if i != row_count - 1 {
-                buffer.push_str(separator);
-            }
-        }
-    }
-    buffer.push_str(delims.1);
-}
-
-/// A trait for ArrayValue types that can be debug formatted
-pub trait DebugArrayValue: ArrayValue {
-    /// Row delimiters that can be read by the interpreter
-    fn debug_delims() -> (&'static str, &'static str) {
-        ("[", "]")
-    }
-    /// String representation that can be read by the interpreter
-    fn debug_string(&self, _depth: usize, _prefix: bool) -> String {
-        self.to_string()
-    }
-    /// Separator that can be read by the interpreter
-    fn debug_separator() -> &'static str {
-        Self::format_sep()
-    }
-}
-impl DebugArrayValue for u8 {}
-impl DebugArrayValue for f64 {
-    fn debug_string(&self, _depth: usize, _prefix: bool) -> String {
-        self.to_string().replace('-', "¯")
-    }
-}
-impl DebugArrayValue for Complex {
-    fn debug_string(&self, depth: usize, prefix: bool) -> String {
-        format!(
-            "ℂ{} {}",
-            self.im.debug_string(depth, prefix),
-            self.re.debug_string(depth, prefix),
-        )
-    }
-}
-impl DebugArrayValue for char {
-    fn debug_delims() -> (&'static str, &'static str) {
-        ("\"", "\"")
-    }
-    fn debug_string(&self, _depth: usize, prefix: bool) -> String {
-        let mut repr = format!("{self:?}")[1..] // gives repr delimited by single quotes
-            .replace(r"\'", "'") // don't escape single quote
-            .replace('"', r#"\""#) // escape double quote
-            .replace(r"\'", r"\\'"); // escape backslash if it's not escaping anything
-        repr.pop();
-        if prefix {
-            format!("@{}", repr.replace(' ', "\\s"))
-        } else {
-            repr
-        }
-    }
-}
-impl DebugArrayValue for Boxed {
-    fn debug_delims() -> (&'static str, &'static str) {
-        ("{", "}")
-    }
-    fn debug_string(&self, depth: usize, prefix: bool) -> String {
-        let mut buffer = String::from(if prefix { "□" } else { "" });
-        buffer.push_str(&dbg_value(
-            &self.0,
-            depth + if prefix { 1 } else { 0 },
-            true,
-        ));
-        buffer
-    }
-    fn debug_separator() -> &'static str {
-        "\n"
     }
 }

@@ -1,52 +1,59 @@
+pub(crate) mod algebra;
 mod binding;
+mod data;
+pub(crate) mod invert;
 mod modifier;
+pub(crate) mod optimize;
+mod pre_eval;
 
 use std::{
     cell::RefCell,
-    collections::{hash_map::DefaultHasher, BTreeSet, HashMap, HashSet},
+    cmp::Ordering,
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    env::current_dir,
     fmt, fs,
-    hash::{Hash, Hasher},
-    mem::{replace, take},
+    iter::once,
+    mem::{replace, swap, take},
     panic::{catch_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
-    rc::Rc,
+    slice,
     sync::Arc,
 };
 
 use ecow::{eco_vec, EcoString, EcoVec};
 use indexmap::IndexMap;
-use instant::Duration;
+use serde::{Deserialize, Serialize};
 
 use crate::{
-    algorithm::invert::{invert_instrs, under_instrs},
     ast::*,
-    check::{instrs_all_signatures, instrs_signature, SigCheckError, SigCheckErrorKind},
-    example_ua,
-    format::format_word,
-    function::*,
+    check::nodes_sig,
+    format::{format_word, format_words},
+    function::DynamicFunction,
     ident_modifier_args,
     lex::{CodeSpan, Sp, Span},
-    lsp::{CodeMeta, SigDecl},
-    optimize::{optimize_instrs, optimize_instrs_mut},
-    parse::{count_placeholders, parse, split_words, unsplit_words},
-    Array, Assembly, BindingKind, Boxed, Diagnostic, DiagnosticKind, Ident, ImplPrimitive,
-    InputSrc, IntoInputSrc, IntoSysBackend, Primitive, RunMode, SemanticComment, SysBackend, Uiua,
-    UiuaError, UiuaResult, Value, CONSTANTS, VERSION,
+    lsp::{CodeMeta, Completion, ImportSrc, SetInverses, SigDecl},
+    parse::{
+        flip_unsplit_items, flip_unsplit_lines, max_placeholder, parse, split_items, split_words,
+    },
+    Array, ArrayValue, Assembly, BindingKind, BindingMeta, Boxed, CustomInverse, Diagnostic,
+    DiagnosticKind, DocComment, DocCommentSig, Function, FunctionId, GitTarget, Ident,
+    ImplPrimitive, InputSrc, IntoInputSrc, IntoSysBackend, Node, PrimClass, Primitive, Purity,
+    RunMode, SemanticComment, SigNode, Signature, SysBackend, Uiua, UiuaError, UiuaErrorKind,
+    UiuaResult, Value, CONSTANTS, EXAMPLE_UA, SUBSCRIPT_DIGITS, VERSION,
 };
+pub use pre_eval::PreEvalMode;
 
 /// The Uiua compiler
 #[derive(Clone)]
 pub struct Compiler {
     pub(crate) asm: Assembly,
     pub(crate) code_meta: CodeMeta,
-    /// Functions which are under construction
-    new_functions: Vec<EcoVec<Instr>>,
-    /// The name of the current binding
-    current_binding: Option<CurrentBinding>,
+    /// The name of the current bindings
+    current_bindings: Vec<CurrentBinding>,
     /// The index of the next global binding
     next_global: usize,
     /// The current scope
-    scope: Scope,
+    pub(crate) scope: Scope,
     /// Ancestor scopes of the current one
     higher_scopes: Vec<Scope>,
     /// Determines which How test scopes are run
@@ -54,31 +61,35 @@ pub struct Compiler {
     /// The paths of files currently being imported (used to detect import cycles)
     current_imports: Vec<PathBuf>,
     /// The bindings of imported files
-    imports: HashMap<PathBuf, Import>,
-    /// Unexpanded stack macros
-    stack_macros: HashMap<usize, StackMacro>,
-    /// Unexpanded array macros
-    array_macros: HashMap<usize, ArrayMacro>,
-    /// The depth of macro expansion
-    macro_depth: usize,
+    imports: HashMap<PathBuf, Module>,
+    /// Unexpanded index macros
+    index_macros: HashMap<usize, IndexMacro>,
+    /// Unexpanded code macros
+    code_macros: HashMap<usize, CodeMacro>,
+    /// Indices of named external functions
+    externals: HashMap<Ident, usize>,
+    /// The depth of compile-time evaluation
+    comptime_depth: usize,
+    /// Whether the compiler is in a try
+    in_try: bool,
     /// Accumulated errors
     errors: Vec<UiuaError>,
-    /// Primitives that have emitted errors because they are experimental
-    experimental_prim_errors: HashSet<Primitive>,
     /// Primitives that have emitted errors because they are deprecated
     deprecated_prim_errors: HashSet<Primitive>,
-    /// Whether an error has been emitted for experimental function strand
-    experimental_function_strand_error: bool,
+    /// Constants that have emitted errors because they are deprecated
+    deprecated_const_errors: HashSet<&'static str>,
     /// Accumulated diagnostics
     diagnostics: BTreeSet<Diagnostic>,
     /// Print diagnostics as they are encountered
-    print_diagnostics: bool,
+    pub(crate) print_diagnostics: bool,
     /// Whether to evaluate comptime code
     comptime: bool,
     /// The comptime mode
     pre_eval_mode: PreEvalMode,
     /// The interpreter used for comptime code
     macro_env: Uiua,
+    /// Start addresses
+    start_addrs: Vec<usize>,
 }
 
 impl Default for Compiler {
@@ -86,50 +97,66 @@ impl Default for Compiler {
         Compiler {
             asm: Assembly::default(),
             code_meta: CodeMeta::default(),
-            new_functions: Vec::new(),
-            current_binding: None,
+            current_bindings: Vec::new(),
             next_global: 0,
             scope: Scope::default(),
             higher_scopes: Vec::new(),
             mode: RunMode::All,
             current_imports: Vec::new(),
             imports: HashMap::new(),
-            stack_macros: HashMap::new(),
-            array_macros: HashMap::new(),
-            macro_depth: 0,
+            index_macros: HashMap::new(),
+            code_macros: HashMap::new(),
+            externals: HashMap::new(),
+            comptime_depth: 0,
+            in_try: false,
             errors: Vec::new(),
-            experimental_prim_errors: HashSet::new(),
             deprecated_prim_errors: HashSet::new(),
-            experimental_function_strand_error: false,
+            deprecated_const_errors: HashSet::new(),
             diagnostics: BTreeSet::new(),
             print_diagnostics: false,
             comptime: true,
             pre_eval_mode: PreEvalMode::default(),
             macro_env: Uiua::default(),
+            start_addrs: Vec::new(),
         }
     }
 }
 
-/// An imported module
-#[derive(Clone)]
-pub struct Import {
+#[derive(Debug, Default)]
+struct BindingPrelude {
+    comment: Option<EcoString>,
+    track_caller: bool,
+    no_inline: bool,
+    external: bool,
+    deprecation: Option<EcoString>,
+}
+
+type LocalNames = IndexMap<Ident, LocalName>;
+
+/// A Uiua module
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Module {
     /// The top level comment
-    pub comment: Option<Arc<str>>,
+    pub comment: Option<EcoString>,
     /// Map module-local names to global indices
-    names: IndexMap<Ident, LocalName>,
-    /// Whether the import uses experimental features
+    pub names: LocalNames,
+    /// Whether the module uses experimental features
     experimental: bool,
 }
 
+/// An index macro
 #[derive(Clone)]
-struct StackMacro {
+struct IndexMacro {
     words: Vec<Sp<Word>>,
-    names: IndexMap<Ident, LocalName>,
+    names: LocalNames,
+    sig: Option<Signature>,
+    recursive: bool,
 }
 
+/// A code macro
 #[derive(Clone)]
-struct ArrayMacro {
-    function: Function,
+struct CodeMacro {
+    root: SigNode,
     names: IndexMap<Ident, LocalName>,
 }
 
@@ -149,80 +176,99 @@ impl AsMut<Assembly> for Compiler {
 struct CurrentBinding {
     name: Ident,
     signature: Option<Signature>,
-    referenced: bool,
+    recurses: usize,
     global_index: usize,
 }
 
 /// A scope where names are defined
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct Scope {
     kind: ScopeKind,
+    /// The name of the current file, if any
+    file_path: Option<PathBuf>,
     /// The top level comment
-    comment: Option<Arc<str>>,
+    comment: Option<EcoString>,
     /// Map local names to global indices
-    names: IndexMap<Ident, LocalName>,
+    names: LocalNames,
+    /// Scope's data def index
+    data_def: Option<ScopeDataDef>,
+    /// Number of named data variants
+    data_variants: usize,
     /// Whether to allow experimental features
-    experimental: bool,
-    /// The stack height between top-level statements
-    stack_height: Result<usize, Sp<SigCheckError>>,
-    /// The stack of referenced bind locals
-    bind_locals: Vec<HashSet<usize>>,
+    pub experimental: bool,
+    /// Whether an error has been emitted for experimental features
+    experimental_error: bool,
+    /// Whether an error has been emitted for fill function signatures
+    fill_sig_error: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ScopeKind {
     /// A scope at the top level of a file
-    File,
+    File(FileScopeKind),
+    /// A scope in a named module
+    Module(Ident),
+    /// A scope in a data definition method
+    Method(usize),
+    /// A scope that includes all bindings in a module
+    AllInModule,
     /// A temporary scope, probably for a macro
-    Temp,
+    Temp(Option<MacroLocal>),
+    /// A function scope
+    Function,
     /// A test scope between `---`s
     Test,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileScopeKind {
+    Source,
+    Git,
+}
+
+#[derive(Debug, Clone)]
+struct ScopeDataDef {
+    def_index: usize,
+    /// Module for local getters
+    module: Module,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MacroLocal {
+    macro_index: usize,
+    expansion_index: usize,
 }
 
 impl Default for Scope {
     fn default() -> Self {
         Self {
-            kind: ScopeKind::File,
+            kind: ScopeKind::File(FileScopeKind::Source),
+            file_path: None,
             comment: None,
             names: IndexMap::new(),
+            data_def: None,
+            data_variants: 0,
             experimental: false,
-            stack_height: Ok(0),
-            bind_locals: Vec::new(),
+            experimental_error: false,
+            fill_sig_error: false,
         }
+    }
+}
+
+impl Scope {
+    pub(crate) fn add_module_name(&mut self, name: EcoString, local: LocalName) {
+        self.names.swap_remove(format!("{name}!").as_str());
+        self.names.insert(name, local);
     }
 }
 
 /// The index of a named local in the bindings, and whether it is public
-#[derive(Clone, Copy)]
-pub(crate) struct LocalName {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalName {
+    /// The index of the binding in assembly's bindings
     pub index: usize,
+    /// Whether the binding is public
     pub public: bool,
-}
-
-/// The mode that dictates how much code to pre-evaluate at compile time
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PreEvalMode {
-    /// The normal mode. Tries to evaluate pure, time-bounded constants and expressions at comptime
-    #[default]
-    Normal,
-    /// Does not evalute pure constants and expressions at comptime, but still evaluates `comptime`
-    Lazy,
-    /// Evaluate as much as possible at compile time, even impure expressions
-    ///
-    /// Recursive functions and certain system functions are not evaluated
-    Lsp,
-}
-
-impl PreEvalMode {
-    fn matches_instrs(&self, instrs: &[Instr], asm: &Assembly) -> bool {
-        match self {
-            PreEvalMode::Normal => {
-                instrs_are_pure(instrs, asm) && instrs_are_limit_bounded(instrs, asm)
-            }
-            PreEvalMode::Lazy => false,
-            PreEvalMode::Lsp => instrs_are_limit_bounded(instrs, asm),
-        }
-    }
 }
 
 impl Compiler {
@@ -285,6 +331,11 @@ impl Compiler {
         self.mode = mode;
         self
     }
+    /// Enable experimental features
+    pub fn experimental(&mut self, experimental: bool) -> &mut Self {
+        self.scope.experimental = experimental;
+        self
+    }
     /// Get the backend
     pub fn backend(&self) -> Arc<dyn SysBackend> {
         self.macro_env.rt.backend.clone()
@@ -298,19 +349,20 @@ impl Compiler {
         self.macro_env.downcast_backend_mut()
     }
     /// Take the system backend
-    pub fn take_backend<T: SysBackend>(&mut self) -> Option<T>
-    where
-        T: Default,
-    {
+    pub fn take_backend<T: SysBackend + Default>(&mut self) -> Option<T> {
         self.macro_env.take_backend()
+    }
+    /// Set the system backend
+    pub fn set_backend<T: SysBackend>(&mut self, backend: T) {
+        self.macro_env.rt.backend = Arc::new(backend);
     }
     /// Compile a Uiua file from a file at a path
     pub fn load_file<P: AsRef<Path>>(&mut self, path: P) -> UiuaResult<&mut Self> {
         let path = path.as_ref();
         let input: EcoString = fs::read_to_string(path)
-            .map_err(|e| UiuaError::Load(path.into(), e.into()))?
+            .map_err(|e| UiuaErrorKind::Load(path.into(), e.into()))?
             .into();
-        // _ = crate::lsp::spans(&input);
+        // _ = crate::lsp::Spans::from_input(&input);
         self.asm.inputs.files.insert(path.into(), input.clone());
         self.load_impl(&input, InputSrc::File(path.into()))
     }
@@ -324,6 +376,25 @@ impl Compiler {
         let src = self.asm.inputs.add_src(src, input);
         self.load_impl(input, src)
     }
+    fn scopes(&self) -> impl Iterator<Item = &Scope> {
+        once(&self.scope).chain(self.higher_scopes.iter().rev())
+    }
+    fn scopes_to_file(&self) -> impl Iterator<Item = &Scope> {
+        let already_file = matches!(self.scope.kind, ScopeKind::File(_));
+        once(&self.scope).chain(
+            (!already_file)
+                .then(|| {
+                    let file_index = self
+                        .higher_scopes
+                        .iter()
+                        .rposition(|s| matches!(s.kind, ScopeKind::File(_)))?;
+                    Some(self.higher_scopes[file_index..].iter().rev())
+                })
+                .flatten()
+                .into_iter()
+                .flatten(),
+        )
+    }
     /// Run in a scoped context. Names defined in this context will be removed when the scope ends.
     ///
     /// While names defined in this context will be removed when the scope ends, values *bound* to
@@ -334,47 +405,100 @@ impl Compiler {
         &mut self,
         kind: ScopeKind,
         f: impl FnOnce(&mut Self) -> UiuaResult<T>,
-    ) -> UiuaResult<Import> {
-        let experimental = self.scope.experimental;
+    ) -> UiuaResult<(Module, T)> {
         self.higher_scopes.push(take(&mut self.scope));
         self.scope.kind = kind;
-        self.scope.experimental = experimental;
         let res = f(self);
         let scope = replace(&mut self.scope, self.higher_scopes.pop().unwrap());
-        res?;
-        Ok(Import {
+        let res = res?;
+        let module = Module {
             comment: scope.comment,
             names: scope.names,
             experimental: scope.experimental,
-        })
+        };
+        Ok((module, res))
+    }
+    fn in_method<T>(
+        &mut self,
+        def: &ScopeDataDef,
+        f: impl FnOnce(&mut Self) -> UiuaResult<T>,
+    ) -> UiuaResult<T> {
+        self.higher_scopes.push(take(&mut self.scope));
+        self.scope.kind = ScopeKind::Method(def.def_index);
+        self.scope.names.extend(
+            (def.module.names)
+                .iter()
+                .map(|(name, local)| (name.clone(), *local)),
+        );
+        let res = f(self);
+        self.scope = self.higher_scopes.pop().unwrap();
+        res
     }
     fn load_impl(&mut self, input: &str, src: InputSrc) -> UiuaResult<&mut Self> {
-        let instrs_start = self.asm.instrs.len();
-        let top_slices_start = self.asm.top_slices.len();
+        let node_start = self.asm.root.len();
         let (items, errors, diagnostics) = parse(input, src.clone(), &mut self.asm.inputs);
-        if self.print_diagnostics {
-            for diagnostic in diagnostics {
-                println!("{}", diagnostic.report());
-            }
-        } else {
-            self.diagnostics.extend(diagnostics);
+        for diagnostic in diagnostics {
+            self.emit_diagnostic_impl(diagnostic);
         }
         if !errors.is_empty() {
-            return Err(UiuaError::Parse(errors, self.asm.inputs.clone().into()));
+            return Err(UiuaErrorKind::Parse(errors, self.asm.inputs.clone().into()).into());
         }
         if let InputSrc::File(path) = &src {
             self.current_imports.push(path.to_path_buf());
+            self.scope.file_path = Some(if path.is_absolute() {
+                current_dir()
+                    .ok()
+                    .and_then(|dir| pathdiff::diff_paths(path, dir))
+                    .unwrap_or_else(|| path.to_path_buf())
+            } else {
+                path.to_path_buf()
+            });
         }
 
-        let res = self.catching_crash(input, |env| env.items(items, false));
+        let base = 0u8;
+        self.start_addrs.push(&base as *const u8 as usize);
+        let res = self.catching_crash(input, |env| env.items(items, ItemCompMode::TopLevel));
+        self.start_addrs.pop();
+
+        // Optimize root
+        // We only optimize if this is not an import
+        let do_optimize = match src {
+            InputSrc::File(_) => self.current_imports.len() <= 1,
+            _ => self.current_imports.is_empty(),
+        };
+        if do_optimize {
+            self.asm.root.optimize_full();
+            // Optimize and pre-eval functions
+            for i in 0..self.asm.functions.len() {
+                self.asm.functions.make_mut()[i].optimize_full();
+                if let Some((root, errs)) = self.pre_eval(&self.asm.functions[i]) {
+                    self.asm.functions.make_mut()[i] = root;
+                    self.errors.extend(errs);
+                    self.asm.functions.make_mut()[i].optimize_full();
+                }
+            }
+        }
+        // dbg!(&self.asm.root);
+
+        // Print diagnostics
+        if self.print_diagnostics {
+            for diagnostic in self.take_diagnostics() {
+                eprintln!("{}", diagnostic.report());
+            }
+        }
+
+        // Update top-level bindings
+        self.code_meta.top_level_names = (self.scope.names.iter())
+            .map(|(name, local)| (name.clone(), *local))
+            .collect();
 
         if let InputSrc::File(_) = &src {
             self.current_imports.pop();
         }
+        // Collect errors
         match res {
             Err(e) | Ok(Err(e)) => {
-                self.asm.instrs.truncate(instrs_start);
-                self.asm.top_slices.truncate(top_slices_start);
+                self.asm.root.truncate(node_start);
                 self.errors.push(e);
             }
             _ => {}
@@ -382,7 +506,7 @@ impl Compiler {
         match self.errors.len() {
             0 => Ok(self),
             1 => Err(self.errors.pop().unwrap()),
-            _ => Err(UiuaError::Multi(take(&mut self.errors))),
+            _ => Err(UiuaError::from_multi(take(&mut self.errors))),
         }
     }
     fn catching_crash<T>(
@@ -392,58 +516,89 @@ impl Compiler {
     ) -> UiuaResult<T> {
         match catch_unwind(AssertUnwindSafe(|| f(self))) {
             Ok(res) => Ok(res),
-            Err(_) => Err(UiuaError::Panic(format!(
+            Err(_) => Err(UiuaErrorKind::CompilerPanic(format!(
                 "\
 The compiler has crashed!
 Hooray! You found a bug!
-Please report this at http://github.com/uiua-lang/uiua/issues/new or on Discord at https://discord.gg/9CU2ME4kmn.
+Please report this at http://github.com/uiua-lang/uiua/issues/new \
+or on Discord at https://discord.gg/9CU2ME4kmn.
 
 Uiua version {VERSION}
 
 code:
 {input}"
-            ))),
+            ))
+            .into()),
         }
     }
-    pub(crate) fn items(&mut self, items: Vec<Item>, in_test: bool) -> UiuaResult {
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ItemCompMode {
+    TopLevel,
+    Function,
+    CodeMacro,
+}
+
+impl Compiler {
+    fn items(&mut self, items: Vec<Item>, mode: ItemCompMode) -> UiuaResult {
         // Set scope comment
-        if let Some(Item::Words(lines)) = items.first() {
-            let mut started = false;
-            let mut comment = String::new();
-            for line in lines {
-                for word in line {
-                    match &word.value {
-                        Word::Comment(c) => {
-                            let mut c = c.as_str();
-                            if c.starts_with(' ') {
-                                c = &c[1..];
-                            }
-                            comment.push_str(c);
-                            started = true;
+        let mut started = false;
+        let mut comment = String::new();
+        let mut items_iter = items.iter();
+        while let Some(Item::Words(line)) = items_iter.next() {
+            for word in line {
+                match &word.value {
+                    Word::Comment(c) => {
+                        let mut c = c.as_str();
+                        if c.starts_with(' ') {
+                            c = &c[1..];
                         }
-                        Word::Spaces => {}
-                        _ => {
-                            comment.clear();
-                            break;
-                        }
+                        comment.push_str(c);
+                        started = true;
+                    }
+                    Word::Spaces => {}
+                    _ => {
+                        comment.clear();
+                        break;
                     }
                 }
-                if line.is_empty() && started {
-                    break;
-                }
-                comment.push('\n');
             }
-            if !comment.trim().is_empty() {
-                self.scope.comment = Some(comment.trim().into());
+            if line.is_empty() && started {
+                break;
             }
         }
+        comment.push('\n');
+        if !comment.trim().is_empty() {
+            self.scope.comment = Some(comment.trim().into());
+        }
 
-        let mut prev_comment = None;
-        for item in items {
-            if let Err(e) = self.item(item, in_test, &mut prev_comment) {
-                if self.errors.is_empty() {
+        let mut prelude = BindingPrelude::default();
+        let mut item_errored = false;
+        let mut item_queue = VecDeque::from(flip_unsplit_items(split_items(items)));
+        while let Some(item) = item_queue.pop_front() {
+            let must_run = mode == ItemCompMode::CodeMacro
+                || matches!(&item, Item::Words(_))
+                    && item_queue.iter().any(|item| match item {
+                        Item::Binding(binding)
+                            if (binding.words.iter())
+                                .filter(|word| word.value.is_code())
+                                .count()
+                                == 0 =>
+                        {
+                            true
+                        }
+                        Item::Words(line) => line
+                            .iter()
+                            .find(|w| w.value.is_code())
+                            .is_some_and(|w| matches!(w.value, Word::Primitive(Primitive::Assert))),
+                        _ => false,
+                    });
+            if let Err(e) = self.item(item, must_run, mode, &mut prelude) {
+                if !item_errored || self.errors.is_empty() {
                     self.errors.push(e);
                 }
+                item_errored = true;
             }
         }
         Ok(())
@@ -451,249 +606,319 @@ code:
     fn item(
         &mut self,
         item: Item,
-        in_test: bool,
-        prev_comment: &mut Option<Arc<str>>,
+        must_run: bool,
+        mode: ItemCompMode,
+        prelude: &mut BindingPrelude,
     ) -> UiuaResult {
-        fn words_should_run_anyway(words: &[Sp<Word>]) -> bool {
-            (words.iter()).any(|w| matches!(&w.value, Word::SemanticComment(_)))
+        match item {
+            Item::Module(m) => self.module(m, take(prelude)),
+            Item::Words(line) => self.top_level_words(line, must_run, mode, prelude),
+            Item::Binding(binding) => self.binding(binding, take(prelude)),
+            Item::Import(import) => self.import(import, take(prelude).comment),
+            Item::Data(defs) => {
+                for data in defs {
+                    self.data_def(data, true, take(prelude))?
+                }
+                Ok(())
+            }
         }
-        let prev_com = prev_comment.take();
-        let mut lines = match item {
-            Item::TestScope(items) => {
-                self.in_scope(ScopeKind::Test, |env| env.items(items.value, true))?;
-                return Ok(());
-            }
-            Item::Words(lines) => lines,
-            Item::Binding(binding) => {
-                let can_run = match self.mode {
-                    RunMode::Normal => !in_test,
-                    RunMode::All | RunMode::Test => true,
-                };
-                if can_run || words_should_run_anyway(&binding.words) {
-                    self.binding(binding, prev_com)?;
-                }
-                return Ok(());
-            }
-            Item::Import(import) => return self.import(import, prev_com),
-        };
-
-        // Compile top-level words
-        if lines.iter().flatten().all(|w| !w.value.is_code()) {
-            let mut comment = String::new();
-            for (i, line) in lines.iter().enumerate() {
-                if line.is_empty() {
-                    comment.clear();
-                    continue;
-                }
-                if i > 0 {
-                    comment.push('\n');
-                }
-                for word in line {
-                    if let Word::Comment(c) = &word.value {
-                        comment.push_str(c);
+    }
+    fn top_level_words(
+        &mut self,
+        mut line: Vec<Sp<Word>>,
+        must_run: bool,
+        mode: ItemCompMode,
+        prelude: &mut BindingPrelude,
+    ) -> UiuaResult {
+        // Populate prelude
+        let mut words = line.iter().filter(|w| !matches!(w.value, Word::Spaces));
+        if words.clone().count() == 1 {
+            let word = words.next().unwrap();
+            match &word.value {
+                Word::Comment(c) => {
+                    if let Some(curr_com) = &mut prelude.comment {
+                        curr_com.push('\n');
+                        curr_com.push_str(c);
+                    } else {
+                        prelude.comment = Some(c.as_str().into());
                     }
+                    line.clear();
                 }
+                Word::SemanticComment(SemanticComment::NoInline) => prelude.no_inline = true,
+                Word::SemanticComment(SemanticComment::TrackCaller) => prelude.track_caller = true,
+                Word::SemanticComment(SemanticComment::External) => prelude.external = true,
+                Word::SemanticComment(SemanticComment::Deprecated(s)) => {
+                    prelude.deprecation = Some(s.clone())
+                }
+                _ => *prelude = BindingPrelude::default(),
             }
-            *prev_comment = if comment.trim().is_empty() {
-                None
-            } else {
-                Some(comment.trim().into())
-            };
-        };
+        } else {
+            *prelude = BindingPrelude::default();
+        }
+
+        fn words_should_run_anyway(words: &[Sp<Word>]) -> bool {
+            let mut anyway = false;
+            recurse_words(words, &mut |w| {
+                anyway = anyway
+                    || matches!(&w.value, Word::SemanticComment(_))
+                    || matches!(&w.value, Word::Modified(m)
+                        if matches!(m.modifier.value, Modifier::Ref(_)))
+            });
+            anyway
+        }
+        let in_test = self.scopes().any(|sc| sc.kind == ScopeKind::Test);
         let can_run = match self.mode {
             RunMode::Normal => !in_test,
             RunMode::Test => in_test,
             RunMode::All => true,
         };
-        lines = unsplit_words(lines.into_iter().flat_map(split_words));
-        for line in lines {
-            if line.is_empty() || !can_run && !words_should_run_anyway(&line) {
-                continue;
-            }
-            let span =
-                (line.first().unwrap().span.clone()).merge(line.last().unwrap().span.clone());
-            if count_placeholders(&line) > 0 {
-                self.add_error(span.clone(), "Cannot use placeholder outside of function");
-            }
-            let all_literal = line.iter().filter(|w| w.value.is_code()).all(|w| {
-                matches!(
-                    w.value,
-                    Word::Char(_) | Word::Number(..) | Word::String(_) | Word::MultilineString(_)
-                )
-            });
-            // Compile the words
-            let instr_count_before = self.asm.instrs.len();
-            let instrs = self.compile_words(line, true)?;
-            let (mut instrs, pre_eval_errors) = self.pre_eval_instrs(instrs);
-            let mut line_eval_errored = false;
-            match instrs_signature(&instrs) {
-                Ok(sig) => {
-                    // Update scope stack height
-                    if let Ok(height) = &mut self.scope.stack_height {
-                        *height = (*height + sig.outputs).saturating_sub(sig.args);
-                    }
-                    // Try to evaluate at comptime
-                    // This can be done when there are at least as many push instructions
-                    // preceding the current line as there are arguments to the line
-                    if !instrs.is_empty()
-                        && instr_count_before >= sig.args
-                        && (self.asm.instrs.iter().take(instr_count_before).rev())
-                            .take(sig.args)
-                            .all(|instr| matches!(instr, Instr::Push(_)))
-                    {
-                        // The instructions for evaluation are the preceding push
-                        // instructions, followed by the current line
-                        let mut comp_instrs = EcoVec::from(
-                            &self.asm.instrs
-                                [instr_count_before.saturating_sub(sig.args)..instr_count_before],
-                        );
-                        comp_instrs.extend(instrs.iter().cloned());
-                        match self.comptime_instrs(comp_instrs) {
-                            Ok(Some(vals)) => {
-                                // Track top level values
-                                if !all_literal {
-                                    self.code_meta.top_level_values.insert(span, vals.clone());
-                                }
-                                // Truncate instrs
-                                self.asm.instrs.truncate(instr_count_before - sig.args);
-                                // Truncate top slices
-                                let mut remaining = sig.args;
-                                while let Some(slice) = self.asm.top_slices.last_mut() {
-                                    let to_sub = slice.len.min(remaining);
-                                    slice.len -= to_sub;
-                                    remaining -= to_sub;
-                                    if remaining == 0 {
-                                        break;
-                                    }
-                                    if slice.len == 0 {
-                                        self.asm.top_slices.pop();
-                                    }
-                                }
-                                // Set instrs
-                                instrs = vals.into_iter().map(Instr::push).collect();
+        if line.is_empty() || !(can_run || must_run || words_should_run_anyway(&line)) {
+            return Ok(());
+        }
+        let span = (line.first().unwrap().span.clone()).merge(line.last().unwrap().span.clone());
+        if max_placeholder(&line).is_some() {
+            self.add_error(
+                span.clone(),
+                "Cannot use placeholder outside of an index macro",
+            );
+        }
+        // Compile the words
+        let binding_count_before = self.asm.bindings.len();
+        let root_len_before = self.asm.root.len();
+        let error_count_before = self.errors.len();
+
+        let mut line_node = self.line(line, true)?;
+
+        let binding_count_after = self.asm.bindings.len();
+        let error_count_after = self.errors.len();
+
+        if mode != ItemCompMode::Function {
+            line_node.optimize_full();
+        }
+        match line_node.sig() {
+            Ok(sig) => {
+                // Compile test assert
+                if self.mode != RunMode::Normal
+                    && mode != ItemCompMode::Function
+                    && !self
+                        .scopes()
+                        .any(|sc| sc.kind == ScopeKind::File(FileScopeKind::Git))
+                {
+                    let test_assert = line_node
+                        .last_mut_recursive(&mut self.asm, |node| {
+                            if let &mut Node::Prim(Primitive::Assert, span) = node {
+                                *node = Node::ImplPrim(ImplPrimitive::TestAssert, span);
+                                true
+                            } else {
+                                false
                             }
-                            Ok(None) => {}
-                            Err(e) => {
-                                self.errors.push(e);
-                                line_eval_errored = true;
-                            }
-                        }
+                        })
+                        .unwrap_or(false);
+                    if test_assert {
+                        self.asm.test_assert_count += 1;
                     }
                 }
-                Err(e) => self.scope.stack_height = Err(span.sp(e)),
+                // Try to evaluate at comptime
+                // This can be done when:
+                // - the line is not in a () function
+                // - the pre-eval mode is greater that `Line`
+                // - there are at least as many push nodes preceding the current line as there are arguments to the line
+                // - the words create no bindings
+                if mode != ItemCompMode::Function
+                    && error_count_after == error_count_before
+                    && self.pre_eval_mode > PreEvalMode::Line
+                    && !line_node.is_empty()
+                    && binding_count_before == binding_count_after
+                    && root_len_before == self.asm.root.len()
+                    && self.asm.root.len() >= sig.args()
+                    && (self.asm.root.iter().rev().take(sig.args()))
+                        .all(|node| matches!(node, Node::Push(_)))
+                {
+                    // The nodes for evaluation are the preceding
+                    // push nodes, followed by the current line
+                    let mut node = Node::from(&self.asm.root[self.asm.root.len() - sig.args()..]);
+                    node.extend(line_node.iter().cloned());
+                    if let Some((node, errs)) = self.pre_eval(&node) {
+                        self.errors.extend(errs);
+                        // Track top-level values
+                        if node.iter().all(|node| matches!(node, Node::Push(_))) {
+                            let vals: Vec<_> = node
+                                .iter()
+                                .map(|node| match node {
+                                    Node::Push(val) => val.clone(),
+                                    _ => unreachable!(),
+                                })
+                                .collect();
+                            self.code_meta.top_level_values.insert(span, vals);
+                        }
+                        // Truncate root
+                        self.asm.root.truncate(self.asm.root.len() - sig.args());
+                        // Set line node to the pre-evaluated node
+                        line_node = node;
+                    }
+                }
             }
-            if !line_eval_errored {
-                self.errors.extend(pre_eval_errors);
-            }
-            let start = self.asm.instrs.len();
-            (self.asm.instrs).extend(instrs);
-            let end = self.asm.instrs.len();
-            self.asm.top_slices.push(FuncSlice {
-                start,
-                len: end - start,
-            });
+            Err(e) => self.add_error(span, e),
         }
+        self.asm.root.push(line_node);
         Ok(())
-    }
-    #[must_use]
-    pub(crate) fn make_function<I>(&mut self, id: FunctionId, sig: Signature, instrs: I) -> Function
-    where
-        I: IntoIterator<Item = Instr> + fmt::Debug,
-        I::IntoIter: ExactSizeIterator,
-    {
-        let (instrs, errors) = self.pre_eval_instrs(instrs.into_iter().collect());
-        self.errors.extend(errors);
-        let len = instrs.len();
-        if len > 1 {
-            (self.asm.instrs).push(Instr::Comment(format!("({id}").into()));
-        }
-        let start = self.asm.instrs.len();
-        let mut hasher = DefaultHasher::new();
-        instrs.hash(&mut hasher);
-        let hash = hasher.finish();
-        self.asm.instrs.extend(instrs);
-        if len > 1 {
-            (self.asm.instrs).push(Instr::Comment(format!("{id})").into()));
-        }
-        Function::new(id, sig, FuncSlice { start, len }, hash)
     }
     fn compile_bind_function(
         &mut self,
-        name: &Ident,
+        name: Ident,
         local: LocalName,
         function: Function,
         span: usize,
-        comment: Option<Arc<str>>,
+        meta: BindingMeta,
     ) -> UiuaResult {
+        if let Some(sig) = meta.comment.as_ref().and_then(|c| c.sig.as_ref()) {
+            if !sig.matches_sig(function.sig) {
+                self.emit_diagnostic(
+                    format!(
+                        "{name}'s comment describes {}, \
+                        but its code has signature {}",
+                        sig.sig_string(),
+                        function.sig,
+                    ),
+                    DiagnosticKind::Warning,
+                    self.get_span(span).clone().code().unwrap(),
+                );
+            }
+        }
         self.scope.names.insert(name.clone(), local);
-        self.asm.bind_function(local, function, span, comment);
+        let span = if span == 0 {
+            Some(CodeSpan::literal(name))
+        } else {
+            self.get_span(span).clone().code()
+        };
+        self.asm
+            .add_binding_at(local, BindingKind::Func(function), span, meta);
         Ok(())
+    }
+    fn compile_bind_const(
+        &mut self,
+        name: Ident,
+        local: LocalName,
+        value: Option<Value>,
+        span: usize,
+        meta: BindingMeta,
+    ) {
+        let span = self.get_span(span).clone().code().unwrap();
+        if let Some(sig) = meta.comment.as_ref().and_then(|c| c.sig.as_ref()) {
+            self.emit_diagnostic(
+                format!(
+                    "{name}'s comment describes {}, but it is a constant",
+                    sig.sig_string(),
+                ),
+                DiagnosticKind::Warning,
+                span.clone(),
+            );
+        }
+        self.asm
+            .add_binding_at(local, BindingKind::Const(value), Some(span), meta);
+        self.scope.names.insert(name, local);
     }
     /// Import a module
     pub(crate) fn import_module(&mut self, path_str: &str, span: &CodeSpan) -> UiuaResult<PathBuf> {
         // Resolve path
-        let path = if let Some(mut url) = path_str.strip_prefix("git:") {
-            let mut branch = None;
-            if let Some((a, b)) = url.split_once("branch:") {
-                url = a;
-                branch = Some(b.trim());
+        let (path, file_kind) = if let Some(mut url) = path_str.trim().strip_prefix("git:") {
+            if url.contains("branch:") && url.contains("commit:") {
+                return Err(self.error(
+                    span.clone(),
+                    "Cannot specify both branch and commit in git import",
+                ));
             }
+            let target = if let Some((a, b)) = url.split_once("branch:") {
+                url = a;
+                GitTarget::Branch(b.trim().into())
+            } else if let Some((a, b)) = url.split_once("commit:") {
+                url = a;
+                GitTarget::Commit(b.trim().into())
+            } else {
+                GitTarget::Default
+            };
             // Git import
             let mut url = url.trim().trim_end_matches(".git").to_string();
-            if ![".com", ".net", ".org", ".io", ".dev"]
-                .iter()
-                .any(|s| url.contains(s))
-            {
-                if !url.starts_with('/') {
-                    url = format!("/{url}");
-                }
-                url = format!("github.com{url}");
+            if url.ends_with("/uiua") {
+                return Err(self.error(span.clone(), "Cannot import what looks like a Uiua fork"));
             }
             if !(url.starts_with("https://") || url.starts_with("http://")) {
                 url = format!("https://{url}");
             }
-            self.backend()
-                .load_git_module(&url, branch)
-                .map_err(|e| self.fatal_error(span.clone(), e))?
+            self.code_meta
+                .import_srcs
+                .insert(span.clone(), ImportSrc::Git(url.clone()));
+            let path = self
+                .backend()
+                .load_git_module(&url, target)
+                .map_err(|e| self.error(span.clone(), e))?;
+            (path, FileScopeKind::Git)
         } else {
             // Normal import
-            self.resolve_import_path(Path::new(path_str))
+            let path = self.resolve_import_path(Path::new(path_str));
+            self.code_meta
+                .import_srcs
+                .insert(span.clone(), ImportSrc::File(path.clone()));
+            (path, FileScopeKind::Source)
         };
-        if self.imports.get(&path).is_none() {
+        if !self.imports.contains_key(&path) {
+            // We cache Git modules on WASM so that the pad doesn't have to recompile big modules constantly
+            thread_local! {
+                static GIT_CACHE: RefCell<HashMap<PathBuf, Compiler>> = RefCell::new(HashMap::new());
+            }
             let bytes = self
                 .backend()
                 .file_read_all(&path)
                 .or_else(|e| {
                     if path.ends_with(Path::new("example.ua")) {
-                        Ok(example_ua(|ex| ex.as_bytes().to_vec()))
+                        Ok(EXAMPLE_UA.as_bytes().to_vec())
                     } else {
                         Err(e)
                     }
                 })
-                .map_err(|e| self.fatal_error(span.clone(), e))?;
-            let input: EcoString = String::from_utf8(bytes)
-                .map_err(|e| self.fatal_error(span.clone(), format!("Failed to read file: {e}")))?
-                .into();
-            if self.current_imports.iter().any(|p| p == &path) {
-                return Err(self.fatal_error(
-                    span.clone(),
-                    format!("Cycle detected importing {}", path.to_string_lossy()),
-                ));
-            }
-            let import = self.in_scope(ScopeKind::File, |env| {
-                env.load_str_src(&input, &path).map(drop)
-            })?;
-            self.imports.insert(path.clone(), import);
+                .map_err(|e| self.error(span.clone(), e))?;
+            if let Some(mut comp) = (bytes.len() > 1000)
+                .then(|| GIT_CACHE.with(|cache| cache.borrow().get(&path).cloned()))
+                .flatten()
+            {
+                swap(self, &mut comp);
+                self.macro_env.rt.backend = comp.macro_env.rt.backend;
+                self.asm.inputs.strings = comp.asm.inputs.strings;
+                self.asm.inputs.files.extend(comp.asm.inputs.files);
+                self.scope.experimental = comp.scope.experimental;
+                self.diagnostics.extend(comp.diagnostics);
+            } else {
+                let input: EcoString = String::from_utf8(bytes)
+                    .map_err(|e| self.error(span.clone(), format!("Failed to read file: {e}")))?
+                    .into();
+                if self.current_imports.iter().any(|p| p == &path) {
+                    return Err(self.error(
+                        span.clone(),
+                        format!("Cycle detected importing {}", path.to_string_lossy()),
+                    ));
+                }
+                let (module, ()) = self.in_scope(ScopeKind::File(file_kind), |comp| {
+                    comp.load_str_src(&input, &path).map(drop)
+                })?;
+                self.imports.insert(path.clone(), module);
+                #[cfg(target_arch = "wasm32")]
+                if file_kind == FileScopeKind::Git {
+                    GIT_CACHE.with(|cache| {
+                        let mut clone = self.clone();
+                        clone.macro_env.rt.backend = Arc::new(crate::SafeSys::default());
+                        cache.borrow_mut().insert(path.clone(), clone);
+                    });
+                }
+            };
         }
-        let import = self.imports.get(&path).unwrap();
-        if import.experimental && !self.scope.experimental {
-            self.add_error(
-                span.clone(),
+        let module = self.imports.get(&path).unwrap();
+        if module.experimental {
+            self.experimental_error(span, || {
                 format!(
                     "Module `{path_str}` is experimental. \
                     To use it, add `# Experimental!` to the top of this file."
-                ),
-            );
+                )
+            });
         }
         Ok(path)
     }
@@ -715,149 +940,293 @@ code:
             pathdiff::diff_paths(&target, base).unwrap_or(target)
         }
     }
-    fn compile_words(
-        &mut self,
-        words: impl IntoIterator<Item = Sp<Word>>,
-        call: bool,
-    ) -> UiuaResult<EcoVec<Instr>> {
-        let words = unsplit_words(split_words(words))
-            .into_iter()
-            .flatten()
-            .collect();
-
-        self.new_functions.push(EcoVec::new());
-        self.words(words, call)?;
-        self.flush_diagnostics();
-        Ok(self.new_functions.pop().unwrap())
-    }
-    fn flush_diagnostics(&mut self) {
-        if self.print_diagnostics {
-            for diagnostic in self.take_diagnostics() {
-                eprintln!("{}", diagnostic.report());
-            }
+    // Compile a line, checking an end-of-line signature comment
+    fn line(&mut self, mut line: Vec<Sp<Word>>, must_be_callable: bool) -> UiuaResult<Node> {
+        let comment_sig = line_sig(&line);
+        let output_comment = if line
+            .last()
+            .is_some_and(|w| matches!(w.value, Word::OutputComment { .. }))
+        {
+            let word = line.pop().unwrap();
+            Some(self.word(word)?)
+        } else {
+            None
+        };
+        // Actually compile the line
+        let mut node = self.words(line)?;
+        node.extend(output_comment);
+        // Validate line signature
+        if let Some(comment_sig) = comment_sig {
+            self.apply_node_comment(&mut node, &comment_sig.value, "Line", &comment_sig.span);
         }
-    }
-    fn compile_operand_word(&mut self, word: Sp<Word>) -> UiuaResult<(EcoVec<Instr>, Signature)> {
-        let span = word.span.clone();
-        let mut instrs = self.compile_words([word], true)?;
-        let mut sig = None;
-        // Extract function instrs if possible
-        if let [Instr::PushFunc(f)] = instrs.as_slice() {
-            sig = Some(f.signature());
-            let slice = f.slice;
-            instrs = f.instrs(self).into();
-            if slice.start + slice.len >= self.asm.instrs.len() - 1 {
-                self.asm.instrs.truncate(slice.start);
-                if matches!(self.asm.instrs.last(), Some(Instr::Comment(com)) if com.starts_with('('))
-                {
-                    self.asm.instrs.pop();
+        // Validate callability
+        if must_be_callable {
+            if let Err((e, f, mut spans)) = node.check_callability(&self.asm) {
+                let e = e.clone();
+                if let Some(f_id) = f.map(|f| f.id.clone()) {
+                    let src_span = self.get_span(spans.remove(0));
+                    let call_span = self.get_span(spans.pop().unwrap());
+                    let error = self.error_with_info(
+                        call_span,
+                        format!("Cannot call {f_id} because of an inversion error"),
+                        [(src_span, e)],
+                    );
+                    self.errors.push(error);
+                } else {
+                    let span = self.get_span(spans.pop().unwrap());
+                    self.add_error(span, e);
                 }
             }
         }
-        let sig = if let Some(sig) = sig {
-            sig
-        } else {
-            self.sig_of(&instrs, &span)?
-        };
-        let instrs = optimize_instrs(instrs, false, &self.asm);
-        Ok((instrs, sig))
+        Ok(node)
     }
-    fn words(&mut self, mut words: Vec<Sp<Word>>, call: bool) -> UiuaResult {
+    fn apply_node_comment(
+        &mut self,
+        node: &mut Node,
+        comment_sig: &DocCommentSig,
+        name: &str,
+        span: &CodeSpan,
+    ) {
+        let mut spandex: Option<usize> = None;
+        // Validate comment signature
+        if let Ok(mut sig) = node.sig() {
+            if let ScopeKind::Method(_) = self.scope.kind {
+                sig.update_args(|a| a + 1);
+            }
+            if !comment_sig.matches_sig(sig) {
+                let span = *spandex.get_or_insert_with(|| self.add_span(span.clone()));
+                self.emit_diagnostic(
+                    format!(
+                        "{name} comment describes {}, \
+                        but its code has signature {sig}",
+                        comment_sig.sig_string()
+                    ),
+                    DiagnosticKind::Warning,
+                    self.get_span(span).clone().code().unwrap(),
+                );
+            }
+        }
+        if comment_sig.label {
+            // Add argument labels
+            if let Some(args) = &comment_sig.args {
+                let span = *spandex.get_or_insert_with(|| self.add_span(span.clone()));
+                let labels = Node::bracket(
+                    args.iter()
+                        .map(|a| Node::Label(a.name.clone(), span).sig_node().unwrap()),
+                    span,
+                );
+                node.prepend(labels);
+            }
+            // Add output labels
+            if let Some(outputs) = &comment_sig.outputs {
+                let span = *spandex.get_or_insert_with(|| self.add_span(span.clone()));
+                let labels = Node::bracket(
+                    outputs
+                        .iter()
+                        .map(|o| Node::Label(o.name.clone(), span).sig_node().unwrap()),
+                    span,
+                );
+                node.push(labels);
+            }
+        }
+    }
+    fn args(&mut self, words: Vec<Sp<Word>>) -> UiuaResult<EcoVec<SigNode>> {
+        words
+            .into_iter()
+            .filter(|w| w.value.is_code())
+            .map(|w| self.word_sig(w))
+            .collect()
+    }
+    fn words_sig(&mut self, words: Vec<Sp<Word>>) -> UiuaResult<SigNode> {
+        let span = words
+            .first()
+            .zip(words.last())
+            .map(|(f, l)| f.span.clone().merge(l.span.clone()));
+        let node = self.words(words)?;
+        let sig = if let Some(span) = span {
+            self.sig_of(&node, &span)?
+        } else {
+            Signature::new(0, 0)
+        };
+        Ok(SigNode::new(sig, node))
+    }
+    fn words(&mut self, mut words: Vec<Sp<Word>>) -> UiuaResult<Node> {
+        // Filter out non-code words
         words.retain(|word| word.value.is_code());
+        // Extract semantic comment
+        let mut sem = None;
+        if let Some(word) = words.last() {
+            if let Word::SemanticComment(com) = &word.value {
+                let com = com.clone();
+                sem = Some(words.pop().unwrap().span.sp(com));
+            }
+        }
+        // Right-to-left
         words.reverse();
+
+        // We keep track of some data from previous words so we can emit
+        // diagnostics about suggested changes
         #[derive(Debug, Clone)]
-        struct PrevWord(Option<Primitive>, Option<Signature>, CodeSpan);
+        struct PrevWord(
+            Option<Primitive>,
+            Option<Primitive>,
+            Option<Signature>,
+            CodeSpan,
+        );
         let mut a: Option<PrevWord> = None;
         let mut b: Option<PrevWord> = None;
-        for word in words {
+        let mut nodes = Node::empty();
+        for word in flip_unsplit_lines(split_words(words)).into_iter().flatten() {
             let span = word.span.clone();
-            let prim = match word.value {
-                Word::Primitive(prim) => Some(prim),
-                _ => None,
-            };
-
-            // First select diagnostic
-            if let (Some(PrevWord(Some(Primitive::Select), _, b_span)), Some(Primitive::First)) =
-                (&b, prim)
-            {
-                self.emit_diagnostic(
-                    format!(
-                        "Flip the order of {} and {} to improve performance",
-                        Primitive::First.format(),
-                        Primitive::Select.format()
-                    ),
-                    DiagnosticKind::Advice,
-                    b_span.clone().merge(span.clone()),
-                );
-            }
-            // Flip monadic dup diagnostic
-            if let (
-                Some(PrevWord(Some(Primitive::Dup), _, a_span)),
-                Some(PrevWord(
-                    _,
-                    Some(Signature {
-                        args: 1,
-                        outputs: 1,
-                    }),
-                    _,
-                )),
-                Some(Primitive::Flip),
-            ) = (a, &b, prim)
-            {
-                self.emit_diagnostic(
-                    format!(
-                        "Prefer {} over {} {} here",
-                        Primitive::On,
-                        Primitive::Flip,
-                        Primitive::Dup
-                    ),
-                    DiagnosticKind::Style,
-                    a_span.merge(span.clone()),
-                );
+            let (mut modif, mut prim) = (None, None);
+            match &word.value {
+                Word::Primitive(p) => prim = Some(*p),
+                Word::Modified(m) => {
+                    if let Modifier::Primitive(mprim) = &m.modifier.value {
+                        if let Some(first) = m.operands.first() {
+                            if let Word::Primitive(p) = first.value {
+                                modif = Some(*mprim);
+                                prim = Some(p);
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
 
-            let start = self.new_functions.last().unwrap().len();
+            match (a, &b, prim.filter(|_| modif.is_none())) {
+                // Flip monadic dup diagnostic
+                (
+                    Some(PrevWord(None, Some(Primitive::Dup), _, a_span)),
+                    Some(PrevWord(_, _, Some(sig), _)),
+                    Some(Primitive::Flip),
+                ) if *sig == (1, 1) => {
+                    self.emit_diagnostic(
+                        format!(
+                            "Prefer {} over {} {} here",
+                            Primitive::On,
+                            Primitive::Flip,
+                            Primitive::Dup
+                        ),
+                        DiagnosticKind::Style,
+                        a_span.merge(span.clone()),
+                    );
+                }
+                // Keep unique dup diagnostic
+                (
+                    Some(PrevWord(None, Some(Primitive::Dup), _, a_span)),
+                    Some(PrevWord(None, Some(Primitive::Unique), _, _)),
+                    Some(Primitive::Keep),
+                ) => {
+                    self.emit_diagnostic(
+                        format!(
+                            "Prefer {} over {}{}{}",
+                            Primitive::Deduplicate.format(),
+                            Primitive::Keep,
+                            Primitive::Unique,
+                            Primitive::Dup
+                        ),
+                        DiagnosticKind::Advice,
+                        a_span.merge(span.clone()),
+                    );
+                }
+                // First reverse diagnostic
+                (
+                    _,
+                    Some(PrevWord(None, Some(Primitive::Reverse), _, b_span)),
+                    Some(Primitive::First),
+                ) => {
+                    self.emit_diagnostic(
+                        format!(
+                            "Prefer {} over {}{}",
+                            Primitive::Last.format(),
+                            Primitive::First,
+                            Primitive::Reverse
+                        ),
+                        DiagnosticKind::Advice,
+                        b_span.clone().merge(span.clone()),
+                    );
+                }
+                // Select by rise and select rise dup diagnostics
+                (
+                    Some(PrevWord(None, Some(Primitive::Dup), _, a_span)),
+                    Some(PrevWord(None, Some(Primitive::Rise), _, _)),
+                    Some(Primitive::Select),
+                ) => {
+                    self.emit_diagnostic(
+                        format!(
+                            "Prefer {} over {}{}{}",
+                            Primitive::Sort.format(),
+                            Primitive::Select,
+                            Primitive::Rise,
+                            Primitive::Dup
+                        ),
+                        DiagnosticKind::Advice,
+                        a_span.merge(span.clone()),
+                    );
+                }
+                (
+                    _,
+                    Some(PrevWord(Some(Primitive::By), Some(Primitive::Rise), _, b_span)),
+                    Some(Primitive::Select),
+                ) => {
+                    self.emit_diagnostic(
+                        format!(
+                            "Prefer {} over {}{}{}",
+                            Primitive::Sort.format(),
+                            Primitive::Select,
+                            Primitive::By,
+                            Primitive::Rise
+                        ),
+                        DiagnosticKind::Advice,
+                        b_span.clone().merge(span.clone()),
+                    );
+                }
+                _ => {}
+            }
 
             // Compile the word
-            self.word(word, call)?;
-
-            let new_functions = self.new_functions.last().unwrap();
-            let sig = if new_functions.len() >= start {
-                instrs_signature(&new_functions[start..]).ok()
-            } else {
-                None
-            };
+            let node = self.word(word)?;
+            let sig = node.sig().ok();
+            nodes.push(node);
             a = b;
-            b = Some(PrevWord(prim, sig, span));
+            b = Some(PrevWord(modif, prim, sig, span));
+        }
+        if let Some(sem) = sem {
+            nodes = self.semantic_comment(sem.value, sem.span, nodes);
+        }
+        Ok(nodes)
+    }
+    fn word_sig(&mut self, word: Sp<Word>) -> UiuaResult<SigNode> {
+        let span = word.span.clone();
+        let node = self.word(word)?;
+        let sig = self.sig_of(&node, &span)?;
+        Ok(SigNode::new(sig, node))
+    }
+    fn check_depth(&mut self, span: &CodeSpan) -> UiuaResult {
+        const MAX_RECURSION_DEPTH: usize =
+            match (cfg!(target_arch = "wasm32"), cfg!(debug_assertions)) {
+                (false, false) => (512 + 256 + 64) * 1024 * 2,
+                (false, true) => (512 + 256 + 64) * 1024,
+                (true, false) => 512 * 1024,
+                (true, true) => 512 * 1024,
+            };
+        let start_addr = *self.start_addrs.first().unwrap();
+        let curr = 0u8;
+        let curr_addr = &curr as *const u8 as usize;
+        let diff = curr_addr.abs_diff(start_addr);
+        if diff > MAX_RECURSION_DEPTH {
+            return Err(self.error(span.clone(), "Compilation recursion limit reached"));
         }
         Ok(())
     }
-    /// Push an instruction to the current function being compiled
-    ///
-    /// Also performs some optimizations if the instruction and the previous
-    /// instruction form some known pattern
-    fn push_instr(&mut self, instr: Instr) {
-        let instrs = self.new_functions.last_mut().unwrap();
-        optimize_instrs_mut(instrs, instr, false, &self.asm);
-    }
-    fn push_all_instrs(&mut self, instrs: impl IntoIterator<Item = Instr>) {
-        for instr in instrs {
-            self.push_instr(instr);
-        }
-    }
-    fn word(&mut self, word: Sp<Word>, call: bool) -> UiuaResult {
-        match word.value {
-            Word::Number(_, n) => {
-                if call {
-                    self.push_instr(Instr::push(n));
-                } else {
-                    let f = self.make_function(
-                        FunctionId::Anonymous(word.span.clone()),
-                        Signature::new(0, 1),
-                        vec![Instr::push(n)],
-                    );
-                    self.push_instr(Instr::PushFunc(f))
-                }
+    fn word(&mut self, word: Sp<Word>) -> UiuaResult<Node> {
+        self.check_depth(&word.span)?;
+        Ok(match word.value {
+            Word::Number(Ok(n)) => Node::new_push(n),
+            Word::Number(Err(s)) => {
+                self.add_error(word.span.clone(), format!("Invalid number `{s}`"));
+                Node::new_push(0.0)
             }
             Word::Char(c) => {
                 let val: Value = if c.chars().count() == 1 {
@@ -865,73 +1234,26 @@ code:
                 } else {
                     c.into()
                 };
-                if call {
-                    self.push_instr(Instr::push(val));
-                } else {
-                    let f = self.make_function(
-                        FunctionId::Anonymous(word.span.clone()),
-                        Signature::new(0, 1),
-                        vec![Instr::push(val)],
-                    );
-                    self.push_instr(Instr::PushFunc(f))
-                }
+                Node::new_push(val)
             }
-            Word::String(s) | Word::MultilineString(s) => {
-                if call {
-                    self.push_instr(Instr::push(s));
-                } else {
-                    let f = self.make_function(
-                        FunctionId::Anonymous(word.span.clone()),
-                        Signature::new(0, 1),
-                        vec![Instr::push(s)],
-                    );
-                    self.push_instr(Instr::PushFunc(f));
+            Word::String(s) => Node::new_push(s),
+            Word::MultilineString(lines) => {
+                let mut s = EcoVec::new();
+                for (i, line) in lines.into_iter().enumerate() {
+                    if i > 0 {
+                        s.push('\n');
+                    }
+                    s.extend(line.value.chars());
                 }
+                Node::new_push(s)
             }
-            Word::Label(label) => {
-                if !self.scope.experimental {
-                    self.add_error(
-                        word.span.clone(),
-                        "Labels are experimental. To use them, add \
-                        `# Experimental!` to the top of the file.",
-                    );
-                }
-                let instr = Instr::Label {
-                    label: label.into(),
-                    span: self.add_span(word.span.clone()),
-                };
-                if call {
-                    self.push_instr(instr);
-                } else {
-                    let f = self.make_function(
-                        FunctionId::Anonymous(word.span),
-                        Signature::new(1, 1),
-                        vec![instr],
-                    );
-                    self.push_instr(Instr::PushFunc(f));
-                }
-            }
+            Word::Label(label) => Node::Label(label.into(), self.add_span(word.span.clone())),
             Word::FormatString(frags) => {
-                let signature = Signature::new(frags.len() - 1, 1);
                 let parts = frags.into_iter().map(Into::into).collect();
                 let span = self.add_span(word.span.clone());
-                let instr = Instr::Format { parts, span };
-                if call {
-                    self.push_instr(instr)
-                } else {
-                    let f = self.make_function(
-                        FunctionId::Anonymous(word.span),
-                        signature,
-                        vec![instr],
-                    );
-                    self.push_instr(Instr::PushFunc(f));
-                }
+                Node::Format(parts, span)
             }
             Word::MultilineFormatString(lines) => {
-                let signature = Signature::new(
-                    lines.iter().map(|l| l.value.len().saturating_sub(1)).sum(),
-                    1,
-                );
                 let span = self.add_span(word.span.clone());
                 let mut curr_part = EcoString::new();
                 let mut parts = EcoVec::new();
@@ -947,20 +1269,10 @@ code:
                     }
                 }
                 parts.push(curr_part);
-                let instr = Instr::Format { parts, span };
-                if call {
-                    self.push_instr(instr)
-                } else {
-                    let f = self.make_function(
-                        FunctionId::Anonymous(word.span),
-                        signature,
-                        vec![instr],
-                    );
-                    self.push_instr(Instr::PushFunc(f));
-                }
+                Node::Format(parts, span)
             }
-            Word::Ref(r) => self.reference(r, call)?,
-            Word::IncompleteRef { path, in_macro_arg } => {
+            Word::Ref(r) => self.reference(r)?,
+            Word::IncompleteRef { path, in_macro_arg } => 'blk: {
                 if let Some((_, locals)) = self.ref_path(&path, in_macro_arg)? {
                     self.add_error(
                         path.last().unwrap().tilde_span.clone(),
@@ -970,48 +1282,59 @@ code:
                         self.validate_local(&comp.module.value, *local, &comp.module.span);
                         self.code_meta
                             .global_references
-                            .insert(comp.module, local.index);
+                            .insert(comp.module.span, local.index);
                     }
-                    self.code_meta
-                        .incomplete_refs
-                        .insert(word.span.clone(), locals.last().unwrap().index);
+                    let index = locals.last().unwrap().index;
+                    let names = match &self.asm.bindings[index].kind {
+                        BindingKind::Import(path) => &self.imports[path].names,
+                        BindingKind::Module(module) => &module.names,
+                        _ => break 'blk Node::empty(),
+                    };
+                    let mut completions = Vec::new();
+                    for (name, local) in names {
+                        if !local.public {
+                            continue;
+                        }
+                        completions.push(Completion {
+                            text: name.into(),
+                            index: local.index,
+                            replace: false,
+                        });
+                    }
+                    if !completions.is_empty() {
+                        self.code_meta
+                            .completions
+                            .insert(word.span.clone(), completions);
+                    }
                 }
+                Node::empty()
             }
             Word::Strand(items) => {
                 // Track span for LSP
                 let just_spans: Vec<_> = items.iter().map(|w| w.span.clone()).collect();
                 // Compile individual items
-                let op_instrs = items
+                let op_nodes = items
                     .into_iter()
                     .rev()
-                    .map(|word| self.compile_operand_word(word))
+                    .map(|word| self.word_sig(word))
                     .collect::<UiuaResult<Vec<_>>>()?;
                 // Check item sigs
-                let has_functions = op_instrs.iter().any(|(_, sig)| sig.args > 0);
+                let has_functions = op_nodes.iter().any(|sn| sn.sig.args() > 0);
                 if has_functions {
-                    return Err(self.fatal_error(
-                        word.span.clone(),
-                        "Functions are not allowed in strands. \n\
-                        You can use the ‿ character (which formats from __) \
-                        to make a function strand.",
-                    ));
+                    return Err(
+                        self.error(word.span.clone(), "Functions are not allowed in strands")
+                    );
                 }
                 self.code_meta.strands.insert(word.span.clone(), just_spans);
                 // Flatten instrs
-                let inner: Vec<Instr> = op_instrs
-                    .into_iter()
-                    .flat_map(|(instrs, _)| instrs)
-                    .collect();
+                let inner = Node::from_iter(op_nodes.into_iter().map(|sn| sn.node));
 
                 // Normal strand
-                if !call {
-                    self.new_functions.push(EcoVec::new());
-                }
-                self.push_instr(Instr::BeginArray);
+
                 // Diagnostic for strand of characters
                 if !inner.is_empty()
                     && inner.iter().all(
-                        |instr| matches!(instr, Instr::Push(Value::Char(arr)) if arr.rank() == 0),
+                        |instr| matches!(instr, Node::Push(Value::Char(arr)) if arr.rank() == 0),
                     )
                 {
                     self.emit_diagnostic(
@@ -1021,92 +1344,95 @@ code:
                     );
                 }
 
-                let span_index = self.add_span(word.span.clone());
-                let instrs = self.new_functions.last_mut().unwrap();
+                let span = self.add_span(word.span.clone());
                 // Inline constant arrays
-                if call && inner.iter().all(|instr| matches!(instr, Instr::Push(_))) {
-                    let values = inner.iter().rev().map(|instr| match instr {
-                        Instr::Push(v) => v.clone(),
-                        _ => unreachable!(),
-                    });
+                if inner.iter().all(|instr| matches!(instr, Node::Push(_))) {
+                    let values: Vec<_> = inner
+                        .iter()
+                        .rev()
+                        .map(|instr| match instr {
+                            Node::Push(v) => v.clone(),
+                            _ => unreachable!(),
+                        })
+                        .collect();
                     match Value::from_row_values(values, &(&word.span, &self.asm.inputs)) {
-                        Ok(val) => {
-                            instrs.pop();
-                            self.push_instr(Instr::push(val));
-                            return Ok(());
-                        }
-                        Err(e) if e.is_fill() => {}
+                        Ok(val) => return Ok(Node::new_push(val)),
+                        Err(e) if e.is_fill => {}
                         Err(e) => return Err(e),
                     }
                 }
-                // Normal case
-                instrs.extend(inner);
-                self.push_instr(Instr::EndArray {
-                    span: span_index,
+                let sig = self.sig_of(&inner, &word.span)?;
+                Node::Array {
+                    len: sig.outputs(),
+                    inner: inner.into(),
                     boxed: false,
-                });
-                if !call {
-                    let instrs = self.new_functions.pop().unwrap();
-                    let sig = instrs_signature(&instrs).unwrap();
-                    let func = self.make_function(FunctionId::Anonymous(word.span), sig, instrs);
-                    self.push_instr(Instr::PushFunc(func));
+                    allow_ext: false,
+                    prim: None,
+                    span,
                 }
             }
             Word::Array(arr) => {
+                if let Some(down_span) = &arr.down_span {
+                    self.experimental_error(down_span, || {
+                        "Lexical ordering is experimental. To use it, \
+                        add `# Experimental!` to the top of the file."
+                    });
+                }
                 // Track span for LSP
                 if !arr.boxes
-                    && (arr.lines.iter().flatten())
+                    && (arr.word_lines().flatten())
                         .filter(|w| w.value.is_code())
                         .all(|w| w.value.is_literal() && !matches!(w.value, Word::Strand(_)))
                 {
-                    let just_spans: Vec<_> = (arr.lines.iter().rev().flatten())
+                    let just_spans: Vec<_> = (arr.word_lines().rev().flatten())
                         .filter(|w| w.value.is_code())
                         .map(|w| w.span.clone())
                         .collect();
-                    self.code_meta.arrays.insert(word.span.clone(), just_spans);
+                    self.code_meta
+                        .array_inner_spans
+                        .insert(word.span.clone(), just_spans);
                 }
-
-                if !call {
-                    self.new_functions.push(EcoVec::new());
-                }
-                self.push_instr(Instr::BeginArray);
-                let mut inner = Vec::new();
                 let line_count = arr.lines.len();
-                for lines in arr.lines.into_iter().rev() {
-                    inner.extend(self.compile_words(lines, true)?);
+                let any_contents = arr.word_lines().flatten().any(|w| w.value.is_code());
+                // Compile lines
+                let (mut word_lines, item_lines): (Vec<_>, Vec<_>) = arr
+                    .lines
+                    .into_iter()
+                    .partition(|item| matches!(item, Item::Words(_)));
+                if arr.down_span.is_none() {
+                    word_lines.reverse();
                 }
-                // Validate inner loop correctness
-                if let Err(e) = instrs_signature(&inner) {
-                    let sig = (0..=inner.len())
-                        .find_map(|i| instrs_signature(&inner[i..]).ok())
-                        .unwrap();
-                    match e.kind {
-                        SigCheckErrorKind::LoopExcess if sig.args > 0 => self.emit_diagnostic(
-                            format!(
-                                "This array contains a loop that has a variable \
-                                number of outputs. The code after the loop has \
-                                signature {sig}, which may result in a variable \
-                                number of values being pulled into the array."
-                            ),
-                            DiagnosticKind::Warning,
-                            word.span.clone(),
-                        ),
-                        SigCheckErrorKind::LoopOverreach => self.emit_diagnostic(
-                            "This array contains a loop that has a variable \
-                            number of inputs. This may result in a variable \
-                            number of values being pulled into the array.",
-                            DiagnosticKind::Warning,
-                            word.span.clone(),
-                        ),
-                        _ => {}
+                let root_start = self.asm.root.len();
+                self.in_scope(ScopeKind::Function, |comp| {
+                    comp.items(item_lines, ItemCompMode::Function)?;
+                    comp.items(word_lines, ItemCompMode::Function)
+                })?;
+                let inner = self.asm.root.split_off(root_start);
+                // Calculate length
+                let len = match inner.sig() {
+                    Ok(sig) => {
+                        if sig.outputs() == 0 && any_contents {
+                            self.emit_diagnostic(
+                                "Array wraps function with no outputs. This is probably not what you want.",
+                                DiagnosticKind::Advice,
+                                word.span.clone(),
+                            )
+                        }
+                        sig.outputs()
                     }
-                }
+                    Err(e) => {
+                        return Err(self.error(
+                            word.span.clone(),
+                            format!("Cannot infer array signature: {e}"),
+                        ))
+                    }
+                };
                 // Diagnostic for array of characters
                 if line_count <= 1
                     && !arr.boxes
                     && !inner.is_empty()
                     && inner.iter().all(
-                        |instr| matches!(instr, Instr::Push(Value::Char(arr)) if arr.rank() == 0),
+                        |instr| matches!(instr, Node::Push(Value::Char(arr)) if arr.rank() == 0),
                     )
                 {
                     self.emit_diagnostic(
@@ -1116,12 +1442,11 @@ code:
                     );
                 }
                 let span = self.add_span(word.span.clone());
-                let instrs = self.new_functions.last_mut().unwrap();
                 // Inline constant arrays
-                if call && inner.iter().all(|instr| matches!(instr, Instr::Push(_))) {
+                if inner.iter().all(|instr| matches!(instr, Node::Push(_))) {
                     let empty = inner.is_empty();
                     let values = inner.iter().rev().map(|instr| match instr {
-                        Instr::Push(v) => v.clone(),
+                        Node::Push(v) => v.clone(),
                         _ => unreachable!(),
                     });
                     let res = if arr.boxes {
@@ -1129,137 +1454,182 @@ code:
                             Ok(Array::<Boxed>::default().into())
                         } else {
                             Value::from_row_values(
-                                values.map(|v| Value::Box(Boxed(v).into())),
+                                values
+                                    .map(|v| Value::Box(Boxed(v).into()))
+                                    .collect::<Vec<_>>(),
                                 &(&word.span, &self.asm.inputs),
                             )
                         }
                     } else {
-                        Value::from_row_values(values, &(&word.span, &self.asm.inputs))
+                        Value::from_row_values(
+                            values.collect::<Vec<_>>(),
+                            &(&word.span, &self.asm.inputs),
+                        )
                     };
                     match res {
                         Ok(val) => {
-                            instrs.pop();
-                            self.push_instr(Instr::push(val));
-                            return Ok(());
+                            self.code_meta
+                                .array_shapes
+                                .insert(word.span.clone(), val.shape.clone());
+                            return Ok(Node::new_push(val));
                         }
-                        Err(e) if e.is_fill() => {}
+                        Err(e) if e.is_fill => {}
                         Err(e) => return Err(e),
                     }
                 }
                 // Normal case
-                instrs.extend(inner);
-                self.push_instr(Instr::EndArray {
-                    span,
+                Node::Array {
+                    len,
+                    inner: inner.into(),
                     boxed: arr.boxes,
-                });
-                if !call {
-                    let instrs = self.new_functions.pop().unwrap();
-                    let sig = instrs_signature(&instrs).unwrap_or(Signature::new(0, 0));
-                    let func = self.make_function(FunctionId::Anonymous(word.span), sig, instrs);
-                    self.push_instr(Instr::PushFunc(func));
+                    allow_ext: false,
+                    prim: None,
+                    span,
                 }
             }
-            Word::Undertied(words) => {
-                if words.len() > 2 {
-                    self.add_error(
-                        word.span.clone(),
-                        "Function strands cannot contain more than two items",
-                    );
-                }
-                if !self.scope.experimental && !self.experimental_function_strand_error {
-                    self.experimental_function_strand_error = true;
-                    self.add_error(
-                        word.span.clone(),
-                        "Function strands are experimental. To use them, add \
-                        `# Experimental!` to the top of the file.",
-                    );
-                }
-                let instrs = self.compile_words(words, true)?;
-                if call {
-                    self.push_all_instrs(instrs);
-                } else {
-                    match instrs_signature(&instrs) {
-                        Ok(sig) => {
-                            let func =
-                                self.make_function(FunctionId::Anonymous(word.span), sig, instrs);
-                            self.push_instr(Instr::PushFunc(func));
-                        }
-                        Err(e) => {
-                            return Err(self.fatal_error(
-                                word.span,
-                                format!(
-                                    "Cannot infer function signature: {e}{}",
-                                    if e.kind == SigCheckErrorKind::Ambiguous {
-                                        ". A signature can be declared after the opening `(`."
-                                    } else {
-                                        ""
-                                    }
-                                ),
-                            ));
-                        }
-                    }
-                }
-            }
-            Word::Func(func) => self.func(func, word.span, call)?,
-            Word::Switch(sw) => self.switch(sw, word.span, call)?,
-            Word::Primitive(p) => self.primitive(p, word.span, call)?,
-            Word::SemicolonPop => {
-                self.emit_diagnostic(
-                    format!(
-                        "Using `;` for {} is deprecated and will be \
-                        removed in the future. Type `pop` or `po` instead.",
-                        Primitive::Pop.format()
-                    ),
-                    DiagnosticKind::Warning,
+            Word::Func(func) => self.func(func, word.span)?,
+            Word::Pack(pack) => {
+                self.add_error(
                     word.span.clone(),
+                    "Function packs are not allowed without a modifier",
                 );
-                self.primitive(Primitive::Pop, word.span, call)?
+                if let Some(first) = pack.into_lexical_order().next() {
+                    self.func(first.value, first.span)?
+                } else {
+                    Node::empty()
+                }
             }
-            Word::Modified(m) => self.modified(*m, call)?,
+            Word::Primitive(p) => self.primitive(p, word.span),
+            Word::Modified(m) => self.modified(*m, None)?,
             Word::Placeholder(_) => {
                 // We could error here, but it's easier to handle it higher up
+                Node::empty()
             }
-            Word::SemanticComment(sc) => match sc {
-                SemanticComment::Experimental => self.scope.experimental = true,
-                SemanticComment::NoInline => {
-                    if call {
-                        self.push_instr(Instr::NoInline);
-                    } else {
-                        let f = self.make_function(
-                            FunctionId::Anonymous(word.span.clone()),
-                            Signature::new(0, 0),
-                            vec![Instr::NoInline],
-                        );
-                        self.push_instr(Instr::PushFunc(f));
-                    }
-                }
-                SemanticComment::Boo => {
-                    self.add_error(word.span.clone(), "The compiler is scared!")
-                }
-            },
-            Word::OutputComment { i, n } => self.push_instr(Instr::SetOutputComment { i, n }),
-            Word::Comment(_) | Word::Spaces | Word::BreakLine | Word::UnbreakLine => {}
-        }
-        Ok(())
+            Word::SemanticComment(_) => {
+                // Semantic comments are handled higher up
+                Node::empty()
+            }
+            Word::OutputComment { i, n } => Node::SetOutputComment { i, n },
+            Word::Subscripted(sub) => self.subscript(*sub, word.span)?,
+            Word::Comment(_) | Word::Spaces | Word::BreakLine | Word::FlipLine => Node::empty(),
+            Word::InlineMacro(_) => {
+                self.add_error(
+                    word.span.clone(),
+                    "Inline macro was not parsed as a modifier.\
+                    This is a bug in the interpreter",
+                );
+                Node::empty()
+            }
+        })
     }
-    fn ref_local(&self, r: &Ref) -> UiuaResult<(Vec<LocalName>, LocalName)> {
-        if let Some((module, path_locals)) = self.ref_path(&r.path, r.in_macro_arg)? {
-            if let Some(local) = self.imports[&module].names.get(&r.name.value).copied() {
-                Ok((path_locals, local))
-            } else {
-                Err(self.fatal_error(
-                    r.name.span.clone(),
+    fn force_sig(&mut self, mut node: Node, new_sig: Signature, span: &CodeSpan) -> Node {
+        let Ok(sig) = node.sig() else {
+            return node;
+        };
+        if new_sig == sig {
+            return node;
+        }
+        let delta = sig.outputs() as isize - sig.args() as isize;
+        let new_delta = new_sig.outputs() as isize - new_sig.args() as isize;
+        match delta.cmp(&new_delta) {
+            Ordering::Equal => {
+                if sig.args() < new_sig.args() {
+                    let spandex = self.add_span(span.clone());
+                    let mut dip = Node::empty();
+                    for _ in 0..new_sig.args() {
+                        dip = Node::Mod(Primitive::Dip, eco_vec![dip.sig_node().unwrap()], spandex);
+                    }
+                    node.prepend(dip);
+                }
+                self.emit_diagnostic(
+                    format!("Signature mismatch: declared {new_sig} but inferred {sig}"),
+                    DiagnosticKind::Warning,
+                    span.clone(),
+                );
+            }
+            Ordering::Less => {
+                let diff = (new_delta - delta).unsigned_abs();
+                let spandex = self.add_span(span.clone());
+                let mut extra = Node::from_iter(
+                    (0..diff).map(|i| Node::new_push(Boxed(Value::from(format!("dbg-{}", i + 1))))),
+                );
+                for _ in 0..sig.outputs() {
+                    extra = Node::Mod(Primitive::Dip, eco_vec![extra.sig_node().unwrap()], spandex);
+                }
+                node.push(extra);
+                self.emit_diagnostic(
                     format!(
-                        "Item `{}` not found in module `{}`",
-                        r.name.value,
-                        module.display()
+                        "Signature mismatch: declared {new_sig} but inferred {sig}. \
+                        {diff} debug output{} will be generated.",
+                        if diff == 1 { "" } else { "s" }
                     ),
+                    DiagnosticKind::Warning,
+                    span.clone(),
+                );
+            }
+            Ordering::Greater => {
+                let diff = (delta - new_delta).unsigned_abs();
+                let spandex = self.add_span(span.clone());
+                let mut pops =
+                    Node::from_iter((0..diff).map(|_| Node::Prim(Primitive::Pop, spandex)));
+                for _ in 0..new_sig.outputs() {
+                    pops = Node::Mod(Primitive::Dip, eco_vec![pops.sig_node().unwrap()], spandex);
+                }
+                node.push(pops);
+                self.emit_diagnostic(
+                    format!(
+                        "Signature mismatch: declared {new_sig} but inferred {sig}. \
+                        Additional arguments will be popped."
+                    ),
+                    DiagnosticKind::Warning,
+                    span.clone(),
+                );
+            }
+        }
+        node
+    }
+    #[must_use]
+    fn semantic_comment(&mut self, comment: SemanticComment, span: CodeSpan, inner: Node) -> Node {
+        match comment {
+            SemanticComment::Experimental => {
+                self.scope.experimental = true;
+                inner
+            }
+            SemanticComment::NoInline => Node::NoInline(inner.into()),
+            SemanticComment::TrackCaller => Node::TrackCaller(inner.into()),
+            SemanticComment::External => inner,
+            SemanticComment::Deprecated(_) => inner,
+            SemanticComment::Boo => {
+                self.add_error(span, "The compiler is scared!");
+                inner
+            }
+        }
+    }
+    /// Find the [`LocalName`]s of both the name and all parts of the path of a [`Ref`]
+    ///
+    /// Returns [`None`] if the reference is to a constant
+    fn ref_local(&self, r: &Ref) -> UiuaResult<Option<(Vec<LocalName>, LocalName)>> {
+        if let Some((names, path_locals)) = self.ref_path(&r.path, r.in_macro_arg)? {
+            if let Some(local) = names.get(&r.name.value).copied().or_else(|| {
+                (r.name.value.strip_suffix('!')).and_then(|name| {
+                    names.get(name).copied().filter(|local| {
+                        matches!(&self.asm.bindings[local.index].kind, BindingKind::Module(_))
+                    })
+                })
+            }) {
+                Ok(Some((path_locals, local)))
+            } else {
+                Err(self.error(
+                    r.name.span.clone(),
+                    format!("Item `{}` not found", r.name.value),
                 ))
             }
         } else if let Some(local) = self.find_name(&r.name.value, r.in_macro_arg) {
-            Ok((Vec::new(), local))
+            Ok(Some((Vec::new(), local)))
+        } else if r.path.is_empty() && CONSTANTS.iter().any(|def| def.name == r.name.value) {
+            Ok(None)
         } else {
-            Err(self.fatal_error(
+            Err(self.error(
                 r.name.span.clone(),
                 format!("Unknown identifier `{}`", r.name.value),
             ))
@@ -1273,8 +1643,8 @@ code:
         }
         let mut hit_file = false;
         for scope in self.higher_scopes.iter().rev() {
-            if scope.kind == ScopeKind::File {
-                if hit_file || self.scope.kind == ScopeKind::File {
+            if matches!(scope.kind, ScopeKind::File(_)) {
+                if hit_file {
                     break;
                 }
                 hit_file = true;
@@ -1283,13 +1653,22 @@ code:
                 return Some(local);
             }
         }
-        None
+        // Attempt to look up the identifier as a non-macro
+        let as_non_macro = self.find_name(name.strip_suffix('!')?, skip_local)?;
+        if let BindingKind::Module(_) | BindingKind::Import(_) =
+            self.asm.bindings[as_non_macro.index].kind
+        {
+            // Only allow it if it is a module
+            Some(as_non_macro)
+        } else {
+            None
+        }
     }
     fn ref_path(
         &self,
         path: &[RefComponent],
         skip_local: bool,
-    ) -> UiuaResult<Option<(PathBuf, Vec<LocalName>)>> {
+    ) -> UiuaResult<Option<(&LocalNames, Vec<LocalName>)>> {
         let Some(first) = path.first() else {
             return Ok(None);
         };
@@ -1297,362 +1676,369 @@ code:
         let module_local = self
             .find_name(&first.module.value, skip_local)
             .ok_or_else(|| {
-                self.fatal_error(
+                self.error(
                     first.module.span.clone(),
                     format!("Unknown import `{}`", first.module.value),
                 )
             })?;
         path_locals.push(module_local);
         let global = &self.asm.bindings[module_local.index].kind;
-        let mut module = match global {
-            BindingKind::Module(module) => module,
+        let mut names = match global {
+            BindingKind::Import(path) => &self.imports[path].names,
+            BindingKind::Module(module) => &module.names,
+            BindingKind::Scope(i) => &self.higher_scopes.get(*i).unwrap_or(&self.scope).names,
             BindingKind::Func(_) => {
-                return Err(self.fatal_error(
+                return Err(self.error(
                     first.module.span.clone(),
                     format!("`{}` is a function, not a module", first.module.value),
                 ))
             }
             BindingKind::Const(_) => {
-                return Err(self.fatal_error(
+                return Err(self.error(
                     first.module.span.clone(),
                     format!("`{}` is a constant, not a module", first.module.value),
                 ))
             }
-            BindingKind::Macro => {
-                return Err(self.fatal_error(
+            BindingKind::IndexMacro(_) => {
+                return Err(self.error(
                     first.module.span.clone(),
-                    format!("`{}` is a modifier, not a module", first.module.value),
+                    format!("`{}` is an index macro, not a module", first.module.value),
                 ))
             }
+            BindingKind::CodeMacro(_) => {
+                return Err(self.error(
+                    first.module.span.clone(),
+                    format!("`{}` is a code macro, not a module", first.module.value),
+                ))
+            }
+            BindingKind::Error => return Ok(None),
         };
         for comp in path.iter().skip(1) {
-            let submod_local = self.imports[module]
-                .names
-                .get(&comp.module.value)
-                .copied()
-                .ok_or_else(|| {
-                    self.fatal_error(
-                        comp.module.span.clone(),
-                        format!(
-                            "Module `{}` not found in module `{}`",
-                            comp.module.value,
-                            module.display()
-                        ),
-                    )
-                })?;
+            let submod_local = names.get(&comp.module.value).copied().ok_or_else(|| {
+                self.error(
+                    comp.module.span.clone(),
+                    format!("Module `{}` not found", comp.module.value),
+                )
+            })?;
             path_locals.push(submod_local);
             let global = &self.asm.bindings[submod_local.index].kind;
-            module = match global {
-                BindingKind::Module(module) => module,
+            names = match global {
+                BindingKind::Import(path) => &self.imports[path].names,
+                BindingKind::Module(module) => &module.names,
+                BindingKind::Scope(i) => &self.higher_scopes.get(*i).unwrap_or(&self.scope).names,
                 BindingKind::Func(_) => {
-                    return Err(self.fatal_error(
+                    return Err(self.error(
                         comp.module.span.clone(),
                         format!("`{}` is a function, not a module", comp.module.value),
                     ))
                 }
                 BindingKind::Const(_) => {
-                    return Err(self.fatal_error(
+                    return Err(self.error(
                         comp.module.span.clone(),
                         format!("`{}` is a constant, not a module", comp.module.value),
                     ))
                 }
-                BindingKind::Macro => {
-                    return Err(self.fatal_error(
+                BindingKind::IndexMacro(_) => {
+                    return Err(self.error(
                         comp.module.span.clone(),
-                        format!("`{}` is a modifier, not a module", comp.module.value),
+                        format!("`{}` is an index macro, not a module", comp.module.value),
                     ))
                 }
+                BindingKind::CodeMacro(_) => {
+                    return Err(self.error(
+                        comp.module.span.clone(),
+                        format!("`{}` is a code macro, not a module", comp.module.value),
+                    ))
+                }
+                BindingKind::Error => return Ok(None),
             };
         }
 
-        Ok(Some((module.clone(), path_locals)))
+        Ok(Some((names, path_locals)))
     }
-    fn reference(&mut self, r: Ref, call: bool) -> UiuaResult {
+    fn reference(&mut self, r: Ref) -> UiuaResult<Node> {
         if r.path.is_empty() {
-            self.ident(r.name.value, r.name.span, call, r.in_macro_arg)
-        } else {
-            let (path_locals, local) = self.ref_local(&r)?;
+            self.ident(r.name.value, r.name.span, r.in_macro_arg)
+        } else if let Some((path_locals, local)) = self.ref_local(&r)? {
             self.validate_local(&r.name.value, local, &r.name.span);
             for (local, comp) in path_locals.into_iter().zip(&r.path) {
                 self.validate_local(&comp.module.value, local, &comp.module.span);
-                (self.code_meta.global_references).insert(comp.module.clone(), local.index);
+                (self.code_meta.global_references).insert(comp.module.span.clone(), local.index);
             }
             self.code_meta
                 .global_references
-                .insert(r.name.clone(), local.index);
-            self.global_index(local.index, r.name.span, call);
-            Ok(())
+                .insert(r.name.span.clone(), local.index);
+            Ok(self.global_index(local.index, false, r.name.span))
+        } else {
+            self.ident(r.name.value, r.name.span, r.in_macro_arg)
         }
     }
-    fn ident(&mut self, ident: Ident, span: CodeSpan, call: bool, skip_local: bool) -> UiuaResult {
-        if let Some(curr) = (self.current_binding.as_mut()).filter(|curr| curr.name == ident) {
+    fn completions(&self, prefix: &str, names: &LocalNames, public_only: bool) -> Vec<Completion> {
+        let mut completions = Vec::new();
+        for (name, local) in names {
+            if public_only && !local.public {
+                continue;
+            }
+            if name.starts_with(prefix) {
+                completions.push(Completion {
+                    text: name.into(),
+                    index: local.index,
+                    replace: true,
+                });
+            }
+            let subnames = match &self.asm.bindings[local.index].kind {
+                BindingKind::Module(m) => &m.names,
+                BindingKind::Import(path) => &self.imports[path].names,
+                _ => continue,
+            };
+            let subcompletions = self.completions(prefix, subnames, true);
+            completions.extend(subcompletions.into_iter().map(|c| Completion {
+                text: format!("{name}~{}", c.text),
+                ..c
+            }));
+        }
+        completions
+    }
+    fn ident(&mut self, ident: Ident, span: CodeSpan, skip_local: bool) -> UiuaResult<Node> {
+        // Add completions
+        let completions = self.completions(&ident, &self.scope.names, false);
+        if !completions.is_empty() {
+            self.code_meta.completions.insert(span.clone(), completions);
+        }
+
+        if let Some(curr) = (self.current_bindings.last_mut()).filter(|curr| curr.name == ident) {
             // Name is a recursive call
             let Some(sig) = curr.signature else {
-                return Err(self.fatal_error(
+                return Err(self.error(
                     span,
                     format!(
                         "Recursive function `{ident}` must have a \
-                        signature declared after the `←`."
+                        signature declared after the ←."
                     ),
                 ));
             };
-            curr.referenced = true;
-            (self.code_meta.global_references).insert(span.clone().sp(ident), curr.global_index);
-            let instr = Instr::Prim(Primitive::Recur, self.add_span(span.clone()));
-            if call {
-                self.push_all_instrs([Instr::PushSig(sig), instr, Instr::PopSig]);
-            } else {
-                let f = self.make_function(FunctionId::Anonymous(span), sig, [instr]);
-                self.push_instr(Instr::PushFunc(f));
-            }
-        } else if !self.scope.bind_locals.is_empty()
-            && ident.chars().all(|c| c.is_ascii_lowercase())
-        {
-            // Name is a local variable
-            let span = self.add_span(span);
-            for c in ident.chars().rev() {
-                let index = c as usize - 'a' as usize;
-                self.scope.bind_locals.last_mut().unwrap().insert(index);
-                self.push_instr(Instr::GetLocal { index, span });
-            }
+            curr.recurses += 1;
+            (self.code_meta.global_references).insert(span.clone(), curr.global_index);
+            Ok(Node::CallGlobal(curr.global_index, sig))
         } else if let Some(local) = self.find_name(&ident, skip_local) {
             // Name exists in scope
-            (self.code_meta.global_references).insert(span.clone().sp(ident), local.index);
-            self.global_index(local.index, span, call);
+            self.validate_local(&ident, local, &span);
+            (self.code_meta.global_references).insert(span.clone(), local.index);
+            Ok(self.global_index(local.index, true, span))
         } else if let Some(constant) = CONSTANTS.iter().find(|c| c.name == ident) {
             // Name is a built-in constant
-            let instr = Instr::push(constant.value.clone());
+            if let Some(suggestion) = constant.deprecation {
+                if self.deprecated_const_errors.insert(constant.name) {
+                    let suggestion = if suggestion.is_empty() {
+                        String::new()
+                    } else {
+                        format!(". {suggestion}")
+                    };
+                    let message = format!(
+                        "{} is deprecated and will be removed in a future version{}",
+                        constant.name, suggestion
+                    );
+                    self.emit_diagnostic(message, DiagnosticKind::Warning, span.clone());
+                }
+            }
             self.code_meta
                 .constant_references
                 .insert(span.clone().sp(ident));
-            if call {
-                self.push_instr(instr);
-            } else {
-                let f = self.make_function(
-                    FunctionId::Anonymous(span),
-                    Signature::new(0, 1),
-                    vec![instr],
-                );
-                self.push_instr(Instr::PushFunc(f));
-            }
+            Ok(Node::Push(
+                constant
+                    .value
+                    .resolve(self.scope_file_path(), &*self.backend()),
+            ))
         } else {
-            return Err(self.fatal_error(span, format!("Unknown identifier `{ident}`")));
+            Err(self.error(span, format!("Unknown identifier `{ident}`")))
         }
-        Ok(())
     }
-    fn global_index(&mut self, index: usize, span: CodeSpan, call: bool) {
-        let global = self.asm.bindings[index].kind.clone();
-        match global {
-            BindingKind::Const(Some(val)) if call => self.push_instr(Instr::push(val)),
-            BindingKind::Const(Some(val)) => {
-                let f = self.make_function(
-                    FunctionId::Anonymous(span),
-                    Signature::new(0, 1),
-                    vec![Instr::push(val)],
-                );
-                self.push_instr(Instr::PushFunc(f));
+    fn scope_file_path(&self) -> Option<&Path> {
+        for scope in self.scopes() {
+            if let Some(file_path) = &scope.file_path {
+                return Some(file_path);
             }
-            BindingKind::Const(None) if call => self.push_instr(Instr::CallGlobal { index, call }),
-            BindingKind::Const(None) => {
-                let f = self.make_function(
-                    FunctionId::Anonymous(span),
-                    Signature::new(0, 1),
-                    vec![Instr::CallGlobal { index, call }],
-                );
-                self.push_instr(Instr::PushFunc(f));
-            }
-            BindingKind::Func(f) if self.inlinable(f.instrs(self)) => {
-                if call {
-                    // Inline instructions
-                    self.push_instr(Instr::PushSig(f.signature()));
-                    let instrs = f.instrs(self).to_vec();
-                    self.push_all_instrs(instrs);
-                    self.push_instr(Instr::PopSig);
-                } else {
-                    self.push_instr(Instr::PushFunc(f));
-                }
-            }
+        }
+        None
+    }
+    fn global_index(&mut self, index: usize, single_ident: bool, span: CodeSpan) -> Node {
+        let binfo = &mut self.asm.bindings.make_mut()[index];
+        binfo.used = true;
+        let bkind = binfo.kind.clone();
+        match bkind {
+            BindingKind::Const(Some(val)) => Node::new_push(val),
+            BindingKind::Const(None) => Node::CallGlobal(index, Signature::new(0, 1)),
             BindingKind::Func(f) => {
-                self.push_instr(Instr::PushFunc(f));
-                if call {
-                    let span = self.add_span(span);
-                    self.push_instr(Instr::Call(span));
-                }
-            }
-            BindingKind::Module { .. } => self.add_error(span, "Cannot import module item here."),
-            BindingKind::Macro => {
-                // We could error here, but it's easier to handle it higher up
-            }
-        }
-    }
-    fn func(&mut self, func: Func, span: CodeSpan, call: bool) -> UiuaResult {
-        if (func.lines.iter().flatten().filter(|w| w.value.is_code())).count() == 1 {
-            // Inline single ident
-            if let Some(
-                word @ Sp {
-                    value: Word::Ref(_),
-                    ..
-                },
-            ) = func.lines.iter().flatten().find(|w| w.value.is_code())
-            {
-                return self.word(word.clone(), call);
-            }
-        }
-
-        if call {
-            let (_, _, instrs) = self.compile_func_instrs(func, span)?;
-            self.push_all_instrs(instrs);
-        } else {
-            let function = self.compile_func(func, span.clone())?;
-            self.push_instr(Instr::PushFunc(function));
-        }
-        Ok(())
-    }
-    fn compile_func(&mut self, func: Func, span: CodeSpan) -> UiuaResult<Function> {
-        let (id, sig, instrs) = self.compile_func_instrs(func, span)?;
-
-        if let [Instr::PushFunc(f), Instr::Call(_)] = instrs.as_slice() {
-            return Ok(Function::clone(f));
-        }
-
-        Ok(self.make_function(id, sig, instrs))
-    }
-    fn compile_func_instrs(
-        &mut self,
-        func: Func,
-        span: CodeSpan,
-    ) -> UiuaResult<(FunctionId, Signature, Vec<Instr>)> {
-        let mut instrs = Vec::new();
-        for line in func.lines {
-            instrs.extend(self.compile_words(line, true)?);
-        }
-
-        // Validate signature
-        let sig = match instrs_signature(&instrs) {
-            Ok(mut sig) => {
-                if let Some(declared_sig) = &func.signature {
-                    if declared_sig.value == sig {
-                        sig = declared_sig.value;
-                    } else {
-                        return Err(self.fatal_error(
-                            declared_sig.span.clone(),
-                            format!(
-                                "Function signature mismatch: declared {} but inferred {}",
-                                declared_sig.value, sig
-                            ),
-                        ));
+                let span = self.add_span(span);
+                let root = &self.asm[&f];
+                let sig = f.sig;
+                let mut node = Node::Call(f, span);
+                if let (true, &Node::WithLocal { def, .. }) = (single_ident, root) {
+                    if self.scopes().any(|sc| sc.kind == ScopeKind::Method(def)) {
+                        let mut inner = Node::GetLocal { def, span };
+                        for _ in 0..sig.args().saturating_sub(1) {
+                            inner = Node::Mod(
+                                Primitive::Dip,
+                                eco_vec![inner.sig_node().unwrap()],
+                                span,
+                            );
+                        }
+                        node.prepend(inner);
                     }
                 }
-                sig
+                node
             }
-            Err(e) => {
-                if let Some(declared_sig) = &func.signature {
-                    declared_sig.value
+            BindingKind::Import(path) => {
+                if let Some(local) = self.imports.get(&path).and_then(|m| m.names.get("Call")) {
+                    self.code_meta.global_references.remove(&span);
+                    self.code_meta
+                        .global_references
+                        .insert(span.clone(), local.index);
+                    self.global_index(local.index, single_ident, span)
                 } else {
-                    return Err(self.fatal_error(
+                    self.add_error(
                         span,
-                        format!(
-                            "Cannot infer function signature: {e}{}",
-                            if e.kind == SigCheckErrorKind::Ambiguous {
-                                ". A signature can be declared after the opening `(`."
-                            } else {
-                                ""
-                            }
-                        ),
-                    ));
+                        "Module cannot be called here as \
+                        it has no `Call` function.",
+                    );
+                    Node::empty()
                 }
             }
-        };
-        self.code_meta.function_sigs.insert(
-            span.clone(),
-            SigDecl {
-                sig,
-                explicit: func.signature.is_some(),
-                inline: true,
-            },
-        );
-        Ok((func.id, sig, instrs))
-    }
-    fn switch(&mut self, sw: Switch, span: CodeSpan, call: bool) -> UiuaResult {
-        let count = sw.branches.len();
-        if !call {
-            self.new_functions.push(EcoVec::new());
-        }
-        let mut branches = sw.branches.into_iter();
-        // Compile first branch
-        let first_branch = branches.next().expect("switch cannot have no branches");
-        let f = self.compile_func(first_branch.value, first_branch.span)?;
-        let mut sig = f.signature();
-        let mut branch_funcs = vec![f];
-        // Compile remaining branches
-        for branch in branches {
-            let f = self.compile_func(branch.value, branch.span.clone())?;
-            let f_sig = f.signature();
-            if f_sig.is_compatible_with(sig) {
-                sig = sig.max_with(f_sig);
-            } else if f_sig.outputs == sig.outputs {
-                sig.args = sig.args.max(f_sig.args)
-            } else {
-                self.add_error(
-                    branch.span,
-                    format!(
-                        "Switch branch's signature {f_sig} is \
-                        incompatible with previous branches {sig}",
-                    ),
-                );
+            global @ (BindingKind::Module(_) | BindingKind::Scope(_)) => {
+                let names = match &global {
+                    BindingKind::Module(m) => &m.names,
+                    BindingKind::Scope(i) => {
+                        &self.higher_scopes.get(*i).unwrap_or(&self.scope).names
+                    }
+                    _ => unreachable!(),
+                };
+                if let Some(local) = names.get("Call").or_else(|| names.get("New")) {
+                    self.code_meta.global_references.remove(&span);
+                    self.code_meta
+                        .global_references
+                        .insert(span.clone(), local.index);
+                    self.global_index(local.index, single_ident, span)
+                } else {
+                    self.add_error(
+                        span,
+                        "Module cannot be called here as \
+                        it has no `Call` or `New` function.",
+                    );
+                    Node::empty()
+                }
             }
-            branch_funcs.push(f);
+            BindingKind::IndexMacro(_) | BindingKind::CodeMacro(_) => {
+                // We could error here, but it's easier to handle it higher up
+                Node::empty()
+            }
+            BindingKind::Error => Node::empty(),
         }
+    }
+    fn func(&mut self, func: Func, span: CodeSpan) -> UiuaResult<Node> {
+        let root_start = self.asm.root.len();
+        self.in_scope(ScopeKind::Function, |comp| {
+            comp.items(func.lines, ItemCompMode::Function)
+        })?;
+        let mut root = self.asm.root.split_off(root_start);
 
-        // Maybe use `repeat` diagnostic
-        if branch_funcs.len() == 2
-            && matches!(
-                branch_funcs[0].instrs(&self.asm),
-                [] | [Instr::Prim(Primitive::Identity, _)]
-            )
-            && branch_funcs[1].signature().args == branch_funcs[1].signature().outputs
-        {
-            self.emit_diagnostic(
-                format!(
-                    "Prefer {} over this switch function",
-                    Primitive::Repeat.format(),
-                ),
-                DiagnosticKind::Style,
+        // Validate signature
+        let sig = match root.sig() {
+            Ok(mut sig) => {
+                if let Some(declared_sig) = &func.signature {
+                    root = self.force_sig(root, declared_sig.value, &declared_sig.span);
+                    sig = declared_sig.value;
+                }
+                Some(sig)
+            }
+            Err(e) => return Err(self.error(span, format!("Cannot infer function signature: {e}"))),
+        };
+        if let Some(sig) = sig {
+            self.code_meta.function_sigs.insert(
                 span.clone(),
+                SigDecl {
+                    sig,
+                    explicit: func.signature.is_some(),
+                    inline: true,
+                    set_inverses: Default::default(),
+                },
             );
         }
-
-        self.push_all_instrs(branch_funcs.into_iter().map(Instr::PushFunc));
-
-        let span_idx = self.add_span(span.clone());
-        self.push_instr(Instr::Switch {
-            count,
-            sig,
-            span: span_idx,
-            under_cond: false,
-        });
-        if !call {
-            let instrs = self.new_functions.pop().unwrap();
-            let sig = match instrs_signature(&instrs) {
-                Ok(sig) => sig,
-                Err(e) => {
-                    return Err(self.fatal_error(
-                        span,
-                        format!(
-                            "Cannot infer function signature: {e}{}",
-                            if e.kind == SigCheckErrorKind::Ambiguous {
-                                ". A signature can be declared after the opening `(`."
-                            } else {
-                                ""
+        Ok(root)
+    }
+    fn switch(&mut self, branches: Vec<Sp<Word>>, span: CodeSpan) -> UiuaResult<Node> {
+        let count = branches.len();
+        // Compile branches
+        let mut br = EcoVec::with_capacity(count);
+        let mut rigid_indices = Vec::new();
+        let mut flex_indices = Vec::new();
+        for (i, branch) in branches.into_iter().enumerate() {
+            let span = branch.span.clone();
+            let SigNode { node, sig } = self.word_sig(branch)?;
+            let is_flex = node
+                .iter()
+                .rposition(|node| matches!(node, Node::Prim(Primitive::Assert, _)))
+                .is_some_and(|end| {
+                    (0..end).rev().any(|start| {
+                        let sub = node.slice(start..end);
+                        match sub.as_slice() {
+                            [Node::Push(val), Node::Prim(Primitive::Dup, _)]
+                            | [Node::Push(val), Node::Push(..)]
+                                if val != &Value::from(1) =>
+                            {
+                                return true;
                             }
-                        ),
-                    ));
-                }
-            };
-            let function = self.make_function(FunctionId::Anonymous(span), sig, instrs);
-            self.push_instr(Instr::PushFunc(function));
+                            [Node::Format(..), Node::Prim(Primitive::Dup, _)] => return true,
+                            _ => (),
+                        }
+                        sub.is_pure(Purity::Pure, &self.asm)
+                            || !sub.sig().is_ok_and(|sig| sig == (0, 2))
+                    })
+                });
+            br.push((SigNode::new(sig, node), span));
+            if is_flex {
+                flex_indices.push(i);
+            } else {
+                rigid_indices.push(i);
+            }
         }
-        Ok(())
+        let mut rigid_funcs = rigid_indices.into_iter().map(|i| &br[i]);
+        let mut sig = None;
+        if let Some((arg, _)) = rigid_funcs.next() {
+            sig = Some(arg.sig);
+            let sig = sig.as_mut().unwrap();
+            // Compile remaining branches
+            for (arg, span) in rigid_funcs {
+                if arg.sig.is_compatible_with(*sig) {
+                    *sig = sig.max_with(arg.sig);
+                } else if arg.sig.outputs() == sig.outputs() {
+                    sig.update_args(|a| a.max(arg.sig.args()));
+                    sig.update_under_args(|a| a.max(arg.sig.under_args()));
+                } else {
+                    self.add_error(
+                        span.clone(),
+                        format!(
+                            "Switch branch's signature {} is \
+                            incompatible with previous branches {sig}",
+                            arg.sig
+                        ),
+                    );
+                }
+            }
+        }
+        let mut flex_funcs = flex_indices.into_iter().map(|i| &br[i]);
+        let mut sig = sig.unwrap_or_else(|| flex_funcs.next().unwrap().0.sig);
+        for (arg, _) in flex_funcs {
+            sig.update_args(|a| a.max(arg.sig.args()));
+            sig.update_under_args(|a| a.max(arg.sig.under_args()));
+        }
+
+        let span = self.add_span(span.clone());
+        Ok(Node::Switch {
+            branches: br.into_iter().map(|(arg, _)| arg).collect(),
+            sig,
+            span,
+            under_cond: false,
+        })
     }
     fn handle_primitive_deprecation(&mut self, prim: Primitive, span: &CodeSpan) {
         if let Some(suggestion) = prim.deprecation_suggestion() {
@@ -1676,52 +2062,403 @@ code:
         }
     }
     fn handle_primitive_experimental(&mut self, prim: Primitive, span: &CodeSpan) {
-        if prim.is_experimental()
-            && !self.scope.experimental
-            && self.experimental_prim_errors.insert(prim)
-        {
-            self.add_error(
-                span.clone(),
+        if prim.is_experimental() {
+            self.experimental_error(span, || {
                 format!(
                     "{} is experimental. To use it, add \
                     `# Experimental!` to the top of the file.",
                     prim.format()
-                ),
-            );
+                )
+            });
         }
     }
-    fn primitive(&mut self, prim: Primitive, span: CodeSpan, call: bool) -> UiuaResult {
-        self.handle_primitive_experimental(prim, &span);
-        self.handle_primitive_deprecation(prim, &span);
-        let span_i = self.add_span(span.clone());
-        if call {
-            self.push_instr(Instr::Prim(prim, span_i));
-        } else {
-            let instrs = [Instr::Prim(prim, span_i)];
-            let sig = self.sig_of(&instrs, &span)?;
-            let func = self.make_function(FunctionId::Primitive(prim), sig, instrs);
-            self.push_instr(Instr::PushFunc(func));
-        }
-        Ok(())
+    fn validate_primitive(&mut self, prim: Primitive, span: &CodeSpan) {
+        self.handle_primitive_experimental(prim, span);
+        self.handle_primitive_deprecation(prim, span);
     }
-    fn inlinable(&self, instrs: &[Instr]) -> bool {
-        use ImplPrimitive::*;
+    fn primitive(&mut self, prim: Primitive, span: CodeSpan) -> Node {
+        self.validate_primitive(prim, &span);
+        let span = self.add_span(span);
+        Node::Prim(prim, span)
+    }
+    #[allow(clippy::match_single_binding, unused_parens)]
+    fn subscript(&mut self, sub: Subscripted, span: CodeSpan) -> UiuaResult<Node> {
         use Primitive::*;
-        if instrs.len() > 10 {
-            return false;
-        }
-        for instr in instrs {
-            match instr {
-                Instr::Prim(Trace | Dump | Stack | Assert | Shapes | Types, _) => return false,
-                Instr::ImplPrim(UnTrace | UnDump | UnStack | BothTrace | UnBothTrace, _) => {
-                    return false
+        let scr = sub.script;
+        Ok(match sub.word.value {
+            Word::Modified(m) => match m.modifier.value {
+                Modifier::Ref(_) | Modifier::Macro(..) => {
+                    self.add_error(
+                        m.modifier.span.clone().merge(scr.span.clone()),
+                        "Subscripts are not implemented for macros",
+                    );
+                    self.modified(*m, Some(scr.map(Into::into)))?
                 }
-                Instr::PushFunc(f) if !self.inlinable(f.instrs(self)) => return false,
-                Instr::NoInline => return false,
-                _ => {}
+                Modifier::Primitive(prim) => match prim {
+                    _ => {
+                        if !matches!(
+                            prim,
+                            (Both | Bracket)
+                                | (Reach | On | By | With | Off)
+                                | (Rows | Each | Inventory)
+                                | (Repeat | Tuples | Stencil)
+                                | (Fill)
+                        ) {
+                            self.add_error(
+                                m.modifier.span.clone().merge(scr.span.clone()),
+                                format!("Subscripts are not implemented for {}", prim.format()),
+                            );
+                        }
+                        self.modified(*m, Some(scr.map(Into::into)))?
+                    }
+                },
+            },
+            Word::Primitive(prim) if prim.class() == PrimClass::DyadicPervasive => {
+                let Some(nos) = self.subscript_n_or_side(&scr, prim.format()) else {
+                    return self.word(sub.word);
+                };
+                match nos {
+                    SubNOrSide::N(n) => Node::from_iter([
+                        self.word(scr.span.sp(Word::Number(Ok(n as f64))))?,
+                        self.primitive(prim, span),
+                    ]),
+                    SubNOrSide::Side(side) => {
+                        self.experimental_error_it(&scr.span, || {
+                            format!("Sided {}", prim.format())
+                        });
+                        let sub_span = self.add_span(scr.span);
+                        let mut node = Node::Prim(Primitive::Fix, sub_span);
+                        if side == SubSide::Right {
+                            node = Node::Mod(
+                                Primitive::Dip,
+                                eco_vec![node.sig_node().unwrap()],
+                                sub_span,
+                            );
+                        }
+                        node.push(self.primitive(prim, span));
+                        node
+                    }
+                }
+            }
+            Word::Primitive(EncodeBytes) => {
+                let Some(side) = self.subscript_side_only(&scr, EncodeBytes.format()) else {
+                    return self.word(sub.word);
+                };
+                let span = self.add_span(sub.word.span);
+                Node::ImplPrim(ImplPrimitive::SidedEncodeBytes(side), span)
+            }
+            Word::Primitive(prim) => {
+                let Some(n) = self.subscript_n_only(&scr, prim.format()) else {
+                    return self.word(sub.word);
+                };
+                let n_span = scr.span;
+                match prim {
+                    prim if prim.sig().is_some_and(|sig| sig == (2, 1))
+                        && prim
+                            .subscript_sig(Some(Subscript::numeric(2)))
+                            .is_some_and(|sig| sig == (1, 1)) =>
+                    {
+                        Node::from_iter([
+                            self.word(n_span.sp(Word::Number(Ok(n as f64))))?,
+                            self.primitive(prim, span),
+                        ])
+                    }
+                    Deshape => Node::ImplPrim(ImplPrimitive::DeshapeSub(n), self.add_span(span)),
+                    Transpose => {
+                        self.subscript_experimental(prim, &span);
+                        if n > 100 {
+                            self.add_error(span.clone(), "Too many subscript repetitions");
+                        }
+                        (0..n.min(100))
+                            .map(|_| self.primitive(prim, span.clone()))
+                            .collect()
+                    }
+                    Neg => {
+                        use crate::Complex;
+                        let rotation = match n {
+                            // Ensure that common cases are exact
+                            -1..=1 => Complex::ONE,
+                            2 | -2 => -Complex::ONE,
+                            4 => Complex::I,
+                            -4 => -Complex::I,
+                            _ => Complex::from_polar(1.0, std::f64::consts::TAU / n as f64),
+                        };
+                        Node::from_iter([Node::new_push(rotation), self.primitive(Mul, span)])
+                    }
+                    Sqrt => {
+                        if n == 0 {
+                            self.add_error(span.clone(), "Cannot take 0th root");
+                        }
+                        Node::from_iter([Node::new_push(1.0 / n as f64), self.primitive(Pow, span)])
+                    }
+                    Ln => {
+                        if n == 0 || n == 1 {
+                            self.add_error(span.clone(), format!("Cannot take log base {n}"));
+                        }
+                        Node::from_iter([Node::new_push(n as f64), self.primitive(Log, span)])
+                    }
+                    Floor | Ceil => {
+                        self.subscript_experimental(prim, &span);
+                        let mul = 10f64.powi(n);
+                        Node::from_iter([
+                            Node::new_push(mul),
+                            self.primitive(Mul, span.clone()),
+                            self.primitive(prim, span.clone()),
+                            Node::new_push(mul),
+                            self.primitive(Div, span),
+                        ])
+                    }
+                    Round => {
+                        let mul = 10f64.powi(n);
+                        Node::from_iter([
+                            Node::new_push(mul),
+                            self.primitive(Mul, span.clone()),
+                            self.primitive(prim, span.clone()),
+                            Node::new_push(mul),
+                            self.primitive(Div, span),
+                        ])
+                    }
+                    Rand => Node::from_iter([
+                        self.primitive(Rand, span.clone()),
+                        Node::new_push(n),
+                        self.primitive(Mul, span.clone()),
+                        self.primitive(Floor, span),
+                    ]),
+                    Utf8 => match n {
+                        8 => self.primitive(Utf8, span),
+                        16 => Node::ImplPrim(ImplPrimitive::Utf16, self.add_span(span)),
+                        _ => {
+                            self.add_error(span.clone(), "Only UTF-8 and UTF-16 are supported");
+                            self.primitive(Utf8, span)
+                        }
+                    },
+                    Couple => match n {
+                        1 => self.primitive(Fix, span),
+                        2 => self.primitive(Couple, span),
+                        n => Node::Array {
+                            len: self.positive_subscript(n, Couple, &span),
+                            inner: Node::empty().into(),
+                            boxed: false,
+                            allow_ext: true,
+                            prim: Some(Couple),
+                            span: self.add_span(span),
+                        },
+                    },
+                    Box => Node::Array {
+                        len: self.positive_subscript(n, Box, &span),
+                        inner: Node::empty().into(),
+                        boxed: true,
+                        allow_ext: false,
+                        prim: Some(Box),
+                        span: self.add_span(span),
+                    },
+                    Stack => Node::ImplPrim(
+                        ImplPrimitive::StackN {
+                            n: self.positive_subscript(n, Stack, &span),
+                            inverse: false,
+                        },
+                        self.add_span(span),
+                    ),
+                    First | Last => {
+                        let n = self.positive_subscript(n, prim, &span);
+                        let span = self.add_span(span);
+                        match n {
+                            0 => Node::Prim(Pop, span),
+                            1 => Node::Prim(prim, span),
+                            n if prim == First => Node::from_iter([
+                                Node::new_push(n),
+                                Node::Prim(Take, span),
+                                Node::Unpack {
+                                    count: n,
+                                    unbox: false,
+                                    allow_ext: false,
+                                    prim: Some(First),
+                                    span,
+                                },
+                            ]),
+                            n => Node::from_iter([
+                                Node::new_push(-(n as i32)),
+                                Node::Prim(Take, span),
+                                Node::Prim(Reverse, span),
+                                Node::Unpack {
+                                    count: n,
+                                    unbox: false,
+                                    allow_ext: false,
+                                    prim: Some(Last),
+                                    span,
+                                },
+                            ]),
+                        }
+                    }
+                    Bits => {
+                        let n = self.positive_subscript(n, Bits, &span);
+                        let span = self.add_span(span);
+                        Node::ImplPrim(ImplPrimitive::NBits(n), span)
+                    }
+                    Len => {
+                        let span = self.add_span(span);
+                        Node::from_iter([
+                            Node::Prim(Shape, span),
+                            Node::new_push(n),
+                            Node::Prim(Select, span),
+                        ])
+                    }
+                    Shape => {
+                        let span = self.add_span(span);
+                        Node::from_iter([
+                            Node::Prim(Shape, span),
+                            Node::new_push(n),
+                            Node::Prim(Take, span),
+                        ])
+                    }
+                    Range => {
+                        let span = self.add_span(span);
+                        Node::from_iter([
+                            Node::Prim(Range, span),
+                            Node::new_push(n),
+                            Node::Prim(Add, span),
+                        ])
+                    }
+                    _ => {
+                        self.add_error(
+                            span.clone(),
+                            format!("Subscripts are not implemented for {}", prim.format()),
+                        );
+                        self.primitive(prim, span)
+                    }
+                }
+            }
+            _ => {
+                self.add_error(span.clone(), "Subscripts are not allowed in this context");
+                self.word(sub.word)?
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubNOrSide<N = i32> {
+    N(N),
+    Side(SubSide),
+}
+
+impl<N> SubNOrSide<N> {
+    fn map_n<M>(self, f: impl FnOnce(N) -> M) -> SubNOrSide<M> {
+        match self {
+            SubNOrSide::N(n) => SubNOrSide::N(f(n)),
+            SubNOrSide::Side(side) => SubNOrSide::Side(side),
+        }
+    }
+}
+
+impl<N: PartialEq> PartialEq<N> for SubNOrSide<N> {
+    fn eq(&self, other: &N) -> bool {
+        match self {
+            SubNOrSide::N(n) => *n == *other,
+            SubNOrSide::Side(_) => false,
+        }
+    }
+}
+
+impl Compiler {
+    fn validate_subscript(&mut self, sub: Sp<Subscript>) -> Sp<Subscript<i32>> {
+        let side = sub.value.side;
+        let num = (sub.value.num).and_then(|num| self.numeric_subscript_n(num, &sub.span));
+        sub.span.sp(Subscript { num, side })
+    }
+    fn numeric_subscript_n(&mut self, num: NumericSubscript, span: &CodeSpan) -> Option<i32> {
+        match num {
+            NumericSubscript::N(n) => Some(n),
+            NumericSubscript::NegOnly => {
+                self.add_error(span.clone(), "Subscript is incomplete");
+                None
+            }
+            NumericSubscript::TooLarge => {
+                self.add_error(span.clone(), "Subscript is too large");
+                None
             }
         }
-        true
+    }
+    fn subscript_n_or_side(
+        &mut self,
+        sub: &Sp<Subscript>,
+        for_what: impl fmt::Display,
+    ) -> Option<SubNOrSide> {
+        match (sub.value.num, sub.value.side) {
+            (None, None) => {
+                self.add_error(sub.span.clone(), "Subscript is incomplete");
+                None
+            }
+            (Some(num), None) => self.numeric_subscript_n(num, &sub.span).map(SubNOrSide::N),
+            (None, Some(side)) => {
+                if side.n.is_some() {
+                    self.add_error(
+                        sub.span.clone(),
+                        format!("Sided subscript quantifiers are not allowed for {for_what}"),
+                    );
+                }
+                Some(SubNOrSide::Side(side.side))
+            }
+            (Some(_), Some(_)) => {
+                self.add_error(
+                    sub.span.clone(),
+                    format!("Mixed subscripts are not allowed for {for_what}"),
+                );
+                None
+            }
+        }
+    }
+    fn subscript_n_only(
+        &mut self,
+        sub: &Sp<Subscript>,
+        for_what: impl fmt::Display + Copy,
+    ) -> Option<i32> {
+        let nos = self.subscript_n_or_side(sub, for_what)?;
+        match nos {
+            SubNOrSide::N(n) => Some(n),
+            SubNOrSide::Side(_) => {
+                self.add_error(
+                    sub.span.clone(),
+                    format!("Sided subscripts are not allowed for {for_what}"),
+                );
+                None
+            }
+        }
+    }
+    fn subscript_side_only(
+        &mut self,
+        sub: &Sp<Subscript>,
+        for_what: impl fmt::Display + Copy,
+    ) -> Option<SubSide> {
+        let nos = self.subscript_n_or_side(sub, for_what)?;
+        match nos {
+            SubNOrSide::N(_) => {
+                self.add_error(
+                    sub.span.clone(),
+                    format!("Numeric subscripts are not allowed for {for_what}"),
+                );
+                None
+            }
+            SubNOrSide::Side(side) => Some(side),
+        }
+    }
+    fn positive_subscript(&mut self, n: i32, prim: Primitive, span: &CodeSpan) -> usize {
+        if n < 0 {
+            self.add_error(
+                span.clone(),
+                format!("Subscript for {} must be positive", prim.format()),
+            );
+        }
+        n.unsigned_abs() as usize
+    }
+    fn subscript_experimental(&mut self, prim: Primitive, span: &CodeSpan) {
+        self.experimental_error(span, || {
+            format!(
+                "Subcripted {} is experimental. To use it, \
+                add `# Experimental!` to the top of the file.",
+                prim.format()
+            )
+        });
     }
     /// Get all diagnostics
     pub fn diagnostics(&self) -> &BTreeSet<Diagnostic> {
@@ -1742,27 +2479,109 @@ code:
         &mut self,
         message: impl Into<String>,
         kind: DiagnosticKind,
-        span: CodeSpan,
+        span: impl Into<Span>,
     ) {
         let inputs = self.asm.inputs.clone();
-        self.diagnostics
-            .insert(Diagnostic::new(message.into(), span, kind, inputs));
+        self.emit_diagnostic_impl(Diagnostic::new(message.into(), span, kind, inputs));
+    }
+    fn emit_diagnostic_impl(&mut self, diagnostic: Diagnostic) {
+        if self.print_diagnostics {
+            println!("{}", diagnostic.report()); // Allow println
+        } else {
+            self.diagnostics.insert(diagnostic);
+        }
     }
     fn add_error(&mut self, span: impl Into<Span>, message: impl ToString) {
-        let e = UiuaError::Run(
-            span.into().sp(message.to_string()),
-            self.asm.inputs.clone().into(),
-        );
+        let e = self.error(span, message);
         self.errors.push(e);
     }
-    fn fatal_error(&self, span: impl Into<Span>, message: impl ToString) -> UiuaError {
-        UiuaError::Run(
-            span.into().sp(message.to_string()),
-            self.asm.inputs.clone().into(),
-        )
+    fn experimental_error<S>(&mut self, span: &CodeSpan, message: impl FnOnce() -> S)
+    where
+        S: fmt::Display,
+    {
+        if !self.allow_experimental() {
+            self.scope.experimental_error = true;
+            self.add_error(span.clone(), message().to_string());
+        }
+    }
+    fn experimental_error_it<S>(&mut self, span: &CodeSpan, thing: impl FnOnce() -> S)
+    where
+        S: fmt::Display,
+    {
+        self.experimental_error(span, || {
+            format!(
+                "{} is experimental. Add `# Experimental!` \
+                to the top of the file to use it.",
+                thing()
+            )
+        })
+    }
+    fn allow_experimental(&self) -> bool {
+        let take = self
+            .scopes()
+            .position(|sc| matches!(sc.kind, ScopeKind::File(_)))
+            .map(|i| i + 1)
+            .unwrap_or(usize::MAX);
+        self.scopes()
+            .take(take)
+            .any(|sc| sc.experimental || sc.experimental_error)
+    }
+    fn error(&self, span: impl Into<Span>, message: impl ToString) -> UiuaError {
+        UiuaErrorKind::Run {
+            message: span.into().sp(message.to_string()),
+            info: Vec::new(),
+            inputs: self.asm.inputs.clone().into(),
+        }
+        .into()
+    }
+    fn error_with_info<S, M>(
+        &self,
+        span: impl Into<Span>,
+        message: impl ToString,
+        info: impl IntoIterator<Item = (S, M)>,
+    ) -> UiuaError
+    where
+        S: Into<Span>,
+        M: ToString,
+    {
+        UiuaErrorKind::Run {
+            message: span.into().sp(message.to_string()),
+            info: info
+                .into_iter()
+                .map(|(s, m)| s.into().sp(m.to_string()))
+                .collect(),
+            inputs: self.asm.inputs.clone().into(),
+        }
+        .into()
     }
     fn validate_local(&mut self, name: &str, local: LocalName, span: &CodeSpan) {
-        if !local.public && (self.scope.names.get(name)).map_or(true, |l| l.index != local.index) {
+        // Emit deprecation warning
+        if let Some(suggestion) = &self.asm.bindings[local.index].meta.deprecation {
+            let mut message = format!("{name} is deprecated");
+            if !suggestion.is_empty() {
+                message.push_str(". ");
+                message.push_str(suggestion);
+                if message.ends_with(char::is_alphanumeric) {
+                    message.push('.');
+                }
+            }
+            self.emit_diagnostic(message, DiagnosticKind::Warning, span.clone());
+        }
+        // Validate public
+        if local.public {
+            return;
+        }
+        let get = |scope: &Scope| {
+            (scope.names.get(name))
+                .or_else(|| scope.names.get(name.strip_suffix('!')?))
+                .copied()
+        };
+        if !local.public
+            && get(&self.scope)
+                .filter(|l| l.public || !matches!(self.scope.kind, ScopeKind::AllInModule))
+                .or_else(|| self.scopes_to_file().skip(1).find_map(get))
+                .is_none_or(|l| l.index != local.index)
+        {
             self.add_error(span.clone(), format!("`{}` is private", name));
         }
     }
@@ -1772,42 +2591,59 @@ code:
     }
     /// Register a span
     pub fn add_span(&mut self, span: impl Into<Span>) -> usize {
+        let span = span.into();
+        if let Some(i) = self.asm.spans.iter().position(|s| *s == span) {
+            return i;
+        }
         let idx = self.asm.spans.len();
-        self.asm.spans.push(span.into());
+        self.asm.spans.push(span);
         idx
     }
     /// Create a function
     pub fn create_function(
         &mut self,
         signature: impl Into<Signature>,
-        f: impl Fn(&mut Uiua) -> UiuaResult + Send + Sync + 'static,
+        f: impl Fn(&mut Uiua) -> UiuaResult + SendSyncNative + 'static,
     ) -> Function {
-        let signature = signature.into();
+        let sig = signature.into();
+        let df = self.create_dynamic_function(sig, f);
+        self.asm
+            .add_function(FunctionId::Unnamed, sig, Node::Dynamic(df))
+    }
+    fn create_dynamic_function(
+        &mut self,
+        sig: Signature,
+        f: impl Fn(&mut Uiua) -> UiuaResult + SendSyncNative + 'static,
+    ) -> DynamicFunction {
         let index = self.asm.dynamic_functions.len();
         self.asm.dynamic_functions.push(Arc::new(f));
-        self.make_function(
-            FunctionId::Unnamed,
-            signature,
-            vec![Instr::Dynamic(DynamicFunction { index, signature })],
-        )
+        DynamicFunction { index, sig }
     }
     /// Bind a function in the current scope
     ///
     /// # Errors
     /// Returns an error in the binding name is not valid
     pub fn bind_function(&mut self, name: impl Into<EcoString>, function: Function) -> UiuaResult {
-        let index = self.next_global;
+        self.bind_function_with_meta(name, function, BindingMeta::default())
+    }
+    fn bind_function_with_meta(
+        &mut self,
+        name: impl Into<EcoString>,
+        function: Function,
+        meta: BindingMeta,
+    ) -> UiuaResult {
         let name = name.into();
         let local = LocalName {
-            index,
+            index: self.next_global,
             public: true,
         };
-        self.compile_bind_function(&name, local, function, 0, None)?;
         self.next_global += 1;
-        self.scope.names.insert(name, local);
+        self.compile_bind_function(name, local, function, 0, meta)?;
         Ok(())
     }
     /// Create and bind a function in the current scope
+    ///
+    /// This function is the only way to bind `# External!` functions.
     ///
     /// # Errors
     /// Returns an error in the binding name is not valid
@@ -1815,125 +2651,25 @@ code:
         &mut self,
         name: impl Into<EcoString>,
         signature: impl Into<Signature>,
-        f: impl Fn(&mut Uiua) -> UiuaResult + Send + Sync + 'static,
+        f: impl Fn(&mut Uiua) -> UiuaResult + SendSyncNative + 'static,
     ) -> UiuaResult {
-        let function = self.create_function(signature, f);
-        self.bind_function(name, function)
+        let name = name.into();
+        if let Some(index) = self.externals.get(&name).copied() {
+            let df = self.create_dynamic_function(signature.into(), f);
+            self.asm.functions.make_mut()[index] = Node::Dynamic(df);
+            Ok(())
+        } else {
+            let function = self.create_function(signature, f);
+            let meta = BindingMeta {
+                external: true,
+                ..Default::default()
+            };
+            self.bind_function_with_meta(name, function, meta)
+        }
     }
-    #[must_use]
-    fn pre_eval_instrs(&mut self, instrs: EcoVec<Instr>) -> (EcoVec<Instr>, Vec<UiuaError>) {
-        let mut errors = Vec::new();
-        let instrs = optimize_instrs(instrs, true, &self.asm);
-        if self.pre_eval_mode == PreEvalMode::Lazy
-            || instrs.iter().all(|instr| matches!(instr, Instr::Push(_)))
-            || (instrs.iter())
-                .any(|instr| matches!(instr, Instr::PushLocals { .. } | Instr::PopLocals))
-        {
-            return (instrs, errors);
-        }
-        let mut start = 0;
-        let mut new_instrs: Option<EcoVec<Instr>> = None;
-        'start: while start < instrs.len() {
-            for end in (start + 1..=instrs.len()).rev() {
-                let section = &instrs[start..end];
-                if !instrs_can_pre_eval(section, &self.asm) {
-                    continue;
-                }
-                if instrs_are_pure(section, &self.asm)
-                    && instrs_all_signatures(section).is_ok_and(|(sig, temps)| {
-                        sig.args == 0 && sig.outputs > 0 && temps.iter().all(|&sig| sig == (0, 0))
-                    })
-                {
-                    // println!("section: {section:?}");
-                    match self.comptime_instrs(section.into()) {
-                        Ok(Some(values)) => {
-                            for val in &values {
-                                val.validate_shape();
-                            }
-                            let new_instrs =
-                                new_instrs.get_or_insert_with(|| instrs[..start].into());
-                            new_instrs.extend(values.into_iter().map(Instr::Push));
-                        }
-                        Ok(None) => {}
-                        Err(e) if e.is_fill() => {}
-                        Err(e) if e.message().contains("No locals to get") => {}
-                        Err(e) => errors.push(e),
-                    }
-                    start = end;
-                    continue 'start;
-                }
-            }
-            if let Some(new_instrs) = &mut new_instrs {
-                new_instrs.push(instrs[start].clone())
-            }
-            start += 1;
-        }
-        // if let Some(new_instrs) = &new_instrs {
-        //     println!("eval: {new_instrs:?}")
-        // }
-        (new_instrs.unwrap_or(instrs), errors)
-    }
-    fn comptime_instrs(&mut self, instrs: EcoVec<Instr>) -> UiuaResult<Option<Vec<Value>>> {
-        if !self.pre_eval_mode.matches_instrs(&instrs, &self.asm) {
-            return Ok(None);
-        }
-        if instrs.iter().all(|instr| matches!(instr, Instr::Push(_))) {
-            return Ok(Some(
-                (instrs.into_iter())
-                    .map(|instr| match instr {
-                        Instr::Push(val) => val,
-                        _ => unreachable!(),
-                    })
-                    .collect(),
-            ));
-        }
-        thread_local! {
-            static CACHE: RefCell<HashMap<EcoVec<Instr>, Option<Vec<Value>>>> = RefCell::new(HashMap::new());
-        }
-        CACHE.with(|cache| {
-            let instrs = optimize_instrs(instrs, true, &self.asm);
-            if let Some(stack) = cache.borrow().get(&instrs) {
-                return Ok(stack.clone());
-            }
-            let mut asm = self.asm.clone();
-            asm.top_slices.clear();
-            let start = asm.instrs.len();
-            let len = instrs.len();
-            asm.instrs.extend(instrs.iter().cloned());
-            asm.top_slices.push(FuncSlice { start, len });
-            let mut env = if self.pre_eval_mode == PreEvalMode::Lsp {
-                #[cfg(feature = "native_sys")]
-                {
-                    Uiua::with_native_sys()
-                }
-                #[cfg(not(feature = "native_sys"))]
-                Uiua::with_safe_sys()
-            } else {
-                Uiua::with_safe_sys()
-            }
-            .with_execution_limit(Duration::from_millis(40));
-            match env.run_asm(asm) {
-                Ok(()) => {
-                    let stack = env.take_stack();
-                    let res = if stack.iter().any(|v| v.element_count() > 1000) {
-                        None
-                    } else {
-                        Some(stack)
-                    };
-                    cache.borrow_mut().insert(instrs, res.clone());
-                    Ok(res)
-                }
-                Err(e) if matches!(e.inner(), UiuaError::Timeout(..)) => {
-                    cache.borrow_mut().insert(instrs, None);
-                    Ok(None)
-                }
-                Err(e) => Err(e),
-            }
-        })
-    }
-    fn sig_of(&self, instrs: &[Instr], span: &CodeSpan) -> UiuaResult<Signature> {
-        instrs_signature(instrs).map_err(|e| {
-            self.fatal_error(
+    fn sig_of(&self, node: &Node, span: &CodeSpan) -> UiuaResult<Signature> {
+        node.sig().map_err(|e| {
+            self.error(
                 span.clone(),
                 format!("Cannot infer function signature: {e}"),
             )
@@ -1941,126 +2677,110 @@ code:
     }
 }
 
-fn instrs_can_pre_eval(instrs: &[Instr], asm: &Assembly) -> bool {
-    use Primitive::*;
-    if instrs.is_empty() {
-        return true;
-    }
-    // Begin and end array instructions must be balanced
-    let begin_array_pos = (instrs.iter()).position(|instr| matches!(instr, Instr::BeginArray));
-    let begin_array_count = (instrs.iter())
-        .filter(|instr| matches!(instr, Instr::BeginArray))
-        .count();
-    let end_array_pos = (instrs.iter()).position(|instr| matches!(instr, Instr::EndArray { .. }));
-    let end_array_count = (instrs.iter())
-        .filter(|instr| matches!(instr, Instr::EndArray { .. }))
-        .count();
-    let array_allowed = begin_array_count == end_array_count
-        && match (begin_array_pos, end_array_pos) {
-            (Some(0), Some(end)) => end == instrs.len() - 1,
-            (None, None) => true,
-            _ => false,
-        };
-    // Local instructions must be balanced
-    let locals_allowed = (instrs.iter())
-        .position(|instr| matches!(instr, Instr::PushLocals { .. }))
-        .map_or(true, |pos| {
-            pos == 0 && instrs.ends_with(&[Instr::PopLocals])
-        });
-    if !array_allowed
-        || !locals_allowed
-        || matches!(
-            instrs.last().unwrap(),
-            Instr::PushFunc(_) | Instr::BeginArray
-        )
-        || instrs.iter().all(|instr| matches!(instr, Instr::Push(_)))
-        || instrs.iter().any(|instr| {
-            matches!(
-                instr,
-                Instr::Prim(SetInverse | SetUnder, _) | Instr::ImplPrim(ImplPrimitive::UnPop, _)
-            )
-        })
-    {
-        return false;
-    }
-    for instr in instrs {
-        if let Instr::PushFunc(f) = instr {
-            if !instrs_can_pre_eval(f.instrs(asm), asm) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
 fn words_look_pervasive(words: &[Sp<Word>]) -> bool {
     use Primitive::*;
     words.iter().all(|word| match &word.value {
         Word::Primitive(p) if p.class().is_pervasive() => true,
-        Word::Primitive(
-            Dup | Flip | Over | Dip | Identity | Fork | Both | Bracket | Under | Each,
-        ) => true,
-        Word::Func(func) if func.lines.iter().all(|line| words_look_pervasive(line)) => true,
+        Word::Primitive(Dup | Dip | Identity | Fork | Under | Each) => true,
+        Word::Func(func) if func.word_lines().all(words_look_pervasive) => true,
         Word::Number(..) | Word::Char(..) => true,
         Word::Modified(m) if m.modifier.value == Modifier::Primitive(Primitive::Each) => true,
         _ => false,
     })
 }
 
-fn collect_placeholder(words: &[Sp<Word>]) -> Vec<Sp<PlaceholderOp>> {
-    let mut ops = Vec::new();
-    for word in words {
-        match &word.value {
-            Word::Placeholder(op) => ops.push(word.span.clone().sp(*op)),
-            Word::Strand(items) => ops.extend(collect_placeholder(items)),
-            Word::Array(arr) => arr.lines.iter().for_each(|line| {
-                ops.extend(collect_placeholder(line));
-            }),
-            Word::Func(func) => func.lines.iter().for_each(|line| {
-                ops.extend(collect_placeholder(line));
-            }),
-            Word::Modified(m) => ops.extend(collect_placeholder(&m.operands)),
-            Word::Switch(sw) => sw.branches.iter().for_each(|branch| {
-                (branch.value.lines.iter()).for_each(|line| ops.extend(collect_placeholder(line)))
-            }),
+fn set_in_macro_arg(words: &mut [Sp<Word>]) {
+    recurse_words_mut_impl(
+        words,
+        &|word| match &word.value {
+            Word::Modified(m) => matches!(m.modifier.value, Modifier::Primitive(_)),
+            _ => true,
+        },
+        &mut |word| match &mut word.value {
+            Word::Ref(r) => r.in_macro_arg = true,
+            Word::IncompleteRef { in_macro_arg, .. } => *in_macro_arg = true,
             _ => {}
-        }
-    }
-    ops
+        },
+    );
 }
 
-fn replace_placeholders(words: &mut Vec<Sp<Word>>, next: &mut dyn FnMut() -> Sp<Word>) {
-    recurse_words(words, &mut |word| match &mut word.value {
-        Word::Placeholder(PlaceholderOp::Call) => *word = next(),
-        _ => {}
-    });
-    words.retain(|word| !matches!(word.value, Word::Placeholder(_)))
-}
-
-fn set_in_macro_arg(words: &mut Vec<Sp<Word>>) {
-    recurse_words(words, &mut |word| match &mut word.value {
-        Word::Ref(r) => r.in_macro_arg = true,
-        Word::IncompleteRef { in_macro_arg, .. } => *in_macro_arg = true,
-        _ => {}
-    });
-}
-
-fn recurse_words(words: &mut Vec<Sp<Word>>, f: &mut dyn FnMut(&mut Sp<Word>)) {
+fn recurse_words(words: &[Sp<Word>], f: &mut dyn FnMut(&Sp<Word>)) {
     for word in words {
         f(word);
-        match &mut word.value {
+        match &word.value {
             Word::Strand(items) => recurse_words(items, f),
-            Word::Array(arr) => arr.lines.iter_mut().for_each(|line| {
+            Word::Array(arr) => arr.word_lines().for_each(|line| {
                 recurse_words(line, f);
             }),
-            Word::Func(func) => func.lines.iter_mut().for_each(|line| {
+            Word::Func(func) => func.word_lines().for_each(|line| {
                 recurse_words(line, f);
             }),
-            Word::Modified(m) => recurse_words(&mut m.operands, f),
-            Word::Switch(sw) => sw.branches.iter_mut().for_each(|branch| {
-                (branch.value.lines.iter_mut()).for_each(|line| recurse_words(line, f))
+            Word::Modified(m) => recurse_words(&m.operands, f),
+            Word::Pack(pack) => pack.branches.iter().for_each(|branch| {
+                (branch.value.word_lines()).for_each(|line| recurse_words(line, f))
             }),
             _ => {}
         }
     }
 }
+
+fn recurse_words_mut(words: &mut [Sp<Word>], f: &mut dyn FnMut(&mut Sp<Word>)) {
+    recurse_words_mut_impl(words, &|_| true, f);
+}
+
+fn recurse_words_mut_impl(
+    words: &mut [Sp<Word>],
+    recurse_word: &dyn Fn(&Sp<Word>) -> bool,
+    f: &mut dyn FnMut(&mut Sp<Word>),
+) {
+    for word in words {
+        if !recurse_word(word) {
+            continue;
+        }
+        match &mut word.value {
+            Word::Strand(items) => recurse_words_mut(items, f),
+            Word::Array(arr) => arr.word_lines_mut().for_each(|line| {
+                recurse_words_mut(line, f);
+            }),
+            Word::Func(func) => func.word_lines_mut().for_each(|line| {
+                recurse_words_mut(line, f);
+            }),
+            Word::Modified(m) => recurse_words_mut(&mut m.operands, f),
+            Word::Pack(pack) => pack.branches.iter_mut().for_each(|branch| {
+                (branch.value.word_lines_mut()).for_each(|line| recurse_words_mut(line, f))
+            }),
+            Word::Subscripted(sub) => recurse_words_mut(slice::from_mut(&mut sub.word), f),
+            _ => {}
+        }
+        f(word);
+    }
+}
+
+fn line_sig(line: &[Sp<Word>]) -> Option<Sp<DocCommentSig>> {
+    line.split_last()
+        .and_then(|(last, mut rest)| match &last.value {
+            Word::Comment(c) => c.parse::<DocCommentSig>().ok().map(|sig| {
+                while rest.last().is_some_and(|w| matches!(w.value, Word::Spaces)) {
+                    rest = &rest[..rest.len() - 1];
+                }
+                let span = (rest.first())
+                    .zip(rest.last())
+                    .map(|(f, l)| f.span.clone().merge(l.span.clone()))
+                    .unwrap_or_else(|| last.span.clone());
+                span.sp(sig)
+            }),
+            _ => None,
+        })
+}
+
+/// Supertrait for `Send` and `Sync` on native targets, but not on wasm32
+#[cfg(not(target_arch = "wasm32"))]
+pub trait SendSyncNative: Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync> SendSyncNative for T {}
+
+/// Supertrait for `Send` and `Sync` on native targets, but not on wasm32
+#[cfg(target_arch = "wasm32")]
+pub trait SendSyncNative {}
+#[cfg(target_arch = "wasm32")]
+impl<T> SendSyncNative for T {}

@@ -1,31 +1,32 @@
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
-    iter::repeat,
+    iter::repeat_n,
     mem::{replace, take},
 };
 
+use bytemuck::must_cast;
 use ecow::EcoVec;
 use serde::*;
 
 use crate::{
-    algorithm::ArrayCmpSlice, Array, ArrayValue, Boxed, Complex, FormatShape, Uiua, UiuaResult,
-    Value,
+    algorithm::ArrayCmpSlice, val_as_arr, Array, ArrayValue, Boxed, Complex, FormatShape, Uiua,
+    UiuaResult, Value,
 };
 
-use super::FillContext;
+use super::{ErrorContext, FillContext};
 
 impl<T: ArrayValue> Array<T> {
     /// Check if the array is a map
     pub fn is_map(&self) -> bool {
-        self.meta().map_keys.as_ref().is_some()
+        self.meta.map_keys.is_some()
     }
     /// Get the keys and values of a map array
     pub fn map_kv(&self) -> impl Iterator<Item = (Value, Array<T>)> {
         self.map_kv_inner().into_iter()
     }
     fn map_kv_inner(&self) -> Vec<(Value, Array<T>)> {
-        let Some(map_keys) = self.meta().map_keys.as_ref() else {
+        let Some(map_keys) = &self.meta.map_keys else {
             return Vec::new();
         };
         let mut kv = Vec::with_capacity(map_keys.len);
@@ -42,20 +43,14 @@ impl<T: ArrayValue> Array<T> {
         kv
     }
     /// Create a map array
-    pub fn map(&mut self, mut keys: Value, env: &Uiua) -> UiuaResult {
+    pub fn map<C: ErrorContext>(&mut self, keys: Value, ctx: &C) -> Result<(), C::Error> {
         let values = self;
         if keys.row_count() != values.row_count() {
-            return Err(env.error(format!(
+            return Err(ctx.error(format!(
                 "Map array's keys and values must have the same length, but they have lengths {} and {}",
                 keys.row_count(),
                 values.row_count()
             )));
-        }
-        if keys.rank() == 0 {
-            keys.shape_mut().insert(0, 1);
-        }
-        if values.rank() == 0 {
-            values.shape_mut().insert(0, 1);
         }
         let mut map_keys = MapKeys {
             keys: keys.clone(),
@@ -63,10 +58,20 @@ impl<T: ArrayValue> Array<T> {
             len: 0,
             fix_stack: Vec::new(),
         };
+        let mut to_remove = Vec::new();
         for (i, key) in keys.into_rows().enumerate() {
-            map_keys.insert(key, i, env)?;
+            let replaced = map_keys.insert(key, i, ctx)?;
+            to_remove.extend(replaced);
         }
-        values.meta_mut().map_keys = Some(map_keys);
+        for i in to_remove.into_iter().rev() {
+            values.remove_row(i);
+            for index in &mut map_keys.indices {
+                if *index > i {
+                    *index -= 1;
+                }
+            }
+        }
+        values.meta.map_keys = Some(map_keys);
         Ok(())
     }
 }
@@ -74,55 +79,46 @@ impl<T: ArrayValue> Array<T> {
 impl Value {
     /// Check if the value is a map
     pub fn is_map(&self) -> bool {
-        self.meta().map_keys.as_ref().is_some()
+        self.meta.map_keys.as_ref().is_some()
     }
     /// Get the keys and values of a map array
     pub fn map_kv(&self) -> Vec<(Value, Value)> {
-        self.generic_ref(
-            |arr| arr.map_kv().map(|(k, v)| (k, v.into())).collect(),
-            |arr| arr.map_kv().map(|(k, v)| (k, v.into())).collect(),
-            |arr| arr.map_kv().map(|(k, v)| (k, v.into())).collect(),
-            |arr| arr.map_kv().map(|(k, v)| (k, v.into())).collect(),
-            |arr| arr.map_kv().map(|(k, v)| (k, v.into())).collect(),
-        )
+        val_as_arr!(self, |arr| arr
+            .map_kv()
+            .map(|(k, v)| (k, v.into()))
+            .collect())
     }
     /// Create a map array
     pub fn map(&mut self, keys: Self, env: &Uiua) -> UiuaResult {
-        match self {
-            Value::Num(arr) => arr.map(keys, env),
-            Value::Byte(arr) => arr.map(keys, env),
-            Value::Complex(arr) => arr.map(keys, env),
-            Value::Char(arr) => arr.map(keys, env),
-            Value::Box(arr) => arr.map(keys, env),
-        }
+        val_as_arr!(self, |arr| arr.map(keys, env))
     }
     /// Turn a map array into its keys and values
     pub fn unmap(mut self, env: &Uiua) -> UiuaResult<(Value, Value)> {
-        // if !self.is_map() && self.row_count() == 0 {
-        //     self.shape_mut().make_row();
-        // }
-        let mut keys = self
+        let keys = self
+            .meta
             .take_map_keys()
             .ok_or_else(|| env.error("Value is not a map"))?;
-        let mut fix_count = 0;
-        while keys.unfix() {
-            fix_count += 1;
-        }
-        let mut key_pairs: Vec<_> = keys.keys.into_rows().zip(keys.indices).collect();
-        key_pairs.sort_unstable_by_key(|(_, i)| *i);
-        let mut keys = remove_empty_rows(key_pairs.into_iter().map(|(k, _)| k));
-        for _ in 0..fix_count {
-            keys.fix();
-        }
-        Ok((keys, self))
+        Ok((keys.normalized(), self))
     }
     /// Get a value from a map array
     pub fn get(&self, key: &Value, env: &Uiua) -> UiuaResult<Value> {
-        if self.row_count() == 0 {
-            return (env.value_fill().cloned()).ok_or_else(|| env.error("Key not found in map"));
+        // Check for higher-ranked keys
+        if let Some(keys) = self.meta.map_keys.as_ref() {
+            if key.rank() == keys.keys.rank() && key.type_id() == keys.keys.type_id() {
+                let mut values = Vec::with_capacity(key.row_count());
+                for key in key.rows() {
+                    values.push(self.get(&key, env)?);
+                }
+                return Value::from_row_values(values, env);
+            }
         }
-        let keys =
-            (self.meta().map_keys.as_ref()).ok_or_else(|| env.error("Value is not a map"))?;
+        // An empty array cannot have the key
+        if self.row_count() == 0 {
+            return (env.value_fill().map(|fv| fv.value.clone()))
+                .ok_or_else(|| env.error("Key not found in map"));
+        }
+
+        let keys = (self.meta.map_keys.as_ref()).ok_or_else(|| env.error("Value is not a map"))?;
         if keys.len != self.row_count() {
             return Err(env.error(format!(
                 "Cannot read from map with {} keys and {} value(s)",
@@ -137,27 +133,56 @@ impl Value {
             Ok(self.row(index))
         } else {
             env.value_fill()
-                .cloned()
+                .map(|fv| fv.value.clone())
                 .ok_or_else(|| env.error("Key not found in map"))
         }
     }
     /// Check if a map array contains a key
-    pub fn has_key(&self, key: &Value, env: &Uiua) -> UiuaResult<bool> {
-        if self.row_count() == 0 {
-            return Ok(false);
+    pub fn has_key(&self, key: &Value, env: &Uiua) -> UiuaResult<Array<u8>> {
+        if let Some(keys) = self.meta.map_keys.as_ref() {
+            if key.rank() == keys.keys.rank() && key.type_id() == keys.keys.type_id() {
+                let mut values = EcoVec::with_capacity(key.row_count());
+                for key in key.rows() {
+                    values.push(keys.get(&key).is_some().into());
+                }
+                return Ok(values.into());
+            }
         }
-        let keys =
-            (self.meta().map_keys.as_ref()).ok_or_else(|| env.error("Value is not a map"))?;
-        Ok(keys.get(key).is_some())
+
+        if self.row_count() == 0 {
+            return Ok(0.into());
+        }
+        let keys = (self.meta.map_keys.as_ref()).ok_or_else(|| env.error("Value is not a map"))?;
+        Ok(keys.get(key).is_some().into())
     }
     /// Insert a key-value pair into a map array
     #[allow(clippy::unit_arg)]
     pub fn insert(&mut self, key: Value, value: Value, env: &Uiua) -> UiuaResult {
+        // if value.rank() == self.rank() && value.type_id() == self.type_id() {
+        //     if key.row_count() != value.row_count() {
+        //         return Err(env.error(format!(
+        //             "You appear to be inserting multiple keys. \
+        //             Inserted keys and values must have the same length, \
+        //             but their shapes are {} and {}",
+        //             key.shape,
+        //             value.shape
+        //         )));
+        //     }
+        //     for (key, value) in key.into_rows().zip(value.into_rows()) {
+        //         self.insert(key, value, env)?;
+        //     }
+        //     return Ok(());
+        // }
+
         if !self.is_map() && self.row_count() == 0 {
             self.map(Value::default(), env)?;
         }
+        if self.rank() == 0 {
+            self.shape.insert(0, 1);
+        }
         let row_count = self.row_count();
         let mut keys = self
+            .meta
             .take_map_keys()
             .ok_or_else(|| env.error("Value is not a map"))?;
         if keys.len != row_count {
@@ -188,9 +213,11 @@ impl Value {
                 },
             )?;
         } else {
-            self.append(value, env)?;
+            self.append(value, false, env)?;
         }
-        self.meta_mut().map_keys = Some(keys);
+        self.meta.map_keys = Some(keys);
+        self.meta.take_sorted_flags();
+        self.validate();
         Ok(())
     }
     #[allow(clippy::unit_arg)]
@@ -209,7 +236,10 @@ impl Value {
                 self.row_count()
             )));
         }
-        let mut keys = (self.take_map_keys()).ok_or_else(|| env.error("Value is not a map"))?;
+        let mut keys = self
+            .meta
+            .take_map_keys()
+            .ok_or_else(|| env.error("Value is not a map"))?;
         for i in &mut keys.indices {
             if *i >= index {
                 *i += 1;
@@ -248,13 +278,13 @@ impl Value {
                 },
             )?;
         };
-        self.meta_mut().map_keys = Some(keys);
+        self.meta.map_keys = Some(keys);
         Ok(())
     }
     /// Return a key's value to what it used to be, including if it didn't exist before
     pub fn undo_insert(&mut self, key: Value, original: &Self, env: &Uiua) -> UiuaResult {
         let orig_keys =
-            (original.meta().map_keys.as_ref()).ok_or_else(|| env.error("Value was not a map"))?;
+            (original.meta.map_keys.as_ref()).ok_or_else(|| env.error("Value was not a map"))?;
         if let Some(index) = orig_keys.get(&key) {
             self.insert_at(index.into(), key, original.row(index), env)?;
         } else {
@@ -264,11 +294,22 @@ impl Value {
     }
     /// Remove a key-value pair from a map array
     pub fn remove(&mut self, key: Value, env: &Uiua) -> UiuaResult {
+        if let Some(keys) = self.meta.map_keys.as_ref() {
+            if key.rank() == keys.keys.rank() && key.type_id() == keys.keys.type_id() {
+                for key in key.into_rows() {
+                    self.remove(key, env)?;
+                }
+                return Ok(());
+            }
+        }
+
         if self.row_count() == 0 {
             return Ok(());
         }
         let row_count = self.row_count();
-        let keys = (self.get_meta_mut().and_then(|m| m.map_keys.as_mut()))
+        let keys = self
+            .meta
+            .map_keys_mut()
             .ok_or_else(|| env.error("Value is not a map"))?;
         if keys.len != row_count {
             return Err(env.error(format!(
@@ -288,20 +329,14 @@ impl Value {
                 }
             }
 
-            match self {
-                Value::Num(arr) => arr.remove_row(index),
-                Value::Complex(arr) => arr.remove_row(index),
-                Value::Char(arr) => arr.remove_row(index),
-                Value::Box(arr) => arr.remove_row(index),
-                Value::Byte(arr) => arr.remove_row(index),
-            }
+            val_as_arr!(self, |arr| arr.remove_row(index))
         }
         Ok(())
     }
     /// Re-insert a key-value pair to a modified map array if it got removed
     pub fn undo_remove(&mut self, key: Value, original: &Self, env: &Uiua) -> UiuaResult {
         let keys =
-            (original.meta().map_keys.as_ref()).ok_or_else(|| env.error("Value wasn't a map"))?;
+            (original.meta.map_keys.as_ref()).ok_or_else(|| env.error("Value wasn't a map"))?;
         if let Some(index) = keys.get(&key) {
             self.insert_at(index.into(), key, original.row(index), env)?;
         }
@@ -309,7 +344,7 @@ impl Value {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MapKeys {
     pub(crate) keys: Value,
     indices: Vec<usize>,
@@ -346,14 +381,16 @@ impl MapKeys {
     {
         let key_row_len = keys.row_len();
         let mut keys_shape = keys.shape.clone();
-        keys_shape[0] = new_capacity;
+        if let Some(len) = keys_shape.first_mut() {
+            *len = new_capacity;
+        } else if new_capacity > 1 {
+            keys_shape = new_capacity.into();
+        }
         let old_keys = take(keys).into_rows();
         let old_indices = take(indices);
         *keys = Array::new(
             keys_shape,
-            repeat(K::empty_cell())
-                .take(new_capacity * key_row_len)
-                .collect::<EcoVec<_>>(),
+            repeat_n(K::empty_cell(), new_capacity * key_row_len).collect::<EcoVec<_>>(),
         );
         *indices = vec![0; new_capacity];
         let key_data = keys.data.as_mut_slice();
@@ -363,7 +400,7 @@ impl MapKeys {
             loop {
                 let cell_key =
                     &mut key_data[key_index * key_row_len..(key_index + 1) * key_row_len];
-                if cell_key[0].is_any_empty_cell() {
+                if cell_key.is_empty() || cell_key[0].is_any_empty_cell() {
                     cell_key.clone_from_slice(&key.data);
                     indices[key_index] = index;
                     break;
@@ -374,7 +411,7 @@ impl MapKeys {
     }
     fn insert<C>(&mut self, key: Value, index: usize, ctx: &C) -> Result<Option<usize>, C::Error>
     where
-        C: FillContext,
+        C: ErrorContext,
     {
         fn insert_impl<K>(
             keys: &mut Array<K>,
@@ -392,9 +429,37 @@ impl MapKeys {
             let key_row_len = keys.row_len();
             let key_data = keys.data.as_mut_slice();
             loop {
+                let cell_key = &key_data[key_index * key_row_len..(key_index + 1) * key_row_len];
+                let present = if cell_key.is_empty() {
+                    *len == 1
+                } else if cell_key[0].is_any_empty_cell() {
+                    false
+                } else if cell_key[0].is_any_tombstone() {
+                    // Probe for the matching key
+                    let orig = key_index;
+                    loop {
+                        key_index = (key_index + 1) % capacity;
+                        if key_index == orig {
+                            break false;
+                        }
+                        let cell_key =
+                            &key_data[key_index * key_row_len..(key_index + 1) * key_row_len];
+                        if cell_key[0].is_any_tombstone() {
+                            continue;
+                        } else if cell_key[0].is_any_empty_cell() {
+                            key_index = orig;
+                            break false;
+                        } else if ArrayCmpSlice(cell_key) == ArrayCmpSlice(&key.data) {
+                            break true;
+                        } else {
+                            continue;
+                        }
+                    }
+                } else {
+                    true
+                };
                 let cell_key =
                     &mut key_data[key_index * key_row_len..(key_index + 1) * key_row_len];
-                let present = !(cell_key[0].is_any_empty_cell() || cell_key[0].is_any_tombstone());
                 if !present || ArrayCmpSlice(cell_key) == ArrayCmpSlice(&key.data) {
                     if !present {
                         *len += 1;
@@ -441,16 +506,16 @@ impl MapKeys {
         Ok(replaced)
     }
     fn get(&self, key: &Value) -> Option<usize> {
-        if self.keys.shape() == [0] {
+        let mut key = key;
+        if self.keys.row_count() == 0 {
             return None;
         }
-        let start = match key {
-            Value::Num(a) => hash_start(a, self.capacity()),
-            Value::Complex(a) => hash_start(a, self.capacity()),
-            Value::Char(a) => hash_start(a, self.capacity()),
-            Value::Box(a) => hash_start(a, self.capacity()),
-            Value::Byte(a) => hash_start(a, self.capacity()),
-        };
+        let boxed_key: Value;
+        if matches!(self.keys, Value::Box(_)) && !matches!(key, Value::Box(_)) {
+            boxed_key = Boxed(key.clone()).into();
+            key = &boxed_key;
+        }
+        let start = val_as_arr!(key, |a| hash_start(a, self.capacity()));
         let mut key_index = start;
         loop {
             let row_key = self.keys.row(key_index);
@@ -521,6 +586,23 @@ impl MapKeys {
         }
         do_remove!(Num, Complex, Char, Box)
     }
+    /// Get the keys in the same order as map values
+    pub fn normalized(mut self) -> Value {
+        let mut fix_count = 0;
+        while self.unfix() {
+            fix_count += 1;
+        }
+        if self.len == 0 {
+            return self.keys.first_dim_zero();
+        }
+        let mut key_pairs: Vec<_> = self.keys.into_rows().zip(&self.indices).collect();
+        key_pairs.sort_unstable_by_key(|(_, i)| *i);
+        let mut keys = remove_empty_rows(key_pairs.into_iter().map(|(k, _)| k));
+        for _ in 0..fix_count {
+            keys.fix();
+        }
+        keys
+    }
     pub(crate) fn fix(&mut self) {
         self.keys.fix();
         let indices = replace(&mut self.indices, vec![0]);
@@ -531,14 +613,11 @@ impl MapKeys {
         if let Some((len, indices)) = self.fix_stack.pop() {
             self.len = len;
             self.indices = indices;
-            self.keys.unfix();
+            self.keys.undo_fix();
             true
         } else {
             false
         }
-    }
-    pub fn into_value(self) -> Value {
-        remove_empty_rows(self.keys.into_rows())
     }
     fn present_indices(&self) -> Vec<usize> {
         let mut present_indices: Vec<_> = (self.keys.rows().enumerate())
@@ -615,6 +694,12 @@ impl MapKeys {
         for index in &mut other.indices {
             *index += self.len;
         }
+        if self.keys.rank() == 0 {
+            self.keys.shape.insert(0, 1);
+        }
+        if other.keys.rank() == 0 {
+            other.keys.shape.insert(0, 1);
+        }
         let mut to_remove = Vec::new();
         let mut to_insert: Vec<_> = (other.keys.into_rows())
             .zip(other.indices)
@@ -686,17 +771,25 @@ pub fn remove_empty_rows(iter: impl ExactSizeIterator<Item = Value>) -> Value {
 
 const LOAD_FACTOR: f64 = 0.75;
 
-// A NaN value used as empty, not the standard NaN.
-pub const EMPTY_NAN: f64 =
-    unsafe { std::mem::transmute(0x7ff8_0000_0000_0000u64 | 0x0000_0000_0000_0001) };
-// A NaN value used as a tombstone, not the standard NaN.
-pub const TOMBSTONE_NAN: f64 =
-    unsafe { std::mem::transmute(0x7ff8_0000_0000_0000u64 | 0x0000_0000_0000_0002) };
+// NOTE: must_cast to f64 only works if f64 and u64 have same endianness.
+//       This is true of all currently supported platforms for rust,
+//       but may not be true in general. Swap out for f64::from_bits when
+//       the MSRV passes 1.83 to ensure correctness on all future platforms.
 
+// A NaN value used as empty, not the standard NaN.
+pub const EMPTY_NAN: f64 = must_cast(0x7ff8_0000_0000_0000u64 | 0x0000_0000_0000_0001);
+// A NaN value used as a tombstone, not the standard NaN.
+pub const TOMBSTONE_NAN: f64 = must_cast(0x7ff8_0000_0000_0000u64 | 0x0000_0000_0000_0002);
+// A character value used as empty
+pub const EMPTY_CHAR: char = '\u{100001}';
+// A character value used as a tombstone
+pub const TOMBSTONE_CHAR: char = '\u{100002}';
+
+#[track_caller]
 fn hash_start<T: ArrayValue>(arr: &Array<T>, capacity: usize) -> usize {
     let mut hasher = DefaultHasher::new();
     arr.hash(&mut hasher);
-    hasher.finish() as usize % capacity
+    hasher.finish() as usize % capacity.max(1)
 }
 
 fn coerce_values(
@@ -706,17 +799,15 @@ fn coerce_values(
     action2: &'static str,
     action3: &'static str,
 ) -> Result<Value, String> {
-    {
-        if let Value::Byte(keys) = a {
-            *a = Value::Num(keys.convert_ref());
-        }
-        if let Value::Byte(values) = b {
-            b = Value::Num(values.convert_ref());
-        }
+    if let Value::Byte(keys) = a {
+        *a = Value::Num(keys.convert_ref());
     }
-    if a.shape() == [0] {
+    if let Value::Byte(values) = b {
+        b = Value::Num(values.convert_ref());
+    }
+    if a.shape == [0] {
         let mut b_clone = b.clone();
-        b_clone.shape_mut().insert(0, 1);
+        b_clone.shape.insert(0, 1);
         *a = b_clone.first_dim_zero();
         return Ok(b);
     }
@@ -732,32 +823,38 @@ fn coerce_values(
         }
     }
     match (&mut *a, b) {
-        (Value::Num(arr), Value::Num(item)) if arr.shape[1..] != item.shape => Err(format!(
-            "Cannot {action1} shape {} {action2} shape {} {action3}",
-            item.shape(),
-            FormatShape(&arr.shape()[1..])
-        )),
-        (Value::Complex(arr), Value::Complex(item)) if arr.shape[1..] != item.shape => {
+        (Value::Num(arr), Value::Num(item)) if arr.rank() > 0 && arr.shape[1..] != item.shape => {
             Err(format!(
                 "Cannot {action1} shape {} {action2} shape {} {action3}",
-                item.shape(),
-                FormatShape(&arr.shape()[1..])
+                item.shape,
+                FormatShape(&arr.shape[1..])
             ))
         }
-        (Value::Box(arr), Value::Box(item)) if arr.shape[1..] != item.shape => Err(format!(
-            "Cannot {action1} shape {} {action2} shape {} {action3}",
-            item.shape(),
-            FormatShape(&arr.shape()[1..])
-        )),
+        (Value::Complex(arr), Value::Complex(item))
+            if arr.rank() > 0 && arr.shape[1..] != item.shape =>
+        {
+            Err(format!(
+                "Cannot {action1} shape {} {action2} shape {} {action3}",
+                item.shape,
+                FormatShape(&arr.shape[1..])
+            ))
+        }
+        (Value::Box(arr), Value::Box(item)) if arr.rank() > 0 && arr.shape[1..] != item.shape => {
+            Err(format!(
+                "Cannot {action1} shape {} {action2} shape {} {action3}",
+                item.shape,
+                FormatShape(&arr.shape[1..])
+            ))
+        }
         (val @ Value::Num(_), owned @ Value::Num(_))
         | (val @ Value::Complex(_), owned @ Value::Complex(_))
         | (val @ Value::Char(_), owned @ Value::Char(_))
         | (val @ Value::Box(_), owned @ Value::Box(_)) => {
-            if &val.shape()[1..] != owned.shape() {
+            if val.rank() > 0 && val.shape[1..] != owned.shape {
                 Err(format!(
                     "Cannot {action1} shape {} {action2} shape {} {action3}",
-                    owned.shape(),
-                    FormatShape(&val.shape()[1..])
+                    owned.shape,
+                    FormatShape(&val.shape[1..])
                 ))
             } else {
                 Ok(owned)
@@ -821,16 +918,16 @@ impl MapItem for Complex {
 
 impl MapItem for char {
     fn empty_cell() -> Self {
-        '\0'
+        EMPTY_CHAR
     }
     fn tombstone_cell() -> Self {
-        '\u{1}'
+        TOMBSTONE_CHAR
     }
     fn is_any_empty_cell(&self) -> bool {
-        *self == '\0'
+        *self == EMPTY_CHAR
     }
     fn is_any_tombstone(&self) -> bool {
-        *self == '\u{1}'
+        *self == TOMBSTONE_CHAR
     }
 }
 

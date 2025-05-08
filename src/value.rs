@@ -3,15 +3,16 @@ use std::{
     cmp::Ordering,
     fmt,
     hash::{Hash, Hasher},
-    iter::repeat,
+    iter::once,
     mem::{size_of, take},
+    ops::{Deref, DerefMut},
 };
 
-use ecow::{EcoString, EcoVec};
+use ecow::EcoVec;
 use serde::*;
 
 use crate::{
-    algorithm::{map::MapKeys, pervade::*, FillContext},
+    algorithm::{pervade::*, ErrorContext, FillContext},
     array::*,
     cowslice::CowSlice,
     grid_fmt::GridFmt,
@@ -47,7 +48,45 @@ impl Default for Value {
 pub trait ExactDoubleIterator: ExactSizeIterator + DoubleEndedIterator {}
 impl<T: ExactSizeIterator + DoubleEndedIterator> ExactDoubleIterator for T {}
 
+/// Operate on a value as an array
+#[macro_export]
+macro_rules! val_as_arr {
+    ($input:expr, |$arr:ident| $body:expr) => {
+        match $input {
+            Value::Num($arr) => $body,
+            Value::Byte($arr) => $body,
+            Value::Complex($arr) => $body,
+            Value::Char($arr) => $body,
+            Value::Box($arr) => $body,
+        }
+    };
+    ($input:expr, $f:path) => {
+        match $input {
+            Value::Num(arr) => $f(arr),
+            Value::Byte(arr) => $f(arr),
+            Value::Complex(arr) => $f(arr),
+            Value::Char(arr) => $f(arr),
+            Value::Box(arr) => $f(arr),
+        }
+    };
+    ($input:expr, $env:expr, $f:path) => {
+        match $input {
+            Value::Num(arr) => $f(arr, $env),
+            Value::Byte(arr) => $f(arr, $env),
+            Value::Complex(arr) => $f(arr, $env),
+            Value::Char(arr) => $f(arr, $env),
+            Value::Box(arr) => $f(arr, $env),
+        }
+    };
+}
+
 impl Value {
+    /// A NULL pointer value for use in `&ffi`
+    pub(crate) fn null() -> Self {
+        let mut arr = Array::<u8>::default();
+        arr.meta.pointer = Some(MetaPtr::null());
+        Value::from(arr)
+    }
     pub(crate) fn builder(capacity: usize) -> ValueBuilder {
         ValueBuilder::with_capacity(capacity)
     }
@@ -94,71 +133,57 @@ impl Value {
     }
     /// Get an iterator over the rows of the value
     pub fn rows(&self) -> Box<dyn ExactSizeIterator<Item = Self> + '_> {
-        match self {
-            Self::Num(array) => Box::new(array.rows().map(Value::from)),
-            Self::Byte(array) => Box::new(array.rows().map(Value::from)),
-            Self::Complex(array) => Box::new(array.rows().map(Value::from)),
-            Self::Char(array) => Box::new(array.rows().map(Value::from)),
-            Self::Box(array) => Box::new(array.rows().map(Value::from)),
+        if self.shape.first() == Some(&1) {
+            let mut row = self.clone();
+            row.undo_fix();
+            Box::new(once(row))
+        } else {
+            val_as_arr!(self, |array| Box::new(array.rows().map(Value::from)))
         }
+    }
+    pub(crate) fn depth_rows(&self, depth: usize) -> Box<dyn ExactSizeIterator<Item = Self> + '_> {
+        val_as_arr!(self, |array| Box::new(
+            array.depth_rows(depth).map(Value::from)
+        ))
     }
     /// Get an iterator over the rows of the value that have the given shape
     pub fn row_shaped_slices(
         &self,
         row_shape: Shape,
     ) -> Box<dyn ExactSizeIterator<Item = Self> + '_> {
-        match self {
-            Self::Num(array) => Box::new(array.row_shaped_slices(row_shape).map(Value::from)),
-            Self::Byte(array) => Box::new(array.row_shaped_slices(row_shape).map(Value::from)),
-            Self::Complex(array) => Box::new(array.row_shaped_slices(row_shape).map(Value::from)),
-            Self::Char(array) => Box::new(array.row_shaped_slices(row_shape).map(Value::from)),
-            Self::Box(array) => Box::new(array.row_shaped_slices(row_shape).map(Value::from)),
-        }
+        val_as_arr!(self, |array| Box::new(
+            array.row_shaped_slices(row_shape).map(Value::from)
+        ))
     }
     /// Get an iterator over the rows of the value that have the given shape
     pub fn into_row_shaped_slices(
         self,
         row_shape: Shape,
     ) -> Box<dyn DoubleEndedIterator<Item = Self>> {
-        match self {
-            Self::Num(array) => Box::new(array.into_row_shaped_slices(row_shape).map(Value::from)),
-            Self::Byte(array) => Box::new(array.into_row_shaped_slices(row_shape).map(Value::from)),
-            Self::Complex(array) => {
-                Box::new(array.into_row_shaped_slices(row_shape).map(Value::from))
-            }
-            Self::Char(array) => Box::new(array.into_row_shaped_slices(row_shape).map(Value::from)),
-            Self::Box(array) => Box::new(array.into_row_shaped_slices(row_shape).map(Value::from)),
-        }
+        val_as_arr!(self, |array| Box::new(
+            array.into_row_shaped_slices(row_shape).map(Value::from)
+        ))
     }
     /// Consume the value and get an iterator over its rows
-    pub fn into_rows(self) -> Box<dyn ExactDoubleIterator<Item = Self>> {
-        match self {
-            Self::Num(array) => Box::new(array.into_rows().map(Value::from)),
-            Self::Byte(array) => Box::new(array.into_rows().map(Value::from)),
-            Self::Complex(array) => Box::new(array.into_rows().map(Value::from)),
-            Self::Char(array) => Box::new(array.into_rows().map(Value::from)),
-            Self::Box(array) => Box::new(array.into_rows().map(Value::from)),
+    pub fn into_rows(mut self) -> Box<dyn ExactDoubleIterator<Item = Self>> {
+        if self.shape.first() == Some(&1) {
+            self.undo_fix();
+            Box::new(once(self))
+        } else {
+            val_as_arr!(self, |array| Box::new(array.into_rows().map(Value::from)))
         }
     }
     /// Get an iterator over the elements of the value
     pub fn elements(&self) -> Box<dyn ExactSizeIterator<Item = Self> + '_> {
-        match self {
-            Self::Num(array) => Box::new(array.data.iter().copied().map(Value::from)),
-            Self::Byte(array) => Box::new(array.data.iter().copied().map(Value::from)),
-            Self::Complex(array) => Box::new(array.data.iter().copied().map(Value::from)),
-            Self::Char(array) => Box::new(array.data.iter().copied().map(Value::from)),
-            Self::Box(array) => Box::new(array.data.iter().cloned().map(Value::from)),
-        }
+        val_as_arr!(self, |array| Box::new(
+            array.data.iter().cloned().map(Value::from)
+        ))
     }
     /// Cosume the value and get an iterator over its elements
     pub fn into_elements(self) -> Box<dyn Iterator<Item = Self>> {
-        match self {
-            Self::Num(array) => Box::new(array.data.into_iter().map(Value::from)),
-            Self::Byte(array) => Box::new(array.data.into_iter().map(Value::from)),
-            Self::Complex(array) => Box::new(array.data.into_iter().map(Value::from)),
-            Self::Char(array) => Box::new(array.data.into_iter().map(Value::from)),
-            Self::Box(array) => Box::new(array.data.into_iter().map(Value::from)),
-        }
+        val_as_arr!(self, |array| Box::new(
+            array.data.into_iter().map(Value::from)
+        ))
     }
     /// Get the value's type name
     pub fn type_name(&self) -> &'static str {
@@ -181,90 +206,116 @@ impl Value {
         }
     }
     /// Get the number of rows
+    #[inline(always)]
     pub fn row_count(&self) -> usize {
-        self.shape().first().copied().unwrap_or(1)
+        self.shape.row_count()
     }
     /// Get the number of element in each row
+    #[inline(always)]
     pub fn row_len(&self) -> usize {
-        self.shape().iter().skip(1).product()
+        self.shape.row_len()
     }
     pub(crate) fn proxy_scalar(&self, env: &Uiua) -> Self {
         match self {
-            Self::Num(_) => env.num_fill().unwrap_or_else(|_| f64::proxy()).into(),
-            Self::Byte(_) => env.byte_fill().unwrap_or_else(|_| u8::proxy()).into(),
-            Self::Complex(_) => env
-                .complex_fill()
+            Self::Num(_) => (env.scalar_fill().map(|fv| fv.value))
+                .unwrap_or_else(|_| f64::proxy())
+                .into(),
+            Self::Byte(_) => (env.scalar_fill().map(|fv| fv.value))
+                .unwrap_or_else(|_| u8::proxy())
+                .into(),
+            Self::Complex(_) => (env.scalar_fill().map(|fv| fv.value))
                 .unwrap_or_else(|_| Complex::proxy())
                 .into(),
-            Self::Char(_) => env.char_fill().unwrap_or_else(|_| char::proxy()).into(),
-            Self::Box(_) => env.box_fill().unwrap_or_else(|_| Boxed::proxy()).into(),
+            Self::Char(_) => (env.scalar_fill().map(|fv| fv.value))
+                .unwrap_or_else(|_| char::proxy())
+                .into(),
+            Self::Box(_) => (env.scalar_fill().map(|fv| fv.value))
+                .unwrap_or_else(|_| Boxed::proxy())
+                .into(),
         }
     }
     pub(crate) fn proxy_row(&self, env: &Uiua) -> Self {
         if self.rank() == 0 {
             return self.proxy_scalar(env);
         }
-        let shape: Shape = self.shape()[1..].into();
+        let shape: Shape = self.shape[1..].into();
         let elem_count = shape.iter().product();
         match self {
             Self::Num(_) => Array::new(
                 shape,
-                repeat(env.num_fill().unwrap_or_else(|_| f64::proxy()))
-                    .take(elem_count)
-                    .collect::<CowSlice<_>>(),
+                CowSlice::from_elem(
+                    env.scalar_fill()
+                        .map(|fv| fv.value)
+                        .unwrap_or_else(|_| f64::proxy()),
+                    elem_count,
+                ),
             )
             .into(),
             Self::Byte(_) => Array::new(
                 shape,
-                repeat(env.byte_fill().unwrap_or_else(|_| u8::proxy()))
-                    .take(elem_count)
-                    .collect::<CowSlice<_>>(),
+                CowSlice::from_elem(
+                    env.scalar_fill()
+                        .map(|fv| fv.value)
+                        .unwrap_or_else(|_| u8::proxy()),
+                    elem_count,
+                ),
             )
             .into(),
             Self::Complex(_) => Array::new(
                 shape,
-                repeat(env.complex_fill().unwrap_or_else(|_| Complex::proxy()))
-                    .take(elem_count)
-                    .collect::<CowSlice<_>>(),
+                CowSlice::from_elem(
+                    env.scalar_fill()
+                        .map(|fv| fv.value)
+                        .unwrap_or_else(|_| Complex::proxy()),
+                    elem_count,
+                ),
             )
             .into(),
             Self::Char(_) => Array::new(
                 shape,
-                repeat(env.char_fill().unwrap_or_else(|_| char::proxy()))
-                    .take(elem_count)
-                    .collect::<CowSlice<_>>(),
+                CowSlice::from_elem(
+                    env.scalar_fill()
+                        .map(|fv| fv.value)
+                        .unwrap_or_else(|_| char::proxy()),
+                    elem_count,
+                ),
             )
             .into(),
             Self::Box(_) => Array::new(
                 shape,
-                repeat(env.box_fill().unwrap_or_else(|_| Boxed::proxy()))
-                    .take(elem_count)
-                    .collect::<CowSlice<_>>(),
+                CowSlice::from_elem(
+                    env.scalar_fill()
+                        .map(|fv| fv.value)
+                        .unwrap_or_else(|_| Boxed::proxy()),
+                    elem_count,
+                ),
             )
             .into(),
         }
     }
-    pub(crate) fn first_dim_zero(&self) -> Self {
+    pub(crate) fn fill(&mut self, env: &Uiua) -> Result<Value, &'static str> {
+        self.match_fill(env);
         match self {
-            Self::Num(array) => array.first_dim_zero().into(),
-            Self::Byte(array) => array.first_dim_zero().into(),
-            Self::Complex(array) => array.first_dim_zero().into(),
-            Self::Char(array) => array.first_dim_zero().into(),
-            Self::Box(array) => array.first_dim_zero().into(),
+            Value::Num(_) => env.array_fill::<f64>().map(|fv| fv.value).map(Into::into),
+            Value::Byte(_) => env.array_fill::<u8>().map(|fv| fv.value).map(Into::into),
+            Value::Complex(_) => env
+                .array_fill::<Complex>()
+                .map(|fv| fv.value)
+                .map(Into::into),
+            Value::Char(_) => env.array_fill::<char>().map(|fv| fv.value).map(Into::into),
+            Value::Box(_) => env.array_fill::<Boxed>().map(|fv| fv.value).map(Into::into),
         }
+    }
+    pub(crate) fn first_dim_zero(&self) -> Self {
+        val_as_arr!(self, |array| array.first_dim_zero().into())
     }
     /// Get the rank
+    #[inline(always)]
     pub fn rank(&self) -> usize {
-        self.shape().len()
+        self.shape.len()
     }
     pub(crate) fn pop_row(&mut self) -> Option<Self> {
-        match self {
-            Self::Num(array) => array.pop_row().map(Value::from),
-            Self::Byte(array) => array.pop_row().map(Value::from),
-            Self::Complex(array) => array.pop_row().map(Value::from),
-            Self::Char(array) => array.pop_row().map(Value::from),
-            Self::Box(array) => array.pop_row().map(Value::from),
-        }
+        val_as_arr!(self, |array| array.pop_row().map(Value::from))
     }
     pub(crate) fn elem_size(&self) -> usize {
         match self {
@@ -277,205 +328,121 @@ impl Value {
     }
 }
 
+/// A representation of a [`Value`] that allows direct access to the
+/// inner [`Array`]'s shape and metadata, regardless of element type
 #[repr(C)]
-struct Repr {
-    discriminant: u8,
-    arr: Array<f64>,
+pub struct ValueRepr {
+    _discriminant: u8,
+    /// The value's shape
+    pub shape: Shape,
+    _data: CowSlice<f64>,
+    /// The value's metadata
+    pub meta: ArrayMeta,
+}
+
+impl Deref for Value {
+    type Target = ValueRepr;
+    fn deref(&self) -> &Self::Target {
+        // Safety: The layout of `Value` should always match that of `Value`
+        unsafe { &*(self as *const Self as *const ValueRepr) }
+    }
+}
+
+impl DerefMut for Value {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // Safety: The layout of `Value` should always match that of `Value`
+        unsafe { &mut *(self as *mut Self as *mut ValueRepr) }
+    }
 }
 
 impl Value {
-    /// # Safety
-    /// The value or layout of data accessed from the Repr's array must not be dependent on the array's type
-    unsafe fn repr(&self) -> &Repr {
-        &*(self as *const Self as *const Repr)
-    }
-    /// # Safety
-    /// The value or layout of data accessed from the Repr's array must not be dependent on the array's type
-    unsafe fn repr_mut(&mut self) -> &mut Repr {
-        &mut *(self as *mut Self as *mut Repr)
-    }
-    /// Get the shape of the value
-    pub fn shape(&self) -> &Shape {
-        &unsafe { self.repr() }.arr.shape
-    }
-    /// Get a mutable reference to the shape
-    pub fn shape_mut(&mut self) -> &mut Shape {
-        &mut unsafe { self.repr_mut() }.arr.shape
-    }
-    /// Get the number of elements
-    pub fn element_count(&self) -> usize {
-        unsafe { self.repr() }.arr.element_count()
-    }
     /// Get the value's metadata
     pub fn meta(&self) -> &ArrayMeta {
-        unsafe { self.repr() }.arr.meta()
+        &self.meta
     }
     /// Get a mutable reference to the value's metadata
     pub fn meta_mut(&mut self) -> &mut ArrayMeta {
-        unsafe { self.repr_mut() }.arr.meta_mut()
+        &mut self.meta
     }
-    /// Get a mutable reference to the value's metadata
-    pub fn get_meta_mut(&mut self) -> Option<&mut ArrayMeta> {
-        unsafe { self.repr_mut() }.arr.get_meta_mut()
-    }
-    /// Take the label from the value
-    pub fn take_label(&mut self) -> Option<EcoString> {
-        unsafe { self.repr_mut() }.arr.take_label()
-    }
-    /// Take the map keys from the value
-    pub fn take_map_keys(&mut self) -> Option<MapKeys> {
-        unsafe { self.repr_mut() }.arr.take_map_keys()
-    }
-    /// Take the persistent metadata from the value
-    pub fn take_per_meta(&mut self) -> PersistentMeta {
-        unsafe { self.repr_mut() }.arr.take_per_meta()
-    }
-    /// Set the persistent metadata for the value
-    pub fn set_per_meta(&mut self, per_meta: PersistentMeta) {
-        unsafe { self.repr_mut() }.arr.set_per_meta(per_meta)
-    }
-    /// Get the value's map keys
-    pub fn map_keys(&self) -> Option<&MapKeys> {
-        unsafe { self.repr() }.arr.map_keys()
-    }
-    /// Get a mutable reference to the value's map keys
-    pub fn map_keys_mut(&mut self) -> Option<&mut MapKeys> {
-        unsafe { self.repr_mut() }.arr.map_keys_mut()
-    }
-    /// Combine this value's metadata with another
-    pub fn combine_meta(&mut self, other: &ArrayMeta) {
-        unsafe { self.repr_mut() }.arr.combine_meta(other)
-    }
-    /// Reset this value's metadata
-    pub fn reset_meta(&mut self) {
-        unsafe { self.repr_mut() }.arr.reset_meta()
-    }
-    /// Reset this value's metadata flags
-    pub fn reset_meta_flags(&mut self) {
-        unsafe { self.repr_mut() }.arr.reset_meta_flags()
-    }
-    /// Add a 1-length dimension to the front of the value's shape
+    /// Add a 1-length dimension to the front of the array's shape
     pub fn fix(&mut self) {
-        unsafe { self.repr_mut() }.arr.fix()
+        self.fix_depth(0);
     }
     pub(crate) fn fix_depth(&mut self, depth: usize) {
-        unsafe { self.repr_mut() }.arr.fix_depth(depth)
+        let depth = depth.min(self.rank());
+        self.shape.fix_depth(depth);
+        if depth == 0 {
+            if let Some(keys) = self.meta.map_keys_mut() {
+                keys.fix();
+            }
+        }
     }
-    /// Remove a 1-length dimension from the front of the value's shape
-    pub fn unfix(&mut self) -> bool {
-        unsafe { self.repr_mut() }.arr.unfix()
+    /// Set the sortedness flags according to the value's data
+    pub fn derive_sortedness(&mut self) {
+        val_as_arr!(self, |array| array.derive_sortedness());
     }
-    pub(crate) fn validate_shape(&self) {
-        self.generic_ref(
-            Array::validate_shape,
-            Array::validate_shape,
-            Array::validate_shape,
-            Array::validate_shape,
-            Array::validate_shape,
-        )
+    /// Remove a 1-length dimension from the front of the array's shape
+    pub fn unfix(&mut self, env: &Uiua) -> UiuaResult {
+        if let Some(keys) = self.meta.map_keys_mut() {
+            keys.unfix();
+        }
+        self.shape.unfix().map_err(|e| env.error(e))?;
+        self.meta.take_sorted_flags();
+        self.validate();
+        Ok(())
+    }
+    /// Collapse the top two dimensions of the array's shape
+    pub fn undo_fix(&mut self) {
+        if let Some(keys) = self.meta.map_keys_mut() {
+            if !keys.unfix() {
+                self.meta.take_map_keys();
+            }
+        }
+        _ = self.shape.unfix();
+        self.meta.take_sorted_flags();
+        self.validate();
+    }
+    /// Ensure the value's invariants are upheld
+    #[track_caller]
+    pub(crate) fn validate(&self) {
+        val_as_arr!(self, |arr| arr.validate());
     }
     /// Get the row at the given index
     #[track_caller]
     pub fn row(&self, i: usize) -> Self {
-        match self {
-            Value::Num(arr) => arr.row(i).into(),
-            Value::Byte(arr) => arr.row(i).into(),
-            Value::Complex(arr) => arr.row(i).into(),
-            Value::Char(arr) => arr.row(i).into(),
-            Value::Box(arr) => arr.row(i).into(),
-        }
+        val_as_arr!(self, |arr| arr.row(i).into())
     }
     #[track_caller]
     pub(crate) fn depth_row(&self, depth: usize, i: usize) -> Self {
-        match self {
-            Value::Num(arr) => arr.depth_row(depth, i).into(),
-            Value::Byte(arr) => arr.depth_row(depth, i).into(),
-            Value::Complex(arr) => arr.depth_row(depth, i).into(),
-            Value::Char(arr) => arr.depth_row(depth, i).into(),
-            Value::Box(arr) => arr.depth_row(depth, i).into(),
-        }
+        val_as_arr!(self, |arr| arr.depth_row(depth, i).into())
     }
-    pub(crate) fn generic_into<T>(
-        self,
-        n: impl FnOnce(Array<f64>) -> T,
-        _b: impl FnOnce(Array<u8>) -> T,
-        _co: impl FnOnce(Array<Complex>) -> T,
-        ch: impl FnOnce(Array<char>) -> T,
-        f: impl FnOnce(Array<Boxed>) -> T,
-    ) -> T {
-        match self {
-            Self::Num(array) => n(array),
-            Self::Byte(array) => _b(array),
-            Self::Complex(array) => _co(array),
-            Self::Char(array) => ch(array),
-            Self::Box(array) => f(array),
-        }
-    }
-    pub(crate) fn generic_ref<'a, T: 'a>(
-        &'a self,
-        n: impl FnOnce(&'a Array<f64>) -> T,
-        _b: impl FnOnce(&'a Array<u8>) -> T,
-        _co: impl FnOnce(&'a Array<Complex>) -> T,
-        ch: impl FnOnce(&'a Array<char>) -> T,
-        f: impl FnOnce(&'a Array<Boxed>) -> T,
-    ) -> T {
-        match self {
-            Self::Num(array) => n(array),
-            Self::Byte(array) => _b(array),
-            Self::Complex(array) => _co(array),
-            Self::Char(array) => ch(array),
-            Self::Box(array) => f(array),
-        }
-    }
-    pub(crate) fn generic_ref_env<'a, T: 'a>(
-        &'a self,
-        n: impl FnOnce(&'a Array<f64>, &Uiua) -> UiuaResult<T>,
-        b: impl FnOnce(&'a Array<u8>, &Uiua) -> UiuaResult<T>,
-        co: impl FnOnce(&'a Array<Complex>, &Uiua) -> UiuaResult<T>,
-        ch: impl FnOnce(&'a Array<char>, &Uiua) -> UiuaResult<T>,
-        f: impl FnOnce(&'a Array<Boxed>, &Uiua) -> UiuaResult<T>,
-        env: &Uiua,
-    ) -> UiuaResult<T> {
-        self.generic_ref(
-            |a| n(a, env),
-            |a| b(a, env),
-            |a| co(a, env),
-            |a| ch(a, env),
-            |a| f(a, env),
-        )
-    }
-    pub(crate) fn generic_mut_shallow<T>(
-        &mut self,
-        n: impl FnOnce(&mut Array<f64>) -> T,
-        _b: impl FnOnce(&mut Array<u8>) -> T,
-        _co: impl FnOnce(&mut Array<Complex>) -> T,
-        ch: impl FnOnce(&mut Array<char>) -> T,
-        f: impl FnOnce(&mut Array<Boxed>) -> T,
-    ) -> T {
-        match self {
-            Self::Num(array) => n(array),
-            Self::Byte(array) => _b(array),
-            Self::Complex(array) => _co(array),
-            Self::Char(array) => ch(array),
-            Self::Box(array) => f(array),
-        }
+    #[track_caller]
+    /// Create an value that is a slice of this values's rows
+    ///
+    /// Generally doesn't allocate
+    ///
+    /// - `start` must be <= `end`
+    /// - `start` must be < `self.row_count()`
+    /// - `end` must be <= `self.row_count()`
+    pub(crate) fn slice_rows(&self, start: usize, end: usize) -> Self {
+        val_as_arr!(self, |arr| arr.slice_rows(start, end).into())
     }
     pub(crate) fn generic_mut_deep<T>(
         &mut self,
         n: impl FnOnce(&mut Array<f64>) -> T,
-        _b: impl FnOnce(&mut Array<u8>) -> T,
-        _co: impl FnOnce(&mut Array<Complex>) -> T,
+        b: impl FnOnce(&mut Array<u8>) -> T,
+        co: impl FnOnce(&mut Array<Complex>) -> T,
         ch: impl FnOnce(&mut Array<char>) -> T,
         f: impl FnOnce(&mut Array<Boxed>) -> T,
     ) -> T {
         match self {
             Self::Num(array) => n(array),
-            Self::Byte(array) => _b(array),
-            Self::Complex(array) => _co(array),
+            Self::Byte(array) => b(array),
+            Self::Complex(array) => co(array),
             Self::Char(array) => ch(array),
             Self::Box(array) => {
                 if let Some(Boxed(value)) = array.as_scalar_mut() {
-                    value.generic_mut_deep(n, _b, _co, ch, f)
+                    value.generic_mut_deep(n, b, co, ch, f)
                 } else {
                     f(array)
                 }
@@ -587,13 +554,7 @@ impl Value {
     }
     /// Ensure that the capacity is at least `min`
     pub(crate) fn reserve_min(&mut self, min: usize) {
-        match self {
-            Self::Num(arr) => arr.data.reserve_min(min),
-            Self::Byte(arr) => arr.data.reserve_min(min),
-            Self::Complex(arr) => arr.data.reserve_min(min),
-            Self::Char(arr) => arr.data.reserve_min(min),
-            Self::Box(arr) => arr.data.reserve_min(min),
-        }
+        val_as_arr!(self, |arr| arr.data.reserve_min(min))
     }
     /// Get the pretty-printed string representation of the value that appears in output
     pub fn show(&self) -> String {
@@ -601,27 +562,268 @@ impl Value {
     }
     /// Get the pretty-printed string representation of the value that appears when formatted
     pub fn format(&self) -> String {
+        fn recur(val: &Value, qoute: bool) -> String {
+            if val.is_map() {
+                let mut s = "{".to_string();
+                for (i, (k, v)) in val.map_kv().into_iter().enumerate() {
+                    if i > 0 {
+                        s.push(' ');
+                    }
+                    s.push_str(&recur(&k, true));
+                    s.push('→');
+                    s.push_str(&recur(&v, true));
+                }
+                s.push('}');
+                return s;
+            }
+            match val {
+                Value::Num(arr) if arr.rank() == 0 => arr.data[0].to_string(),
+                Value::Byte(arr) if arr.rank() == 0 => arr.data[0].to_string(),
+                Value::Complex(arr) if arr.rank() == 0 => arr.data[0].to_string(),
+                Value::Char(arr) if arr.rank() < 2 => {
+                    let mut s: String = arr.data.iter().collect();
+                    if qoute {
+                        s = format!("{s:?}");
+                    }
+                    s
+                }
+                Value::Box(arr) if arr.rank() == 0 => recur(&arr.data[0].0, qoute),
+                value if value.rank() > 0 => {
+                    let mut s = "[".to_string();
+                    for (i, row) in value.rows().enumerate() {
+                        if i > 0 {
+                            s.push(' ');
+                        }
+                        s.push_str(&recur(&row, true));
+                    }
+                    s.push(']');
+                    s
+                }
+                value => value.to_string(),
+            }
+        }
+        recur(self, false)
+    }
+}
+
+pub(crate) trait ScalarNum: Copy {
+    fn from_u8(u: u8) -> Result<Self, FromU8Error>;
+    fn from_f64(f: f64) -> Result<Self, FromF64Error>;
+}
+
+pub(crate) enum FromU8Error {
+    NonBoolean,
+}
+
+pub(crate) enum FromF64Error {
+    NaN,
+    TooHigh,
+    TooLow,
+    NonInteger,
+    NonBoolean,
+}
+
+impl fmt::Display for FromU8Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Value::Num(arr) if arr.rank() == 0 => arr.data[0].to_string(),
-            Value::Complex(arr) if arr.rank() == 0 => arr.data[0].to_string(),
-            Value::Char(arr) if arr.rank() < 2 => arr.to_string(),
-            Value::Box(arr) if arr.rank() == 0 => arr.as_scalar().unwrap().0.format(),
-            value => value.grid_string(false),
+            FromU8Error::NonBoolean => write!(f, "not a boolean"),
         }
     }
+}
+
+impl fmt::Display for FromF64Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FromF64Error::NaN => write!(f, "present"),
+            FromF64Error::TooHigh => write!(f, "too high"),
+            FromF64Error::TooLow => write!(f, "too low"),
+            FromF64Error::NonInteger => write!(f, "not an integer"),
+            FromF64Error::NonBoolean => write!(f, "not a boolean"),
+        }
+    }
+}
+
+impl ScalarNum for usize {
+    fn from_u8(u: u8) -> Result<Self, FromU8Error> {
+        Ok(u as usize)
+    }
+    fn from_f64(f: f64) -> Result<Self, FromF64Error> {
+        if f.is_nan() {
+            Err(FromF64Error::NaN)
+        } else if f > usize::MAX as f64 {
+            Err(FromF64Error::TooHigh)
+        } else if f < 0.0 {
+            Err(FromF64Error::TooLow)
+        } else if f.fract() != 0.0 {
+            Err(FromF64Error::NonInteger)
+        } else {
+            Ok(f as usize)
+        }
+    }
+}
+
+impl ScalarNum for isize {
+    fn from_u8(u: u8) -> Result<Self, FromU8Error> {
+        Ok(u as isize)
+    }
+    fn from_f64(f: f64) -> Result<Self, FromF64Error> {
+        if f.is_nan() {
+            Err(FromF64Error::NaN)
+        } else if f > isize::MAX as f64 {
+            Err(FromF64Error::TooHigh)
+        } else if f < isize::MIN as f64 {
+            Err(FromF64Error::TooLow)
+        } else if f.fract() != 0.0 {
+            Err(FromF64Error::NonInteger)
+        } else {
+            Ok(f as isize)
+        }
+    }
+}
+
+impl ScalarNum for i64 {
+    fn from_u8(u: u8) -> Result<Self, FromU8Error> {
+        Ok(u as i64)
+    }
+    fn from_f64(f: f64) -> Result<Self, FromF64Error> {
+        if f.is_nan() {
+            Err(FromF64Error::NaN)
+        } else if f > i64::MAX as f64 {
+            Err(FromF64Error::TooHigh)
+        } else if f < i64::MIN as f64 {
+            Err(FromF64Error::TooLow)
+        } else if f.fract() != 0.0 {
+            Err(FromF64Error::NonInteger)
+        } else {
+            Ok(f as i64)
+        }
+    }
+}
+
+impl ScalarNum for Result<isize, bool> {
+    fn from_u8(u: u8) -> Result<Self, FromU8Error> {
+        Ok(Ok(u as isize))
+    }
+    fn from_f64(f: f64) -> Result<Self, FromF64Error> {
+        if f.is_nan() {
+            Err(FromF64Error::NaN)
+        } else if f.is_infinite() {
+            Ok(Err(f.is_sign_negative()))
+        } else if f > isize::MAX as f64 {
+            Err(FromF64Error::TooHigh)
+        } else if f < isize::MIN as f64 {
+            Err(FromF64Error::TooLow)
+        } else if f.fract() != 0.0 {
+            Err(FromF64Error::NonInteger)
+        } else {
+            Ok(Ok(f as isize))
+        }
+    }
+}
+
+impl ScalarNum for Option<isize> {
+    fn from_u8(u: u8) -> Result<Self, FromU8Error> {
+        Ok(Some(u as isize))
+    }
+    fn from_f64(f: f64) -> Result<Self, FromF64Error> {
+        Result::<isize, bool>::from_f64(f).map(Result::ok)
+    }
+}
+
+impl ScalarNum for u8 {
+    fn from_u8(u: u8) -> Result<Self, FromU8Error> {
+        Ok(u)
+    }
+    fn from_f64(f: f64) -> Result<Self, FromF64Error> {
+        if f.is_nan() {
+            Err(FromF64Error::NaN)
+        } else if f > u8::MAX as f64 {
+            Err(FromF64Error::TooHigh)
+        } else if f < 0.0 {
+            Err(FromF64Error::TooLow)
+        } else if f.fract() != 0.0 {
+            Err(FromF64Error::NonInteger)
+        } else {
+            Ok(f as u8)
+        }
+    }
+}
+
+impl ScalarNum for u16 {
+    fn from_u8(u: u8) -> Result<Self, FromU8Error> {
+        Ok(u as u16)
+    }
+    fn from_f64(f: f64) -> Result<Self, FromF64Error> {
+        if f.is_nan() {
+            Err(FromF64Error::NaN)
+        } else if f > u16::MAX as f64 {
+            Err(FromF64Error::TooHigh)
+        } else if f < 0.0 {
+            Err(FromF64Error::TooLow)
+        } else if f.fract() != 0.0 {
+            Err(FromF64Error::NonInteger)
+        } else {
+            Ok(f as u16)
+        }
+    }
+}
+
+impl ScalarNum for bool {
+    fn from_u8(u: u8) -> Result<Self, FromU8Error> {
+        match u {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(FromU8Error::NonBoolean),
+        }
+    }
+    fn from_f64(f: f64) -> Result<Self, FromF64Error> {
+        match f {
+            0.0 => Ok(false),
+            1.0 => Ok(true),
+            _ => Err(FromF64Error::NonBoolean),
+        }
+    }
+}
+
+impl ScalarNum for f64 {
+    fn from_u8(u: u8) -> Result<Self, FromU8Error> {
+        Ok(u as f64)
+    }
+    fn from_f64(f: f64) -> Result<Self, FromF64Error> {
+        Ok(f)
+    }
+}
+
+impl Value {
     /// Attempt to convert the array to a list of integers
     ///
     /// The `requirement` parameter is used in error messages.
-    pub fn as_ints(&self, env: &Uiua, requirement: &'static str) -> UiuaResult<Vec<isize>> {
-        self.as_number_list(env, requirement, |f| f.fract() == 0.0, |f| f as isize)
+    pub fn as_ints<C: ErrorContext>(
+        &self,
+        ctx: &C,
+        requirement: impl Into<Option<&'static str>>,
+    ) -> Result<Vec<isize>, C::Error> {
+        let requirement = requirement
+            .into()
+            .unwrap_or("Expected value to be array of integers");
+        self.as_number_list(ctx, requirement)
+    }
+    pub(crate) fn as_ints_or_infs(
+        &self,
+        env: &Uiua,
+        requirement: &'static str,
+    ) -> UiuaResult<Vec<Result<isize, bool>>> {
+        self.as_number_list(env, requirement)
     }
     /// Attempt to convert the array to a single boolean
     ///
     /// The `requirement` parameter is used in error messages.
-    pub fn as_bool(&self, env: &Uiua, mut requirement: &'static str) -> UiuaResult<bool> {
-        if requirement.is_empty() {
-            requirement = "Expected value to be boolean"
-        }
+    pub fn as_bool(
+        &self,
+        env: &Uiua,
+        requirement: impl Into<Option<&'static str>>,
+    ) -> UiuaResult<bool> {
+        let requirement = requirement.into().unwrap_or("Expected value to be boolean");
         Ok(match self {
             Value::Num(nums) => {
                 if nums.rank() > 0 {
@@ -654,28 +856,35 @@ impl Value {
                 }
             }
             value => {
-                return Err(env.error(format!("{requirement}, but it is {}", value.type_name())))
+                return Err(env.error(format!(
+                    "{requirement}, but it is {}",
+                    value.type_name_plural()
+                )))
             }
         })
     }
     /// Attempt to convert the array to a single natural number
     ///
     /// The `requirement` parameter is used in error messages.
-    pub fn as_nat(&self, env: &Uiua, mut requirement: &'static str) -> UiuaResult<usize> {
-        if requirement.is_empty() {
-            requirement = "Expected value to be a natural number";
-        }
+    pub fn as_nat(
+        &self,
+        env: &Uiua,
+        requirement: impl Into<Option<&'static str>>,
+    ) -> UiuaResult<usize> {
+        let requirement = requirement
+            .into()
+            .unwrap_or("Expected value to be a natural number");
         self.as_nat_or_inf(env, requirement)?
             .ok_or_else(|| env.error(format!("{requirement}, but it is infinity")))
     }
     pub(crate) fn as_nat_or_inf(
         &self,
         env: &Uiua,
-        mut requirement: &'static str,
+        requirement: impl Into<Option<&'static str>>,
     ) -> UiuaResult<Option<usize>> {
-        if requirement.is_empty() {
-            requirement = "Expected value to be a natural number or infinity";
-        }
+        let requirement = requirement
+            .into()
+            .unwrap_or("Expected value to be a natural number or infinity");
         Ok(match self {
             Value::Num(nums) => {
                 if nums.rank() > 0 {
@@ -717,49 +926,57 @@ impl Value {
     /// Attempt to convert the array to a single integer
     ///
     /// The `requirement` parameter is used in error messages.
-    pub fn as_int(&self, env: &Uiua, mut requirement: &'static str) -> UiuaResult<isize> {
-        if requirement.is_empty() {
-            requirement = "Expected value to be an integer";
-        }
+    pub fn as_int<C: ErrorContext>(
+        &self,
+        ctx: &C,
+        requirement: impl Into<Option<&'static str>>,
+    ) -> Result<isize, C::Error> {
+        let requirement = requirement
+            .into()
+            .unwrap_or("Expected value to be an integer");
         Ok(match self {
             Value::Num(nums) => {
                 if nums.rank() > 0 {
                     return Err(
-                        env.error(format!("{requirement}, but its rank is {}", nums.rank()))
+                        ctx.error(format!("{requirement}, but its rank is {}", nums.rank()))
                     );
                 }
                 let num = nums.data[0];
                 if num.is_infinite() {
-                    return Err(env.error(format!("{requirement}, but it is infinite")));
+                    return Err(ctx.error(format!("{requirement}, but it is infinite")));
                 }
                 if num.is_nan() {
-                    return Err(env.error(format!("{requirement}, but it is NaN")));
+                    return Err(ctx.error(format!("{requirement}, but it is NaN")));
                 }
                 if num.fract() != 0.0 {
-                    return Err(env.error(format!("{requirement}, but it has a fractional part")));
+                    return Err(ctx.error(format!("{requirement}, but it has a fractional part")));
                 }
                 num as isize
             }
             Value::Byte(bytes) => {
                 if bytes.rank() > 0 {
                     return Err(
-                        env.error(format!("{requirement}, but its rank is {}", bytes.rank()))
+                        ctx.error(format!("{requirement}, but its rank is {}", bytes.rank()))
                     );
                 }
                 bytes.data[0] as isize
             }
             value => {
-                return Err(env.error(format!("{requirement}, but it is {}", value.type_name())))
+                return Err(ctx.error(format!("{requirement}, but it is {}", value.type_name())))
             }
         })
     }
     /// Attempt to convert the array to a single number
     ///
     /// The `requirement` parameter is used in error messages.
-    pub fn as_num(&self, env: &Uiua, mut requirement: &'static str) -> UiuaResult<f64> {
-        if requirement.is_empty() {
-            requirement = "Expected value to be a number";
-        }
+    pub fn as_num(
+        &self,
+        env: &Uiua,
+        requirement: impl Into<Option<&'static str>>,
+    ) -> UiuaResult<f64> {
+        let requirement = requirement
+            .into()
+            .unwrap_or("Expected value to be a number");
         Ok(match self {
             Value::Num(nums) => {
                 if nums.rank() > 0 {
@@ -785,33 +1002,76 @@ impl Value {
     /// Attempt to convert the array to a list of numbers
     ///
     /// The `requirement` parameter is used in error messages.
-    pub fn as_nums(&self, env: &Uiua, requirement: &'static str) -> UiuaResult<Vec<f64>> {
-        self.as_number_list(env, requirement, |_| true, |f| f)
+    pub fn as_nums(
+        &self,
+        env: &Uiua,
+        requirement: impl Into<Option<&'static str>>,
+    ) -> UiuaResult<Vec<f64>> {
+        let requirement = requirement
+            .into()
+            .unwrap_or("Expected value to be array of numbers");
+        self.as_number_list(env, requirement)
     }
     /// Attempt to convert the array to a list of natural numbers
     ///
     /// The `requirement` parameter is used in error messages.
-    pub fn as_nats(&self, env: &Uiua, requirement: &'static str) -> UiuaResult<Vec<usize>> {
-        self.as_number_list(
-            env,
-            requirement,
-            |f| f.fract() == 0.0 && f >= 0.0,
-            |f| f as usize,
-        )
+    pub fn as_nats<C: ErrorContext>(
+        &self,
+        ctx: &C,
+        requirement: impl Into<Option<&'static str>>,
+    ) -> Result<Vec<usize>, C::Error> {
+        let requirement = requirement
+            .into()
+            .unwrap_or("Expected value to be array of natural numbers");
+        if let Value::Num(arr) = self {
+            if let Some(&(mut n)) =
+                (arr.data.iter()).find(|&&n| n > usize::MAX as f64 && n.fract() == 0.0)
+            {
+                let power = n.log10().floor() as i32;
+                n /= 10f64.powi(power);
+                return Err(ctx.error(format!("{requirement}, but {n}e{power} is too large")));
+            }
+        }
+        self.as_number_list(ctx, requirement)
     }
     /// Attempt to convert the array to a list of bytes
     ///
     /// The `requirement` parameter is used in error messages.
-    pub fn as_bytes(&self, env: &Uiua, requirement: &'static str) -> UiuaResult<Vec<u8>> {
-        self.as_number_list(
-            env,
-            requirement,
-            |f| f.fract() == 0.0 && (0.0..256.0).contains(&f),
-            |f| f as u8,
-        )
+    pub fn as_bytes(
+        &self,
+        env: &Uiua,
+        requirement: impl Into<Option<&'static str>>,
+    ) -> UiuaResult<Vec<u8>> {
+        let requirement = requirement
+            .into()
+            .unwrap_or("Expected value to be array of bytes");
+        self.as_number_list(env, requirement)
     }
-    pub(crate) fn as_bools(&self, env: &Uiua, requirement: &'static str) -> UiuaResult<Vec<bool>> {
-        self.as_number_list(env, requirement, |f| f == 0.0 || f == 1.0, |f| f == 1.0)
+    /// Attempt to convert the array to a list of u16s
+    ///
+    /// The `requirement` parameter is used in error messages.
+    pub fn as_u16s(
+        &self,
+        env: &Uiua,
+        requirement: impl Into<Option<&'static str>>,
+    ) -> UiuaResult<Vec<u16>> {
+        let requirement = requirement
+            .into()
+            .unwrap_or("Expected value to be array of unsigned 16-bit integers");
+        self.as_number_list(env, requirement)
+    }
+    /// Attempt to convert the array to a list of booleans
+    ///
+    /// The `requirement` parameter is used in error messages.
+    pub fn as_bools(
+        &self,
+        env: &Uiua,
+        requirement: impl Into<Option<&'static str>>,
+    ) -> UiuaResult<Vec<bool>> {
+        let requirement = requirement
+            .into()
+            .unwrap_or("Expected value to be array of booleans");
+        self.as_number_list(env, requirement)
     }
     /// Attempt to convert the array to a list of integers or infinity
     ///
@@ -821,65 +1081,55 @@ impl Value {
     pub fn as_rank_list(
         &self,
         env: &Uiua,
-        mut requirement: &'static str,
+        requirement: impl Into<Option<&'static str>>,
     ) -> UiuaResult<Vec<Option<isize>>> {
-        if requirement.is_empty() {
-            requirement = "Elements of rank list must be integers or infinity";
-        }
-        self.as_number_list(
-            env,
-            requirement,
-            |n| n.fract() == 0.0 || n == f64::INFINITY,
-            |n| {
-                if n == f64::INFINITY {
-                    None
-                } else {
-                    Some(n as isize)
-                }
-            },
-        )
+        let requirement = requirement
+            .into()
+            .unwrap_or("Elements of rank list must be integers or infinity");
+        self.as_number_list(env, requirement)
     }
-    pub(crate) fn as_number_list<T>(
+    pub(crate) fn as_number_list<T, C>(
         &self,
-        env: &Uiua,
+        ctx: &C,
         requirement: &'static str,
-        test: fn(f64) -> bool,
-        convert: fn(f64) -> T,
-    ) -> UiuaResult<Vec<T>> {
+    ) -> Result<Vec<T>, C::Error>
+    where
+        T: ScalarNum,
+        C: ErrorContext,
+    {
         Ok(match self {
             Value::Num(nums) => {
                 if nums.rank() > 1 {
                     return Err(
-                        env.error(format!("{requirement}, but its rank is {}", nums.rank()))
+                        ctx.error(format!("{requirement}, but its rank is {}", nums.rank()))
                     );
                 }
                 let mut result = Vec::with_capacity(nums.row_count());
-                for &num in nums.data() {
-                    if !test(num) {
-                        return Err(env.error(requirement));
-                    }
-                    result.push(convert(num));
+                for &num in &nums.data {
+                    result.push(
+                        T::from_f64(num)
+                            .map_err(|e| ctx.error(format!("{requirement}, but {num} is {e}")))?,
+                    );
                 }
                 result
             }
             Value::Byte(bytes) => {
                 if bytes.rank() > 1 {
                     return Err(
-                        env.error(format!("{requirement}, but its rank is {}", bytes.rank()))
+                        ctx.error(format!("{requirement}, but its rank is {}", bytes.rank()))
                     );
                 }
                 let mut result = Vec::with_capacity(bytes.row_count());
-                for &byte in bytes.data() {
-                    let num = byte as f64;
-                    if !test(num) {
-                        return Err(env.error(requirement));
-                    }
-                    result.push(convert(num));
+                for &byte in &bytes.data {
+                    result.push(
+                        T::from_u8(byte)
+                            .map_err(|e| ctx.error(format!("{requirement}, but {byte} is {e}")))?,
+                    );
                 }
                 result
             }
             value => {
-                return Err(env.error(format!(
+                return Err(ctx.error(format!(
                     "{requirement}, but it is {}",
                     value.type_name_plural()
                 )))
@@ -891,66 +1141,49 @@ impl Value {
         env: &Uiua,
         requirement: &'static str,
     ) -> UiuaResult<Array<isize>> {
-        self.as_number_array(
-            env,
-            requirement,
-            |_| true,
-            |n| n.fract() == 0.0,
-            |n| n as isize,
-        )
+        self.as_number_array(env, requirement)
     }
     pub(crate) fn as_natural_array(
         &self,
         env: &Uiua,
         requirement: &'static str,
     ) -> UiuaResult<Array<usize>> {
-        self.as_number_array(
-            env,
-            requirement,
-            |_| true,
-            |n| n.fract() == 0.0 && n >= 0.0,
-            |n| n as usize,
-        )
+        if let Value::Num(arr) = self {
+            if let Some(&(mut n)) =
+                (arr.data.iter()).find(|&&n| n > usize::MAX as f64 && n.fract() == 0.0)
+            {
+                let power = n.log10().floor() as i32;
+                n /= 10f64.powi(power);
+                return Err(env.error(format!("{requirement}, but {n}e{power} is too large")));
+            }
+        }
+        self.as_number_array(env, requirement)
     }
-    pub(crate) fn as_number_array<T: Clone>(
+    pub(crate) fn as_number_array<T: ScalarNum>(
         &self,
         env: &Uiua,
         requirement: &'static str,
-        test_shape: fn(&[usize]) -> bool,
-        test_num: fn(f64) -> bool,
-        convert_num: fn(f64) -> T,
     ) -> UiuaResult<Array<T>> {
         Ok(match self {
             Value::Num(nums) => {
-                if !test_shape(self.shape()) {
-                    return Err(
-                        env.error(format!("{requirement}, but its shape is {}", nums.shape()))
+                let mut result = EcoVec::with_capacity(nums.element_count());
+                for &num in &nums.data {
+                    result.push(
+                        T::from_f64(num)
+                            .map_err(|e| env.error(format!("{requirement}, but {num} is {e}")))?,
                     );
                 }
-                let mut result = EcoVec::with_capacity(nums.element_count());
-                for &num in nums.data() {
-                    if !test_num(num) {
-                        return Err(env.error(requirement));
-                    }
-                    result.push(convert_num(num));
-                }
-                Array::new(self.shape().clone(), result)
+                Array::new(self.shape.clone(), result)
             }
             Value::Byte(bytes) => {
-                if !test_shape(self.shape()) {
-                    return Err(
-                        env.error(format!("{requirement}, but its shape is {}", bytes.shape()))
+                let mut result = EcoVec::with_capacity(bytes.element_count());
+                for &byte in &bytes.data {
+                    result.push(
+                        T::from_u8(byte)
+                            .map_err(|e| env.error(format!("{requirement}, but {byte} is {e}")))?,
                     );
                 }
-                let mut result = EcoVec::with_capacity(bytes.element_count());
-                for &byte in bytes.data() {
-                    let num = byte as f64;
-                    if !test_num(num) {
-                        return Err(env.error(requirement));
-                    }
-                    result.push(convert_num(num));
-                }
-                Array::new(self.shape().clone(), result)
+                Array::new(self.shape.clone(), result)
             }
             value => {
                 return Err(env.error(format!(
@@ -963,38 +1196,86 @@ impl Value {
     /// Attempt to convert the array to a string
     ///
     /// The `requirement` parameter is used in error messages.
-    pub fn as_string(&self, env: &Uiua, mut requirement: &'static str) -> UiuaResult<String> {
-        if requirement.is_empty() {
-            requirement = "Expected value to be a string";
+    pub fn as_string(
+        &self,
+        env: &Uiua,
+        requirement: impl Into<Option<&'static str>>,
+    ) -> UiuaResult<String> {
+        let requirement = requirement
+            .into()
+            .unwrap_or("Expected value to be a string");
+        match (self, self.rank()) {
+            (Value::Char(chars), 0 | 1) => Ok(chars.data.iter().collect()),
+            (Value::Char(_), n) => Err(env.error(format!("{requirement}, but its rank is {n}"))),
+            (Value::Box(boxes), 0) => boxes.data[0].0.as_string(env, requirement),
+            (val, _) => Err(env.error(format!(
+                "{requirement}, but it is {}",
+                val.type_name_plural()
+            ))),
         }
-        match self {
-            Value::Char(chars) => {
-                if chars.rank() > 1 {
-                    return Err(
-                        env.error(format!("{requirement}, but its rank is {}", chars.rank()))
-                    );
-                }
-                return Ok(chars.data().iter().collect());
-            }
-            Value::Box(boxes) => {
-                if let Some(bx) = boxes.as_scalar() {
-                    return bx.as_value().as_string(env, requirement);
-                }
-            }
-            _ => {}
+    }
+    /// Attempt to convert the array to a string
+    pub fn as_string_opt(&self) -> Option<String> {
+        match (self, self.rank()) {
+            (Value::Char(chars), 0 | 1) => Some(chars.data.iter().collect()),
+            (Value::Box(boxes), 0) => boxes.data[0].0.as_string_opt(),
+            _ => None,
         }
-        Err(env.error(format!(
-            "{requirement}, but its type is {}",
-            self.type_name()
-        )))
+    }
+    /// Attempt to convert the array to a list of strings
+    ///
+    /// A rank-1 character array is treated as a single string.
+    ///
+    /// The `requirement` parameter is used in error messages.
+    pub fn as_strings(
+        &self,
+        env: &Uiua,
+        requirement: impl Into<Option<&'static str>>,
+    ) -> UiuaResult<Vec<String>> {
+        let requirement = requirement
+            .into()
+            .unwrap_or("Expected value to be a string or list of strings");
+
+        match (self, self.rank()) {
+            (Value::Char(chars), 0 | 1) => Ok(vec![chars.data.iter().collect()]),
+            (Value::Char(chars), 2) => {
+                let mut strings = Vec::with_capacity(self.row_count());
+                for row in chars.row_slices() {
+                    strings.push(row.iter().copied().collect());
+                }
+                Ok(strings)
+            }
+            (Value::Char(_), n) => Err(env.error(format!(
+                "{requirement}, but it is a rank-{n} character array"
+            ))),
+            (Value::Box(boxes), 0) => boxes.data[0].0.as_strings(env, requirement),
+            (Value::Box(boxes), 1) => {
+                let mut strings = Vec::with_capacity(boxes.row_count());
+                for Boxed(val) in &boxes.data {
+                    strings.push(val.as_string(env, requirement)?);
+                }
+                Ok(strings)
+            }
+            (Value::Box(_), n) => {
+                Err(env.error(format!("{requirement}, but it is a rank-{n} box array")))
+            }
+            (val, _) => Err(env.error(format!(
+                "{requirement}, but it is {}",
+                val.type_name_plural()
+            ))),
+        }
     }
     /// Attempt to convert the array to a list of bytes
     ///
     /// The `requirement` parameter is used in error messages.
-    pub fn into_bytes(self, env: &Uiua, mut requirement: &'static str) -> UiuaResult<Vec<u8>> {
-        if requirement.is_empty() {
-            requirement = "Expected value to be a list of bytes";
-        }
+    pub fn into_bytes(
+        self,
+        env: &Uiua,
+        requirement: impl Into<Option<&'static str>>,
+    ) -> UiuaResult<Vec<u8>> {
+        let requirement = requirement
+            .into()
+            .unwrap_or("Expected value to be a list of bytes");
         Ok(match self {
             Value::Byte(a) => {
                 if a.rank() != 1 {
@@ -1088,6 +1369,22 @@ impl Value {
             val => val,
         }
     }
+    /// Remove a single layer of boxing if the condition is met
+    pub fn unboxed_if(self, unbox: bool) -> Self {
+        if unbox {
+            self.unboxed()
+        } else {
+            self
+        }
+    }
+    /// Box the value if the condition is met
+    pub fn boxed_if(self, do_box: bool) -> Self {
+        if do_box {
+            Boxed(self).into()
+        } else {
+            self
+        }
+    }
     /// Turn the value into a scalar box if it is not one already
     pub fn box_if_not(&mut self) {
         match &mut *self {
@@ -1111,7 +1408,7 @@ impl Value {
                 let mut compress = true;
                 let mut boolean = true;
                 for &n in &nums.data {
-                    if n.fract() != 0.0 || n < 0.0 || n > u8::MAX as f64 {
+                    if n.fract() != 0.0 || n.is_sign_negative() || n > u8::MAX as f64 {
                         compress = false;
                         boolean = false;
                         break;
@@ -1129,7 +1426,7 @@ impl Value {
                     let mut arr = Array::new(take(&mut nums.shape), bytes);
                     arr.meta = meta;
                     if boolean {
-                        arr.meta_mut().flags.set(ArrayFlags::BOOLEAN, true);
+                        arr.meta.flags.set(ArrayFlags::BOOLEAN, true);
                     }
                     *self = arr.into();
                 }
@@ -1143,7 +1440,7 @@ impl Value {
                     }
                 }
                 if boolean {
-                    bytes.meta_mut().flags.set(ArrayFlags::BOOLEAN, true);
+                    bytes.meta.flags.set(ArrayFlags::BOOLEAN, true);
                 }
             }
             _ => {}
@@ -1151,6 +1448,9 @@ impl Value {
     }
     /// Convert to a box array by boxing every element
     pub fn coerce_to_boxes(self) -> Array<Boxed> {
+        if self.rank() == 0 && !matches!(self, Value::Box(_)) {
+            return Boxed(self).into();
+        }
         match self {
             Value::Num(arr) => arr.convert_with(|v| Boxed(Value::from(v))),
             Value::Byte(arr) => arr.convert_with(|v| Boxed(Value::from(v))),
@@ -1161,6 +1461,12 @@ impl Value {
     }
     /// Convert to a box array by boxing every element
     pub fn coerce_as_boxes(&self) -> Cow<Array<Boxed>> {
+        if self.rank() == 0 {
+            return match self {
+                Value::Box(arr) => Cow::Borrowed(arr),
+                val => Cow::Owned(Boxed(val.clone()).into()),
+            };
+        }
         match self {
             Value::Num(arr) => Cow::Owned(arr.convert_ref_with(|v| Boxed(Value::from(v)))),
             Value::Byte(arr) => Cow::Owned(arr.convert_ref_with(|v| Boxed(Value::from(v)))),
@@ -1171,10 +1477,10 @@ impl Value {
     }
     /// Propogate a value's label accross an operation
     pub fn keep_label(mut self, f: impl FnOnce(Self) -> UiuaResult<Self>) -> UiuaResult<Self> {
-        let label = self.take_label();
+        let label = self.meta.take_label();
         let mut result = f(self)?;
         if let Some(label) = label {
-            result.meta_mut().label = Some(label);
+            result.meta.label = Some(label);
         }
         Ok(result)
     }
@@ -1184,20 +1490,26 @@ impl Value {
         mut other: Self,
         f: impl FnOnce(Self, Self) -> UiuaResult<Self>,
     ) -> UiuaResult<Self> {
-        let label = self.take_label();
-        let other_label = other.take_label();
+        let label = self.meta.take_label();
+        let other_label = other.meta.take_label();
         let mut result = f(self, other)?;
-        if let Some(label) = label.xor(other_label) {
-            result.meta_mut().label = Some(label);
+        match (label, other_label) {
+            (Some(label), None) | (None, Some(label)) => {
+                result.meta.label = Some(label);
+            }
+            (Some(a), Some(b)) if a == b => {
+                result.meta.label = Some(a);
+            }
+            _ => {}
         }
         Ok(result)
     }
     /// Propogate a value's map keys accross an operation
     pub fn keep_map_key(mut self, f: impl FnOnce(Self) -> UiuaResult<Self>) -> UiuaResult<Self> {
-        let keys = self.take_map_keys();
+        let keys = self.meta.take_map_keys();
         let mut result = f(self)?;
         if let Some(keys) = keys {
-            result.meta_mut().map_keys = Some(keys);
+            result.meta.map_keys = Some(keys);
         }
         Ok(result)
     }
@@ -1207,11 +1519,11 @@ impl Value {
         mut other: Self,
         f: impl FnOnce(Self, Self) -> UiuaResult<Self>,
     ) -> UiuaResult<Self> {
-        let keys = self.take_map_keys();
-        let other_keys = other.take_map_keys();
+        let keys = self.meta.take_map_keys();
+        let other_keys = other.meta.take_map_keys();
         let mut result = f(self, other)?;
         if let Some(keys) = keys.xor(other_keys) {
-            result.meta_mut().map_keys = Some(keys);
+            result.meta.map_keys = Some(keys);
         }
         Ok(result)
     }
@@ -1226,6 +1538,34 @@ impl Value {
         f: impl FnOnce(Self, Self) -> UiuaResult<Self>,
     ) -> UiuaResult<Self> {
         self.keep_labels(other, |a, b| a.keep_map_keys(b, f))
+    }
+    pub(crate) fn match_fill<C: FillContext>(&mut self, ctx: &C) {
+        if let Value::Byte(arr) = self {
+            if arr.meta.flags.is_boolean() && ctx.scalar_fill::<f64>().is_ok() {
+                arr.meta.flags.remove(ArrayFlags::BOOLEAN);
+            }
+            if ctx.number_only_fill() {
+                let shape = take(&mut arr.shape);
+                let meta = take(&mut arr.meta);
+                let data: EcoVec<f64> = take(&mut arr.data).into_iter().map(|b| b as f64).collect();
+                let mut array = Array::new(shape, data);
+                array.meta = meta;
+                *self = array.into();
+            }
+        }
+    }
+    pub(crate) fn has_wildcard(&self) -> bool {
+        val_as_arr!(self, |arr| arr.data.iter().any(ArrayValue::has_wildcard))
+    }
+    pub(crate) fn box_nesting(&self) -> usize {
+        let Value::Box(arr) = self else {
+            return 0;
+        };
+        (arr.data.iter())
+            .map(|Boxed(v)| v.box_nesting())
+            .max()
+            .unwrap_or(0)
+            + 1
     }
 }
 
@@ -1249,6 +1589,12 @@ macro_rules! value_from {
         impl<const N: usize> From<[$ty; N]> for Value {
             fn from(array: [$ty; N]) -> Self {
                 Self::$variant(Array::from_iter(array))
+            }
+        }
+        impl<const M: usize, const N: usize> From<[[$ty; N]; M]> for Value {
+            fn from(array: [[$ty; N]; M]) -> Self {
+                let data: EcoVec<$ty> = array.into_iter().flatten().collect();
+                Self::$variant(Array::new([M, N], data))
             }
         }
         impl From<CowSlice<$ty>> for Value {
@@ -1286,14 +1632,26 @@ impl FromIterator<usize> for Value {
     }
 }
 
+impl FromIterator<String> for Value {
+    fn from_iter<I: IntoIterator<Item = String>>(iter: I) -> Self {
+        iter.into_iter().map(|s| Boxed(s.into())).collect()
+    }
+}
+
 impl From<bool> for Value {
     fn from(b: bool) -> Self {
-        Value::from(b as u8)
+        Value::from(Array::<u8>::from(b))
     }
 }
 
 impl From<usize> for Value {
     fn from(i: usize) -> Self {
+        Value::from(i as f64)
+    }
+}
+
+impl From<i64> for Value {
+    fn from(i: i64) -> Self {
         Value::from(i as f64)
     }
 }
@@ -1324,30 +1682,57 @@ impl From<i32> for Value {
     }
 }
 
-macro_rules! value_un_impl {
-    ($name:ident, $(
-        $([$(|$meta:ident| $pred:expr,)* $in_place:ident, $f:ident])?
-        $(($make_new:ident, $f2:ident))?
-    ),* $(,)?) => {
+impl From<Vec<u8>> for Value {
+    fn from(vec: Vec<u8>) -> Self {
+        let mut data = CowSlice::new();
+        data.extend_from_vec(vec);
+        Self::from(data)
+    }
+}
+
+impl<const M: usize, const N: usize> From<[[i32; N]; M]> for Value {
+    fn from(array: [[i32; N]; M]) -> Self {
+        let data: EcoVec<f64> = array.into_iter().flatten().map(|n| n as f64).collect();
+        Self::Num(Array::new([M, N], data))
+    }
+}
+
+impl<const N: usize> From<[i32; N]> for Value {
+    fn from(array: [i32; N]) -> Self {
+        let data: EcoVec<f64> = array.into_iter().map(|n| n as f64).collect();
+        Self::Num(Array::new(N, data))
+    }
+}
+
+macro_rules! value_mon_impl {
+    (
+        $name:ident,
+        $(
+            $([$(|$meta:ident| $pred:expr,)* $in_place:ident, $f:ident])?
+            $(($make_new:ident, $f2:ident))?
+        ),*
+        $(|$sorted_val:ident, $sorted_flags:ident| $sorted_body:expr)?
+    ) => {
         impl Value {
-            #[allow(clippy::redundant_closure_call)]
-            pub(crate) fn $name(self, env: &Uiua) -> UiuaResult<Self> {
-                self.keep_meta(|val| Ok(match val {
-                    $($(Self::$in_place(mut array) $(if (|$meta: &ArrayMeta| $pred)(array.meta()))* => {
+            #[allow(unused_mut, clippy::redundant_closure_call)]
+            pub(crate) fn $name(mut self, env: &Uiua) -> UiuaResult<Self> {
+                let _sorted_flags = self.meta.take_sorted_flags();
+                let mut val: Value = self.keep_meta(|val| Ok(match val {
+                    $($(Self::$in_place(mut array) $(if (|$meta: &ArrayMeta| $pred)(&array.meta))* => {
                         for val in &mut array.data {
                             *val = $name::$f(*val);
                         }
                         array.into()
                     },)*)*
                     $($(Self::$make_new(array) => {
-                        let mut new = EcoVec::with_capacity(array.flat_len());
+                        let mut new = EcoVec::with_capacity(array.element_count());
                         for val in array.data {
                             new.push($name::$f2(val));
                         }
                         (array.shape, new).into()
                     },)*)*
                     Value::Box(mut array) => {
-                        let mut new_data = EcoVec::with_capacity(array.flat_len());
+                        let mut new_data = EcoVec::with_capacity(array.element_count());
                         for b in array.data {
                             new_data.push(Boxed(b.0.$name(env)?));
                         }
@@ -1356,87 +1741,124 @@ macro_rules! value_un_impl {
                     }
                     #[allow(unreachable_patterns)]
                     val => return Err($name::error(val.type_name(), env))
-                }))
+                }))?;
+                $((|$sorted_val: &mut Value, $sorted_flags| $sorted_body)(&mut val, _sorted_flags);)?
+                val.validate();
+                Ok(val)
             }
         }
     }
 }
 
-value_un_impl!(
+value_mon_impl!(
     scalar_neg,
     [Num, num],
     (Byte, byte),
     [Complex, com],
     [Char, char]
 );
-value_un_impl!(
+value_mon_impl!(
     not,
     [Num, num],
     [|meta| meta.flags.is_boolean(), Byte, bool],
     (Byte, byte),
-    [Complex, com]
+    [Complex, com],
+    |val, flags| val.meta.or_sorted_flags_rev(flags)
 );
-value_un_impl!(
+value_mon_impl!(
     scalar_abs,
     [Num, num],
     (Byte, byte),
     (Complex, com),
     [Char, char]
 );
-value_un_impl!(sign, [Num, num], [Byte, byte], [Complex, com], (Char, char));
-value_un_impl!(
+value_mon_impl!(
+    sign,
+    [Num, num],
+    [Byte, byte],
+    [Complex, com],
+    (Char, char),
+    |val, flags| if val.rank() < 2 {
+        val.meta.or_sorted_flags(flags)
+    }
+);
+value_mon_impl!(
     sqrt,
     [Num, num],
     [|meta| meta.flags.is_boolean(), Byte, bool],
     (Byte, byte),
     [Complex, com]
 );
-value_un_impl!(sin, [Num, num], (Byte, byte), [Complex, com]);
-value_un_impl!(cos, [Num, num], (Byte, byte), [Complex, com]);
-value_un_impl!(asin, [Num, num], (Byte, byte), [Complex, com]);
-value_un_impl!(floor, [Num, num], [Byte, byte], [Complex, com]);
-value_un_impl!(ceil, [Num, num], [Byte, byte], [Complex, com]);
-value_un_impl!(round, [Num, num], [Byte, byte], [Complex, com]);
-value_un_impl!(
+value_mon_impl!(exp, [Num, num], (Byte, byte), [Complex, com]);
+value_mon_impl!(ln, [Num, num], (Byte, byte), [Complex, com]);
+value_mon_impl!(sin, [Num, num], (Byte, byte), [Complex, com]);
+value_mon_impl!(cos, [Num, num], (Byte, byte), [Complex, com]);
+value_mon_impl!(asin, [Num, num], (Byte, byte), [Complex, com]);
+value_mon_impl!(acos, [Num, num], (Byte, byte), [Complex, com]);
+value_mon_impl!(
+    floor,
+    [Num, num],
+    [Byte, byte],
+    [Complex, com],
+    |val, flags| val.meta.or_sorted_flags(flags)
+);
+value_mon_impl!(
+    ceil,
+    [Num, num],
+    [Byte, byte],
+    [Complex, com],
+    |val, flags| val.meta.or_sorted_flags(flags)
+);
+value_mon_impl!(
+    round,
+    [Num, num],
+    [Byte, byte],
+    [Complex, com],
+    |val, flags| val.meta.or_sorted_flags(flags)
+);
+value_mon_impl!(
     complex_re,
     [Num, generic],
     [Byte, generic],
     (Complex, com),
     [Char, generic]
 );
-value_un_impl!(complex_im, [Num, num], [Byte, byte], (Complex, com));
+value_mon_impl!(complex_im, [Num, num], [Byte, byte], (Complex, com));
 
 impl Value {
     /// Get the `absolute value` of a value
     pub fn abs(self, env: &Uiua) -> UiuaResult<Self> {
         match self {
-            Value::Char(mut chars) if chars.rank() == 1 && env.char_fill().is_ok() => {
+            Value::Char(mut chars) if chars.rank() == 1 && env.scalar_fill::<char>().is_ok() => {
                 chars.data = (chars.data.into_iter())
                     .flat_map(|c| c.to_uppercase())
                     .collect();
                 chars.shape = chars.data.len().into();
                 Ok(chars.into())
             }
-            Value::Char(chars) if chars.rank() > 1 && env.char_fill().is_ok() => {
+            Value::Char(mut chars) if chars.rank() > 1 && env.scalar_fill::<char>().is_ok() => {
+                let meta = chars.meta.get_mut().map(take);
                 let mut rows = Vec::new();
                 for row in chars.row_shaped_slices(Shape::from(*chars.shape.last().unwrap())) {
                     rows.push(Array::<char>::from_iter(
-                        row.data().iter().flat_map(|c| c.to_uppercase()),
+                        row.data.iter().flat_map(|c| c.to_uppercase()),
                     ));
                 }
                 let mut arr = Array::from_row_arrays(rows, env)?;
                 let last = arr.shape.pop().unwrap();
                 arr.shape = chars.shape;
                 *arr.shape.last_mut().unwrap() = last;
+                arr.meta = meta.unwrap_or_default();
                 Ok(arr.into())
             }
             value => value.scalar_abs(env),
         }
     }
     /// `negate` a value
-    pub fn neg(self, env: &Uiua) -> UiuaResult<Self> {
-        match self {
-            Value::Char(mut chars) if chars.rank() == 1 && env.char_fill().is_ok() => {
+    pub fn neg(mut self, env: &Uiua) -> UiuaResult<Self> {
+        let sorted_flags = self.meta.take_sorted_flags();
+        let mut val = match self {
+            Value::Char(mut chars) if chars.rank() == 1 && env.scalar_fill::<char>().is_ok() => {
                 let mut new_data = EcoVec::with_capacity(chars.data.len());
                 for c in chars.data {
                     if c.is_uppercase() {
@@ -1447,13 +1869,13 @@ impl Value {
                 }
                 chars.data = new_data.into();
                 chars.shape = chars.data.len().into();
-                Ok(chars.into())
+                chars.into()
             }
-            Value::Char(chars) if chars.rank() > 1 && env.char_fill().is_ok() => {
+            Value::Char(chars) if chars.rank() > 1 && env.scalar_fill::<char>().is_ok() => {
                 let mut rows = Vec::new();
                 for row in chars.row_shaped_slices(Shape::from(*chars.shape.last().unwrap())) {
-                    let mut new_data = EcoVec::with_capacity(row.data().len());
-                    for c in row.data() {
+                    let mut new_data = EcoVec::with_capacity(row.data.len());
+                    for c in row.data {
                         if c.is_uppercase() {
                             new_data.extend(c.to_lowercase());
                         } else {
@@ -1466,192 +1888,322 @@ impl Value {
                 let last = arr.shape.pop().unwrap();
                 arr.shape = chars.shape;
                 *arr.shape.last_mut().unwrap() = last;
-                Ok(arr.into())
+                arr.into()
             }
-            value => value.scalar_neg(env),
+            value => value.scalar_neg(env)?,
+        };
+        val.meta.or_sorted_flags_rev(sorted_flags);
+        Ok(val)
+    }
+    /// Raise a value to a power
+    pub fn pow(self, base: Self, env: &Uiua) -> UiuaResult<Self> {
+        if let Ok(pow) = self.as_int(env, None) {
+            match pow {
+                1 => return Ok(base),
+                2 => return base.clone().mul(base, env),
+                -1 => return base.div(Value::from(1), env),
+                _ => {}
+            }
         }
+        self.scalar_pow(base, env)
     }
 }
 
-macro_rules! val_retry {
-    (Byte, $env:expr) => {
-        $env.num_fill().is_ok()
-    };
-    ($variant:ident, $env:expr) => {
-        false
-    };
+fn optimize_types(a: Value, b: Value) -> (Value, Value) {
+    match (a, b) {
+        (Value::Num(a), Value::Byte(b)) if a.element_count() > b.element_count() => {
+            (a.into(), b.convert::<f64>().into())
+        }
+        (Value::Byte(a), Value::Num(b)) if a.element_count() < b.element_count() => {
+            (a.convert::<f64>().into(), b.into())
+        }
+        (a, b) => (a, b),
+    }
 }
 
-macro_rules! value_bin_impl {
-    ($name:ident, $(
-        $(($na:ident, $nb:ident, $f1:ident $(, $retry:ident)? ))*
-        $([$(|$meta:ident| $pred:expr,)* $ip:ident, $f2:ident $(, $retry2:ident)? $(, $reset_meta:literal)?])*
-    ),* ) => {
+/// Macro to generate a dyadic pervasive function on [`Value`]s.
+macro_rules! value_dy_impl {
+    (
+        $name:ident,
+        $(
+            $(($na:ident, $nb:ident, $f1:ident))*
+            $([$(|$meta:ident| $pred:expr,)* $ip:ident, $f2:ident $(, $reset_value_flags:literal)?])*
+        ),*
+        $({
+            get_pre: |$get_pre_a:ident, $get_pre_b:ident, $get_pre_left:ident| $get_pre_body:expr,
+            handle_pre: |$pre_a:ident: $pre_ty:ty, $pre_b:ident, $handle_val:ident| $handle_body:expr,
+        })?
+    ) => {
         impl Value {
-            #[allow(unreachable_patterns, unused_mut, clippy::wrong_self_convention)]
-            pub(crate) fn $name(self, other: Self, a_depth: usize, b_depth: usize, env: &Uiua) -> UiuaResult<Self> {
-                self.keep_metas(other, |a, b| { Ok(match (a, b) {
-                    $($((Value::$ip(mut a), Value::$ip(b)) $(if {
+            #[allow(unreachable_patterns, unused_assignments, unused_mut, clippy::wrong_self_convention)]
+            pub(crate) fn $name(self, other: Self, env: &Uiua) -> UiuaResult<Self> {
+                let (mut a, mut b) = optimize_types(self, other);
+                let mut handle_pre: Option<&dyn Fn(&mut Value)> = None;
+                a.match_fill(env);
+                b.match_fill(env);
+                $(
+                    let get_pre = |$get_pre_a: &mut Value, $get_pre_b: &Value, $get_pre_left: bool| $get_pre_body;
+                    let pre_a = get_pre(&mut a, &b, false);
+                    let pre_b = get_pre(&mut b, &a, true);
+                    let f = move |val: &mut Value| {
+                        (|$pre_a: $pre_ty, $pre_b: $pre_ty, $handle_val: &mut Value| $handle_body)(pre_a, pre_b, val)
+                    };
+                    if env.fill().value_for(&a).is_none() && env.fill().value_for(&b).is_none() {
+                        handle_pre = Some(&f);
+                    }
+                )?
+                a.meta.take_sorted_flags();
+                b.meta.take_sorted_flags();
+                let mut val = a.keep_metas(b, |a, b| { Ok(match (a, b) {
+                    $($((Value::$ip(mut a), Value::$ip(mut b)) $(if {
                         let f = |$meta: &ArrayMeta| $pred;
-                        f(a.meta()) && f(b.meta())
+                        f(&a.meta) && f(&b.meta)
                     })* => {
-                        let mut val: Value = if val_retry!($ip, env) {
-                            let mut a_clone = a.clone();
-                            if let Err(e) = bin_pervade_mut(&mut a_clone, b.clone(), a_depth, b_depth, env, $name::$f2) {
-                                if e.is_fill() {
-                                    $(
-                                        let mut a = a.convert();
-                                        let b = b.convert();
-                                        bin_pervade_mut(&mut a, b, a_depth, b_depth, env, $name::$retry2)?;
-                                        a.reset_meta_flags();
-                                        return Ok(a.into());
-                                    )*
-                                }
-                                return Err(e);
-                            } else {
-                                a_clone.into()
-                            }
-                        } else {
-                            bin_pervade_mut(&mut a, b, a_depth, b_depth, env, $name::$f2)?;
-                            a.into()
-                        };
-                        $(if $reset_meta {
-                            val.reset_meta_flags();
+                        bin_pervade_mut(a, &mut b, env, $name::$f2)?;
+                        let mut val: Value = b.into();
+                        $(if $reset_value_flags {
+                            val.meta.take_value_flags();
                         })*
+                        if let Some(handle_pre) = handle_pre {
+                            handle_pre(&mut val);
+                        }
                         val
                     },)*)*
                     $($((Value::$na(a), Value::$nb(b)) => {
-                        let mut val: Value = if val_retry!($na, env) || val_retry!($nb, env) {
-                            let res = bin_pervade(a.clone(), b.clone(), a_depth, b_depth, env, InfalliblePervasiveFn::new($name::$f1));
-                            match res {
-                                Ok(arr) => arr.into(),
-                                #[allow(unreachable_code, unused_variables)]
-                                Err(e) if e.is_fill() => {
-                                    $(return bin_pervade(a.convert::<f64>(), b.convert::<f64>(), a_depth, b_depth, env, InfalliblePervasiveFn::new($name::$retry)).map(Into::into);)?
-                                    return Err(e);
-                                }
-                                Err(e) => return Err(e),
-                            }
-                        } else {
-                            bin_pervade(a, b, a_depth, b_depth, env, InfalliblePervasiveFn::new($name::$f1))?.into()
-                        };
-                        val.reset_meta_flags();
+                        let mut val: Value = bin_pervade(a, b, env, InfalliblePervasiveFn::new($name::$f1))?.into();
+                        val.meta.take_value_flags();
+                        if let Some(handle_pre) = handle_pre {
+                            handle_pre(&mut val);
+                        }
                         val
                     },)*)*
                     (Value::Box(a), Value::Box(b)) => {
                         let (a, b) = match (a.into_unboxed(), b.into_unboxed()) {
-                            (Ok(a), Ok(b)) => return Ok(Boxed(Value::$name(a, b, a_depth, b_depth, env)?).into()),
+                            (Ok(a), Ok(b)) => return Ok(Boxed(Value::$name(a, b, env)?).into()),
                             (Ok(a), Err(b)) => (a.coerce_as_boxes().into_owned(), b),
                             (Err(a), Ok(b)) => (a, b.coerce_as_boxes().into_owned()),
                             (Err(a), Err(b)) => (a, b),
                         };
-                        let mut val: Value = bin_pervade(a, b, a_depth, b_depth, env, FalliblePerasiveFn::new(|a: Boxed, b: Boxed, env: &Uiua| {
-                            Ok(Boxed(Value::$name(a.0, b.0, a_depth, b_depth, env)?))
+                        let mut val: Value = bin_pervade(a, b, env, FalliblePerasiveFn::new(|a: Boxed, b: Boxed, env: &Uiua| {
+                            Ok(Boxed(Value::$name(a.0, b.0, env)?))
                         }))?.into();
-                        val.reset_meta_flags();
+                        val.meta.take_value_flags();
+                        if let Some(handle_pre) = handle_pre {
+                            handle_pre(&mut val);
+                        }
                         val
                     }
                     (Value::Box(a), b) => {
-                        let mut val: Value = match a.into_unboxed() {
-                            Ok(a) => Boxed(Value::$name(a, b, a_depth, b_depth, env)?).into(),
-                            Err(a) => {
-                                let b = b.coerce_as_boxes().into_owned();
-                                bin_pervade(a, b, a_depth, b_depth, env, FalliblePerasiveFn::new(|a: Boxed, b: Boxed, env: &Uiua| {
-                                    Ok(Boxed(Value::$name(a.0, b.0, a_depth, b_depth, env)?))
-                                }))?.into()
-                            }
-                        };
-                        val.reset_meta_flags();
+                        let b = b.coerce_as_boxes().into_owned();
+                        let mut val: Value = bin_pervade(a, b, env, FalliblePerasiveFn::new(|a: Boxed, b: Boxed, env: &Uiua| {
+                            Ok(Boxed(Value::$name(a.0, b.0, env)?))
+                        }))?.into();
+                        val.meta.take_value_flags();
+                        if let Some(handle_pre) = handle_pre {
+                            handle_pre(&mut val);
+                        }
                         val
                     },
                     (a, Value::Box(b)) => {
-                        let mut val: Value = match b.into_unboxed() {
-                            Ok(b) => Boxed(Value::$name(a, b, a_depth, b_depth, env)?).into(),
-                            Err(b) => {
-                                let a = a.coerce_as_boxes().into_owned();
-                                bin_pervade(a, b, a_depth, b_depth, env, FalliblePerasiveFn::new(|a: Boxed, b: Boxed, env: &Uiua| {
-                                    Ok(Boxed(Value::$name(a.0, b.0, a_depth, b_depth, env)?))
-                                }))?.into()
-                            }
-                        };
-                        val.reset_meta_flags();
+                        let a = a.coerce_as_boxes().into_owned();
+                        let mut val: Value = bin_pervade(a, b, env, FalliblePerasiveFn::new(|a: Boxed, b: Boxed, env: &Uiua| {
+                            Ok(Boxed(Value::$name(a.0, b.0, env)?))
+                        }))?.into();
+                        val.meta.take_value_flags();
+                        if let Some(handle_pre) = handle_pre {
+                            handle_pre(&mut val);
+                        }
                         val
                     },
                     (a, b) => return Err($name::error(a.type_name(), b.type_name(), env)),
-                })})
+                })})?;
+                val.validate();
+                Ok(val)
             }
         }
     };
 }
 
-macro_rules! value_bin_math_impl {
-    ($name:ident $(,$($tt:tt)*)?) => {
-        value_bin_impl!(
+/// Macro to generate a dyadic pervasive math function on [`Value`]s.
+macro_rules! value_dy_math_impl {
+    // The generated function will maintain the sortedness of
+    // the result if one of the inputs is a scalar number.
+    // The $left parameter determines whether the scalar is the left argument.
+    ($name:ident $(,($($tt:tt)*))? , maintain_scalar_sortedness$(($left:expr))?) => {
+        value_dy_math_impl!(
+            $name
+            $(,($($tt)*))?,
+            pre {
+                get_pre: |a, b, _left| {
+                    if b.shape != [] || b.type_id() != f64::TYPE_ID {
+                        return None;
+                    }
+                    let mut flags = a.meta.take_sorted_flags();
+                    $(if _left != $left {
+                        flags.reverse_sorted();
+                    })?
+                    Some(flags)
+                },
+                handle_pre: |a: Option<ArrayFlags>, b, val| {
+                    if let Some(flags) = a.or(b) {
+                        val.meta.or_sorted_flags(flags);
+                    }
+                },
+            }
+        );
+    };
+    // The generated function will maintain the sortedness of
+    // the result if both of the inputs have the same sortedness.
+    ($name:ident $(,($($tt:tt)*))? , maintain_both_sortedness) => {
+        value_dy_math_impl!(
+            $name
+            $(,($($tt)*))?,
+            pre {
+                get_pre: |a, b, _left| {
+                    if a.type_id() != f64::TYPE_ID || b.type_id() != f64::TYPE_ID {
+                        return None;
+                    }
+                    let a_flags = a.meta.take_sorted_flags();
+                    Some(if b.shape == [] {
+                        a_flags
+                    } else {
+                        a_flags & (b.meta.flags & ArrayFlags::SORTEDNESS)
+                    })
+                },
+                handle_pre: |a: Option<ArrayFlags>, b, val| {
+                    if let Some(flags) = a.or(b) {
+                        val.meta.or_sorted_flags(flags);
+                    }
+                },
+            }
+        );
+    };
+    // The generated function will maintain the sortedness of
+    // the result if one of the inputs is a scalar number,
+    // reversing the sortedness if the number is negative.
+    // The $left parameter determines whether the scalar is the left argument.
+    ($name:ident $(,($($tt:tt)*))? , signed_scalar_sortedness$(($left:expr))?) => {
+        value_dy_math_impl!(
+            $name
+            $(,($($tt)*))?,
+            pre {
+                get_pre: |a, b, _left| {
+                    let negative = match b {
+                        Value::Num(arr) if arr.shape == [] => arr.data[0] < 0.0,
+                        Value::Byte(arr) if arr.shape == [] => false,
+                        _ => return None,
+                    };
+                    let mut flags = a.meta.take_sorted_flags();
+                    if negative {
+                        flags.reverse_sorted();
+                    }
+                    $(if _left != $left {
+                        flags.reverse_sorted();
+                    })?
+                    Some(flags)
+                },
+                handle_pre: |a: Option<ArrayFlags>, b, val| {
+                    if let Some(flags) = a.or(b) {
+                        val.meta.or_sorted_flags(flags);
+                    }
+                },
+            }
+        );
+    };
+    ($name:ident $(,($($tt:tt)*))? $(,pre {$($after:tt)*})?) => {
+        value_dy_impl!(
             $name,
             $($($tt)*)?
             [Num, num_num],
-            (Byte, Byte, byte_byte, num_num),
-            (Byte, Num, byte_num, num_num),
-            (Num, Byte, num_byte, num_num),
+            (Byte, Byte, byte_byte),
+            (Byte, Num, byte_num),
+            (Num, Byte, num_byte),
             [Complex, com_x],
             (Complex, Num, com_x),
             (Num, Complex, x_com),
             (Complex, Byte, com_x),
             (Byte, Complex, x_com),
+            $({$($after)*})?
         );
     };
 }
 
-value_bin_math_impl!(
+value_dy_math_impl!(
     add,
-    (Num, Char, num_char),
-    (Char, Num, char_num),
-    (Byte, Char, byte_char),
-    (Char, Byte, char_byte),
-    [
-        |meta| meta.flags.is_boolean(),
-        Byte,
-        bool_bool,
-        num_num,
-        true
-    ],
+    (
+        (Num, Char, num_char),
+        (Char, Num, char_num),
+        (Byte, Char, byte_char),
+        (Char, Byte, char_byte),
+        [|meta| meta.flags.is_boolean(), Byte, bool_bool, true]
+    ),
+    maintain_both_sortedness
 );
-value_bin_math_impl!(
+value_dy_math_impl!(
     sub,
-    (Num, Char, num_char),
-    (Char, Char, char_char),
-    (Byte, Char, byte_char),
+    (
+        (Num, Char, num_char),
+        (Char, Char, char_char),
+        (Byte, Char, byte_char),
+    ),
+    maintain_scalar_sortedness(true)
 );
-value_bin_math_impl!(
+value_dy_math_impl!(
     mul,
-    (Num, Char, num_char),
-    (Char, Num, char_num),
-    (Byte, Char, byte_char),
-    (Char, Byte, char_byte),
-    [|meta| meta.flags.is_boolean(), Byte, bool_bool, num_num],
+    (
+        (Num, Char, num_char),
+        (Char, Num, char_num),
+        (Byte, Char, byte_char),
+        (Char, Byte, char_byte),
+        [|meta| meta.flags.is_boolean(), Byte, bool_bool],
+    ),
+    signed_scalar_sortedness
 );
-value_bin_math_impl!(div, (Num, Char, num_char), (Byte, Char, byte_char),);
-value_bin_math_impl!(modulus, (Complex, Complex, com_com));
-value_bin_math_impl!(pow);
-value_bin_math_impl!(log);
-value_bin_math_impl!(atan2);
-value_bin_math_impl!(
+value_dy_math_impl!(
+    set_sign,
+    (
+        (Num, Char, num_char),
+        (Char, Num, char_num),
+        (Byte, Char, byte_char),
+        (Char, Byte, char_byte),
+    )
+);
+value_dy_math_impl!(
+    div,
+    ((Num, Char, num_char), (Byte, Char, byte_char)),
+    signed_scalar_sortedness(true)
+);
+value_dy_math_impl!(modulus, ((Complex, Complex, com_com)));
+value_dy_math_impl!(or, ([|meta| meta.flags.is_boolean(), Byte, bool_bool]));
+value_dy_math_impl!(scalar_pow);
+value_dy_math_impl!(root);
+value_dy_math_impl!(log);
+value_dy_math_impl!(atan2);
+value_dy_math_impl!(
     min,
-    [Char, char_char],
-    [|meta| meta.flags.is_boolean(), Byte, bool_bool, num_num],
+    (
+        [Char, generic],
+        (Box, Box, generic),
+        [|meta| meta.flags.is_boolean(), Byte, bool_bool],
+    ),
+    maintain_both_sortedness
 );
-value_bin_math_impl!(
+value_dy_math_impl!(
     max,
-    [Char, char_char],
-    [|meta| meta.flags.is_boolean(), Byte, bool_bool, num_num],
+    (
+        [Char, generic],
+        (Box, Box, generic),
+        [|meta| meta.flags.is_boolean(), Byte, bool_bool],
+    ),
+    maintain_both_sortedness
 );
 
-value_bin_impl!(
+value_dy_impl!(
     complex,
     (Num, Num, num_num),
-    (Byte, Byte, byte_byte, num_num),
-    (Byte, Num, byte_num, num_num),
-    (Num, Byte, num_byte, num_num),
+    (Byte, Byte, byte_byte),
+    (Byte, Num, byte_num),
+    (Num, Byte, num_byte),
     [Complex, com_x],
     (Complex, Num, com_x),
     (Num, Complex, x_com),
@@ -1659,19 +2211,32 @@ value_bin_impl!(
     (Byte, Complex, x_com),
 );
 
+value_dy_impl!(
+    abs_complex,
+    [Num, num],
+    (Byte, Byte, num),
+    (Byte, Num, num),
+    (Num, Byte, num),
+    (Complex, Complex, com),
+    (Complex, Num, com),
+    (Num, Complex, com),
+    (Complex, Byte, com),
+    (Byte, Complex, com),
+);
+
 macro_rules! eq_impls {
     ($($name:ident),*) => {
         $(
-            value_bin_impl!(
+            value_dy_impl!(
                 $name,
                 // Value comparable
                 [Num, same_type],
-                [Complex, same_type],
+                (Complex, Complex, com_x),
                 (Box, Box, generic),
-                (Byte, Byte, same_type, num_num),
+                [Byte, same_type],
                 (Char, Char, generic),
-                (Num, Byte, num_byte, num_num),
-                (Byte, Num, byte_num, num_num),
+                (Num, Byte, num_byte),
+                (Byte, Num, byte_num),
                 (Complex, Num, com_x),
                 (Num, Complex, x_com),
                 (Complex, Byte, com_x),
@@ -1679,8 +2244,10 @@ macro_rules! eq_impls {
                 // Type comparable
                 (Num, Char, always_less),
                 (Byte, Char, always_less),
+                (Complex, Char, always_less),
                 (Char, Num, always_greater),
                 (Char, Byte, always_greater),
+                (Char, Complex, always_greater),
             );
         )*
     };
@@ -1689,16 +2256,16 @@ macro_rules! eq_impls {
 macro_rules! cmp_impls {
     ($($name:ident),*) => {
         $(
-            value_bin_impl!(
+            value_dy_impl!(
                 $name,
                 // Value comparable
                 [Num, same_type],
                 [Complex, com_x],
                 (Box, Box, generic),
-                (Byte, Byte, same_type, num_num),
+                (Byte, Byte, same_type),
                 (Char, Char, generic),
-                (Num, Byte, num_byte, num_num),
-                (Byte, Num, byte_num, num_num),
+                (Num, Byte, num_byte),
+                (Byte, Num, byte_num),
                 (Complex, Num, com_x),
                 (Num, Complex, x_com),
                 (Complex, Byte, com_x),
@@ -1706,18 +2273,30 @@ macro_rules! cmp_impls {
                 // Type comparable
                 (Num, Char, always_less),
                 (Byte, Char, always_less),
+                (Complex, Char, always_less),
                 (Char, Num, always_greater),
                 (Char, Byte, always_greater),
+                (Char, Complex, always_greater),
             );
         )*
     };
 }
 
 eq_impls!(is_eq, is_ne);
-cmp_impls!(is_lt, is_le, is_gt, is_ge);
+cmp_impls!(other_is_lt, other_is_le, other_is_gt, other_is_ge);
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
+        if let Some(a) = self.meta.pointer {
+            if a.raw {
+                return other.meta.pointer.is_some_and(|b| a == b);
+            }
+        }
+        if let Some(b) = other.meta.pointer {
+            if b.raw {
+                return false;
+            }
+        }
         match (self, other) {
             (Value::Num(a), Value::Num(b)) => a == b,
             (Value::Byte(a), Value::Byte(b)) => a == b,
@@ -1767,25 +2346,49 @@ impl Ord for Value {
 
 impl Hash for Value {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            Value::Num(arr) => arr.hash(state),
-            Value::Byte(arr) => arr.hash(state),
-            Value::Complex(arr) => arr.hash(state),
-            Value::Char(arr) => arr.hash(state),
-            Value::Box(arr) => arr.hash(state),
+        val_as_arr!(self, |arr| arr.hash(state))
+    }
+}
+
+/// A wrapper for values that hashes their labels in addition to the normal hashing
+///
+/// Works with both [`Value`] and `&Value`
+#[derive(Debug, Clone)]
+pub struct HashLabels<T = Value>(pub T);
+
+impl PartialEq for HashLabels {
+    fn eq(&self, other: &Self) -> bool {
+        HashLabels(&self.0).eq(&HashLabels(&other.0))
+    }
+}
+impl Eq for HashLabels {}
+impl Hash for HashLabels {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        HashLabels(&self.0).hash(state);
+    }
+}
+
+impl PartialEq for HashLabels<&Value> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq(other.0) && self.0.meta.label == other.0.meta.label
+    }
+}
+impl Eq for HashLabels<&Value> {}
+impl Hash for HashLabels<&Value> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+        self.0.meta.label.hash(state);
+        if let HashLabels(Value::Box(arr)) = self {
+            for Boxed(val) in &arr.data {
+                HashLabels(val).hash(state);
+            }
         }
     }
 }
 
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Num(array) => array.fmt(f),
-            Self::Byte(array) => array.fmt(f),
-            Self::Complex(array) => array.fmt(f),
-            Self::Char(array) => array.fmt(f),
-            Self::Box(array) => array.fmt(f),
-        }
+        val_as_arr!(self, |arr| arr.fmt(f))
     }
 }
 
@@ -1795,6 +2398,19 @@ impl fmt::Display for Value {
             Value::Char(c) if c.rank() < 2 => c.fmt(f),
             Value::Box(arr) if arr.rank() == 0 => arr.fmt(f),
             value => value.grid_string(true).fmt(f),
+        }
+    }
+}
+
+impl PartialEq<i32> for Value {
+    fn eq(&self, other: &i32) -> bool {
+        if self.rank() > 0 {
+            return false;
+        }
+        match self {
+            Value::Num(arr) => arr.data[0] == (*other as f64),
+            Value::Byte(arr) => arr.data[0] as i32 == *other,
+            _ => false,
         }
     }
 }
@@ -1816,10 +2432,10 @@ impl ValueBuilder {
     }
     pub fn add_row<C: FillContext>(&mut self, mut row: Value, ctx: &C) -> Result<(), C::Error> {
         if let Some(value) = &mut self.value {
-            value.append(row, ctx)?;
+            value.append(row, false, ctx)?;
         } else {
             row.reserve_min(self.capacity);
-            row.shape_mut().insert(0, 1);
+            row.shape.insert(0, 1);
             self.value = Some(row);
         }
         self.rows += 1;

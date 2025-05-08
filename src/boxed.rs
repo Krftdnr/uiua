@@ -1,3 +1,5 @@
+//! The [`Boxed`] type
+
 use std::{
     borrow::{Borrow, BorrowMut},
     fmt,
@@ -14,33 +16,18 @@ pub struct Boxed(pub Value);
 
 #[derive(Serialize, Deserialize)]
 struct BoxedRep {
-    boxed: Value,
+    b: Value,
 }
 
 impl From<Boxed> for BoxedRep {
     fn from(b: Boxed) -> Self {
-        Self { boxed: b.0 }
+        Self { b: b.0 }
     }
 }
 
 impl From<BoxedRep> for Boxed {
     fn from(b: BoxedRep) -> Self {
-        Self(b.boxed)
-    }
-}
-
-impl Boxed {
-    /// Get the inner value
-    pub fn as_value(&self) -> &Value {
-        &self.0
-    }
-    /// Get the inner value mutably
-    pub fn as_value_mut(&mut self) -> &mut Value {
-        &mut self.0
-    }
-    /// Unwrap the inner value
-    pub fn into_inner(self) -> Value {
-        self.0
+        Self(b.b)
     }
 }
 

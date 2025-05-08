@@ -1,95 +1,24 @@
 use leptos::*;
 use leptos_meta::*;
-use leptos_router::*;
-use uiua::{Primitive, CONSTANTS};
+use uiua::{ConstClass, Primitive, SysOp, CONSTANTS};
+use uiua_editor::{lang, Editor};
 
-use crate::{editor::Editor, markdown::markdown, Const, Hd, Prim, Prims};
-
-#[component]
-pub fn Design() -> impl IntoView {
-    use Primitive::*;
-    view! {
-        <Title text="Design - Uiua Docs"/>
-        <h1 id="design">"Design"</h1>
-        <p>"This page explains the reasons for some of Uiua's design decisions."</p>
-        <p>"It serves as a "<a href="https://news.knowledia.com/US/en/articles/more-software-projects-need-defenses-of-design-85ea9e23ffd85f5fde5a2d3d42001393cbce169a">"defense of design"</a>"."</p>
-
-        <Hd id="stack-basing">"Stack Basing"</Hd>
-        <h3>"Combinators"</h3>
-        <p>"When I first started developing Uiua, it was neither stack-based nor array-oriented. What it "<em>"did"</em>" focus a lot on was "<em>"combinators"</em>". I had this whole hierarchy of language-level operators that let you construct arbitrarily complex combinators relatively succinctly."</p>
-        <p>"I discovered what a lot of others have discovered when delving deep into tacit code: it's really hard to read and write and reason about."</p>
-        <p>"Eventually, I moved to a stack-based model and discovered that you can write almost any 1 or 2 argument combinator with just "<Prim prim=Dup/>", "<Prim prim=Over/>", and "<Prim prim=Flip/>"."</p>
-        <p>"Of course, I also made the discovery that juggling 3 or more values on the stack also imposes a high cognitive load on the developer. This is especially true if you try to "<em>"rotate"</em>" the stack like you could with the now-removed functions"<code>"roll"</code>" and "<code>"unroll"</code>". "<Prim prim=Dip/>" replaced the rolling functions as it is more general and easier to reason about, and eventually grew into "<A href="/tutorial/advancedstack#planet-notation">"Planet Notation"</A>"."</p>
-        <br/>
-        <h3>"Expressions"</h3>
-        <p>"Long tacit expressions in most array languages can get very unwieldy. Because binary operations are infix, you have to parse the tree structure in your head before you can start determining the order of operations."</p>
-        <p>"For example, in BQN, you can trim matches from the beginning of a string with "<a style="text-decoration: none;" href="https://mlochbaum.github.io/bqncrate/?q=Remove%20cells%20that%20appear%20in%20x%20from%20beginning%20of%20y#"><code>"x(∧`∘∊˜¬⊸/⊢)y"</code></a>". "</p>
-        <p>"In contrast, here is their equivalent in Uiua, implemented the same way:"</p>
-        <Editor example="Trim ← ▽¬\\×∊,"/>
-        <p>
-            "You'll notice that stack basing simplifies the expression in a few ways:"
-            <ul>
-                <li>"There is no Uiua code corresponding to the BQN combinators "<code>"∘"</code>" and "<code>"⊸"</code>". Function composition is implicit."</li>
-                <li>"Functions are executed right-to-left instead of in a tree ordering."</li>
-                <li>"The expression does not require "<code>"()"</code>"s. In fact, no Uiua expression requires explicit grouping. "<code>"()"</code>" is used to make inline functions instead."</li>
-            </ul>
-        </p>
-        <p>"I think this clarity makes writing long tacit expressions much more workable."</p>
-
-        <Hd id="array-model">"The Array Model"</Hd>
-        <p>"Uiua's array model went through a lot of iterations during development. At first, it used a flat, vector-based model ala K and Q. Then, I switched to BQN's Based array model. That was really complicated to implement primitives for, so I tried something else."</p>
-        <p>"I switched to a flat array model with \"fill elements\". While arrays could not be nested, operations which would create nested arrays in other languages would instead create jagged arrays with special fill elements at the end of some rows. While this worked, the code was scattered everywhere with checks for fill elements, because they had to propagate through everything. It also had the unfortunate effect of making byte arrays take up 2 bytes of space, since a bit had to be used to indicate whether the byte was a fill element or not. Also, a lot of operations, such as "<Prim prim=Transpose/>", don't really make a lot of sense with jagged arrays."</p>
-        <p>"Finally, I switched to the current model, which resembles J's Boxed array model. While you can do something resembling J's "<code>"box <"</code>" using "<Prim prim=Box/>" (and "<code>"open >"</code>" with "<Prim prim=Un/><Prim prim=Box/>"), I designed functions like "<Prim prim=Partition/>" and "<Prim prim=Group/>" to allow selecting uniformly-shaped rows from a non-uniform list in an effort to minimize interaction with jagged data."</p>
-        <p>"The fact that the stack is always available also makes putting non-uniform data in arrays less necessary."</p>
-
-        <Hd id="glyphs">"The Glyphs"</Hd>
-        <p>"Most of Uiua's glyphs were chosen for one of a few reasons:"</p>
-        <ul>
-            <li>"It is a common mathematical symbol, such as "<Prim prim=Add/>", "<Prim prim=Sub/>", and "<Prim prim=Pi/>"."</li>
-            <li>"It is a very commonly used function and should create little line noise, such as "<Prim prim=Dup/>" and "<Prim prim=Flip/>"."</li>
-            <li>"It is used in other array languages, such as "<Prim prim=Reduce/>", "<Prim prim=Scan/>", and "<Prim prim=Transpose/>"."</li>
-            <li>"It kind of reminds me of what it does. Some of my favorites are "<Prim prim=Table/>", "<Prim prim=Reshape/>", "<Prim prim=Rotate/>", "<Prim prim=Deshape/>", and "<Prim prim=Find/>"."</li>
-            <li>"Its function is kind of abstract, but there are other related functions, so they all use related glyphs. For example, "<Prim prim=Fold/>" has this nice symmetry with "<Prim prim=Reduce/>" and "<Prim prim=Scan/>". The indexing/finding/grouping functions like"<Prim prim=Classify/>", "<Prim prim=Group/>", "<Prim prim=Deduplicate/>", etc are all circles."</li>
-            <li>"I think they look like cute little guys: "<Prim prim=Assert/>" and "<Prim prim=Try/></li>
-        </ul>
-        <p>"An additional constraint is that every glyph must be present in the "<a href="https://dejavu-fonts.github.io">"DejaVu Sans Mono"</a>" font, which is the best-looking free monospace font I could find that supports the largest number of glyphs."</p>
-
-        <Hd id="no-local-variables">"No Local Variables"</Hd>
-        <p>"Forbidding general local variables has a few benefits:"</p>
-        <ul>
-            <li>"I don't have to implement them (score!)"</li>
-            <li>"It forces you to write (often beautiful) tacit code, which I would argue Uiua enables better than almost any other programming language."</li>
-            <li>"It frees you from the burden of naming things."</li>
-        </ul>
-
-        <Hd id="identifiers-and-formatting">"Identifiers and Formatting"</Hd>
-        <p>"I made the decision to have a formatter that turns names into Unicode glyphs about as soon as I started using Unicode glyphs. I did not want to require special keyboard or editor support like APL and BQN do."</p>
-        <p>"The advantage of a file-watching formatter is that the only feature your editor needs is the ability to automatically reload files if they change on disk. You don't need special keybinds or plugins or anything."</p>
-        <p>"The other nice thing about a formatter is that it makes it easier to get started with the language. You do not have to memorize a bunch of keyboard shortcuts to type the glyphs. You just need to learn their names."</p>
-
-        <Hd id="inspiration">"Inspiration"</Hd>
-        <h3>"BQN"</h3>
-        <p>"The main language that inspired Uiua is "<a href="https://mlochbaum.github.io/BQN/">BQN</a>". While I had heard about APL before, BQN was my first real exposure to the power of the array paradigm. I think the language is an astounding feat of engineering. Marshall is both a genius and a great communicator."</p>
-        <p>"However, as you can read above, a lot of Uiua's design decisions are responses to things I "<em>"didn't"</em>" like about BQN. There were a bunch of little pain-points that I thought I could improve on."</p>
-        <p>"A lot of the behavior of Uiua's built-in functions (and the choice of which built-ins to include) is inspired by BQN's primitives. Just a few examples are "<Prim prim=Transpose/>", "<Prim prim=Classify/>", "<Prim prim=Group/>", and "<Prim prim=Take/>"."</p>
-        <p>"Another thing that was largely inspired by BQN is this website! BQN's site is excellent. I really like the way it is organized and the way it presents the language. I particularly liked the built-in editor, so I made my own version for Uiua that has syntax highlighting and history, which I reuse in all the tutorials and examples."</p>
-        <br/>
-        <h3>"The Array Cast"</h3>
-        <p>"During the period of Uiua's development, I spent a lot of time listening to "<a href="https://arraycast.com/">"The Array Cast"</a>", a podcast about array languages. The conversations about the design and implementation of APL, J, K, Q, and BQN are both inspirational and informative. The guys have such a depth and breadth of knowledge on the topic. I really recommend giving it a listen."</p>
-        <p>"Thanks to "<a href = "https://github.com/codereport">"Con"</a><a href="https://www.youtube.com/@code_report">"or"</a>", Bob, Stephen, Adám, "<a href="https://github.com/mlochbaum">"Marshall"</a>", Richard, and all the guests."</p>
-    }
-}
+use crate::{
+    markdown::{markdown_view, Markdown},
+    primitive::doc_line_fragments_to_view,
+    Const, Hd, Prim, Prims,
+};
 
 #[component]
 pub fn Technical() -> impl IntoView {
     view! {
-        <Title text="Technical Details - Uiua Docs"/>
+        <Title text=format!("Technical Details - {} Docs", lang())/>
         <h1>"Technical Details"</h1>
 
         <Hd id="the-interpreter">"The Interpreter"</Hd>
-        <p>"The Uiua interpreter is written in Rust."</p>
-        <p>"Uiua code is compiled into a simple bytecode assembly. This assembly is then usually immediately executed by the interpreter."</p>
-        <p>"Built-in functions are implemented in Rust so they can be as fast as possible. User-defined functions are passed around as chunks of bytecode."</p>
+        <p>"The "{lang}" interpreter is written in Rust."</p>
+        <p>{lang}" code is compiled into an IR tree assembly. This assembly is then usually immediately executed by the interpreter."</p>
+        <p>"Built-in functions are implemented in Rust so they can be as fast as possible. User-defined functions are passed around as IR trees."</p>
 
         <Hd id="arrays">"Arrays"</Hd>
         <p>"Values on the stack are implemented as Rust "<code>"enum"</code>"s, where each variant contains a different array type."</p>
@@ -98,71 +27,63 @@ pub fn Technical() -> impl IntoView {
         <p>"Array shapes are stored in a special array type that only allocates when there are more than 3 items."</p>
 
         <Hd id="website">"The Website"</Hd>
-        <p>"The Uiua website is written using the "<a href="https://leptos.dev/">Leptos</a>" framework and hosted on GitHub pages."</p>
-        <p>"Leptos compiles to webassembly, which allows the entire Uiua interpreter to be compiled and used by the site's editor."</p>
+        <p>"The "{lang}" website is written using the "<a href="https://leptos.dev/">Leptos</a>" framework and hosted on GitHub pages."</p>
+        <p>"Leptos compiles to webassembly, which allows the entire "{lang}" interpreter to be compiled and used by the site's editor."</p>
         <p>"The online editor is implemented as a "<code>"contenteditable"</code>" div with lots of custom behaviors."</p>
     }
 }
 
 #[component]
-pub fn StackIdioms() -> impl IntoView {
-    view! {
-        <Title text="Stack Idioms - Uiua Docs"/>
-        <h1>"Common Stack Idioms"</h1>
-        <p>"This page contains some common stack idioms that you may find useful."</p>
-        <p>"They are presented as rearrangements of characters which are then grouped into an array so that you can see the result."</p>
-        <Editor example="[. @A]"/>
-        <Editor example="[: @A@B]"/>
-        <Editor example="[, @A@B]"/>
-        <Editor example="[◌ @A@B]"/> // Should fail
-        <Editor example="[,, @A@B]"/>
-        <Editor example="[⟜: @A@B]"/>
-        <Editor example="[⊙. @A@B]"/>
-        <Editor example="[⊙.: @A@B]"/>
-        <Editor example="[⊙◌ @A@B]"/>
-        <Editor example="[⊙: @A@B@C]"/>
-        <Editor example="[⊙, @A@B@C]"/>
-    }
-}
-
-#[component]
 pub fn Install() -> impl IntoView {
+    use Primitive::*;
     view! {
-        <Title text="Installation - Uiua Docs"/>
-        <Hd id="installing-uiua">"Installing Uiua"</Hd>
-        <p>"If your OS is supported, then the newest version of the Uiua interpreter can be downloaded from the "<a href="https://github.com/uiua-lang/uiua/releases">"releases"</a>" page."</p>
-        <p>"Otherwise, the native Uiua interpreter can be installed via Cargo."</p>
-        <p>"This requires a "<a href="https://www.rust-lang.org/tools/install">"Rust"</a>" installation (>=1.75)."</p>
-        <p>"Once you have that, run the following command:"</p>
+        <Title text=format!("Installation - {} Docs", lang())/>
+        <Hd id="installing-uiua">"Installing "{lang}""</Hd>
+        <p><strong>"If your OS is supported, then the newest version of the "{lang}" interpreter can be downloaded from the "<a href="https://github.com/uiua-lang/uiua/releases">"releases"</a>" page."</strong></p>
+        <p>"Otherwise, the native "{lang}" interpreter can be installed via Cargo."</p>
+        <p>"This requires a "<a href="https://www.rust-lang.org/tools/install">"Rust"</a>" installation (>=1.78)."</p>
+        <p>"Once you have that, run one of the following commands:"</p>
+        <code class="code-block">"cargo install uiua -F full"</code>
         <code class="code-block">"cargo install uiua"</code>
         <p>"On Linux, this may require installing some dependencies:"</p>
-        <code class="code-block">"apt install libx11-dev"</code>
-        <p>"The following optional features are available but not enabled by default (enabled by passing "<code>"--features <feature>"</code>"):"</p>
+        <code class="code-block">"apt install libx11-dev libffi-dev"</code>
+        <p>"The "<code>"-F full"</code>" flag enables all optional features. If you need more control over which features are installed, enable only the only the ones you want by passing "<code>"--features <feature>"</code>"):"</p>
         <ul>
+            <li><code>"full"</code>" - Enables all optional features below."</li>
             <li>
                 <p><code>"audio"</code>" - Enables audio system functions."</p>
                 <p>"On Linux, this may require installing some dependencies:"</p>
                 <code class="code-block">"apt install libasound2-dev libudev-dev pkg-config"</code>
             </li>
+            <li>
+                <p><code>"webcam"</code>" - Enables webcam system functions."</p>
+                <p>"On Linux, this may require installing some dependencies:"</p>
+                <code class="code-block">"apt install libjpeg-dev"</code>
+            </li>
+            <li>
+                <p><code>"window"</code>" - Enables output in a window."</p>
+            </li>
         </ul>
-        <p>"If you want the most recent development version of Uiua, you can install from the git repository."</p>
+        <p>"If you want the most recent development version of "{lang}", you can install from the git repository."</p>
         <code class="code-block">"cargo install --git https://github.com/uiua-lang/uiua uiua"</code>
 
         <Hd id="fonts">"Fonts"</Hd>
-        <p>"Uiua supports a few custom fonts, but "<a href="https://github.com/uiua-lang/uiua/raw/main/site/Uiua386.ttf">"Uiua386"</a>" is the primary one."</p>
+        <p>{lang}" supports a few custom fonts, but "<a href="https://github.com/uiua-lang/uiua/blob/main/src/algorithm/Uiua386.ttf">{lang}"386"</a>" is the primary one."</p>
         <ul>
-            <li><a href="https://github.com/uiua-lang/uiua/raw/main/site/Uiua386.ttf">"Uiua386"</a>" - inspired by APL386. Thanks to Gifti for making it!"</li>
-            <li>"Jonathan Perret's "<a href="https://github.com/jonathanperret/uiua386color">"Uiua386Color"</a>" - a colored version of Uiua386"</li>
+            <li><a href="https://github.com/uiua-lang/uiua/blob/main/src/algorithm/Uiua386.ttf">{lang}"386"</a>" - inspired by APL386. Thanks to Gifti for making it!"</li>
+            <li>"Jonathan Perret's "<a href="https://github.com/jonathanperret/uiua386color">{lang}"386Color"</a>" - a colored version of "{lang}"386"</li>
             <li><a href="https://github.com/uiua-lang/uiua/raw/main/site/DejaVuSansMono.ttf">"DejaVuSansMono"</a>" - a modified version"</li>
         </ul>
-        <p>"Uiua was originally designed to be used with stock "<a href="https://dejavu-fonts.github.io">"DejaVu Sans Mono"</a>", but further development and glyph choices target Uiua386."</p>
+        <p>{lang}" was originally designed to be used with stock "<a href="https://dejavu-fonts.github.io">"DejaVu Sans Mono"</a>", but further development and glyph choices target "{lang}"386."</p>
 
         <Hd id="editor-support">"Editor Support"</Hd>
-        <p>"An official "<a href="https://marketplace.visualstudio.com/items?itemName=uiua-lang.uiua-vscode">"Uiua language extension for VSCode"</a>" is available."</p>
-        <p>"For Neovim, Apeiros-46B maintains "<a href="https://github.com/Apeiros-46B/nvim/blob/main/after/syntax/uiua.vim">"syntax"</a>" and "<a href="https://github.com/Apeiros-46B/nvim/blob/main/after/ftplugin/uiua.lua">"LSP"</a>" scripts."</p>
-        <p>"For Vim, sputnick1124 maintains a "<a href="https://github.com/sputnick1124/uiua.vim">"Uiua plugin"</a>"."</p>
-        <p>"For Emacs, crmsnbleyd maintains a "<a href="https://github.com/crmsnbleyd/uiua-ts-mode">"Uiua mode"</a>"."</p>
-        <p>"These require Uiua to be installed and in your "<code>"PATH"</code>"."</p>
+        <p>"An official "<a href="https://marketplace.visualstudio.com/items?itemName=uiua-lang.uiua-vscode">{lang}" language extension for VSCode"</a>" is available."</p>
+        <p>"For Vim/Neovim, Apeiros-46B maintains a "<a href="https://github.com/Apeiros-46B/uiua.vim">{lang}" syntax highlighting plugin"</a>"."</p>
+        <p>"For Vim, sputnick1124 maintains a "<a href="https://github.com/sputnick1124/uiua.vim">{lang}" plugin"</a>"."</p>
+        <p>"Language support in Neovim is easy with "<a href="https://github.com/neovim/nvim-lspconfig">"nvim-lspconfig"</a>"."</p>
+        <p>"For Emacs, crmsnbleyd maintains a "<a href="https://github.com/crmsnbleyd/uiua-ts-mode">{lang}" mode"</a>"."</p>
+        <p>"For Kakoune, ThaCuber maintains a "<a href="https://github.com/thacuber2a03/highlighters.kak/blob/main/uiua.kak">"syntax highlighting module"</a>"."</p>
+        <p>"These require "{lang}" to be installed and in your "<code>"PATH"</code>"."</p>
 
         <Hd id="basic-usage">"Basic Usage"</Hd>
         <p>"Running just "<code>"uiua"</code>" will display the help message if there are no "<code>".ua"</code>" files in the directory."</p>
@@ -172,6 +93,28 @@ pub fn Install() -> impl IntoView {
         <p>"Use "<code>"uiua <PATH>"</code>" or "<code>"uiua run [PATH]"</code>" to format and run a file without watching it."</p>
         <p>"Use "<code>"uiua fmt [PATH]"</code>" to format a file without running it."</p>
         <p>"Use "<code>"uiua test [PATH]"</code>" to run tests."</p>
+        <p>"Use "<code>"uiua module update"</code>" to update Git modules."</p>
+
+        <Hd id="the-output-window">"The Output Window"</Hd>
+        <p>"If you download the native interpreter from the "<a href="https://github.com/uiua-lang/uiua/releases">"releases page"</a>", or if you build it from source with either the "<code>"window"</code>" or "<code>"full"</code>" features, you will have the option to show the output of a program (and certain system functions) in a window."</p>
+        <p>"The window shows not only basic arrays, but images, gifs, and audio as well."</p>
+        <p>"The window will be shown if you run any of the following commands:"</p>
+        <code class="code-block">"\
+uiua -w
+uiua run -w <PATH>
+uiua watch -w"
+        </code>
+        <p>"It can also be enabled by default if you set the "<code>"UIUA_WINDOW"</code>" environment variable to "<code>"1"</code>"."</p>
+        <p>"The values left on the stack after a program finishes will be shown in the window. In addition, the "<Prim prim=Sys(SysOp::Show)/>", "<Prim prim=Sys(SysOp::ImShow)/>", "<Prim prim=Sys(SysOp::GifShow)/>", and "<Prim prim=Sys(SysOp::AudioPlay)/>" functions will all show their output in the window."</p>
+
+        <Hd id="local-site">"Running the Site Locally"</Hd>
+        <p>"This website is a static, single-page application. As such, it can be build and run locally, without connecting to a server."</p>
+        <p>"To do this, you will need "<a href="https://www.rust-lang.org/tools/install">"Rust"</a>" installed. You will also need the "<a href="https://github.com/uiua-lang/uiua">{lang}" repository"</a>" cloned locally."</p>
+        <p>"You need to have both "<a href="https://trunkrs.dev">"Trunk"</a>" and the "<code>"wasm32-unknown-unknown"</code>" target installed. To get both of these, run:"</p>
+        <code class="code-block">"cargo install trunk\nrustup target add wasm32-unknown-unknown"</code>
+        <p>"Then, from the root of the "{lang}" repository, run:"</p>
+        <code class="code-block">"cd site\ntrunk serve"</code>
+        <p>"The site will be available at "<code>"http://localhost:8080"</code>"."</p>
     }
 }
 
@@ -179,14 +122,14 @@ pub fn Install() -> impl IntoView {
 pub fn RightToLeft() -> impl IntoView {
     use Primitive::*;
     view! {
-        <Title text="Right-to-Left - Uiua Docs"/>
+        <Title text=format!("Right-to-Left - {} Docs", lang())/>
         <Hd id="right-to-left">"Right-to-Left"</Hd>
-        <p>"One of the most asked questions about Uiua is \"Why does code execute right-to-left?\" It's a valid question. Every other stack-oriented language I know goes left-to-right."</p>
-        <p>"The simple answer is that while Uiua is stack-"<em>"based"</em>", it is not stack-"<em>"oriented"</em>"."</p>
+        <p>"One of the most asked questions about "{lang}" is \"Why does code execute right-to-left?\" It's a valid question. Every other stack-oriented language I know goes left-to-right."</p>
+        <p>"The simple answer is that while "{lang}" is stack-"<em>"based"</em>", it is not stack-"<em>"oriented"</em>"."</p>
         <p>"The misunderstanding is largely my own fault. The initial version of the website said \"stack-oriented\" everywhere and made references to FORTH. I have since rectified this."</p>
-        <p>"When you write Uiua code the stack should just be a tool, a convention. It's how you pass values around. "<strong>"The stack should not guide how you think about solving problems in Uiua."</strong></p>
-        <p>"Uiua is about composing arrays. The stack makes it possible to do this without naming local variables. This is the entire reason for its presence in the language. In particular, the stack can be used to construct arbitrary combinators and data flows. It is an extremely powerful mechanism for this purpose."</p>
-        <p>"You should not think of Uiua syntax like a FORTH. You should think of it like any of the numerous other languages that put functions before their arguments. This group includes languages of vastly different kinds, like C, Haskell, and Lisp."</p>
+        <p>"When you write "{lang}" code the stack should just be a tool, a convention. It's how you pass values around. "<strong>"The stack should not guide how you think about solving problems in "{lang}"."</strong></p>
+        <p>{lang}" is about composing arrays. The stack makes it possible to do this without naming local variables. This is the entire reason for its presence in the language. In particular, the stack can be used to construct arbitrary combinators and data flows. It is an extremely powerful mechanism for this purpose."</p>
+        <p>"You should not think of "{lang}" syntax like a FORTH. You should think of it like any of the numerous other languages that put functions before their arguments. This group includes languages of vastly different kinds, like C, Haskell, and Lisp."</p>
         <p>"The left side of an expression is "<em>"not"</em>" the end or the beginning. It is the "<em>"root"</em>". The expression is a tree with branches that converge and diverge in different ways. It is not a list of instructions."</p>
         <p>"This allows us to separate the execution model from the mental model. With a separate mental model, why does it matter which direction the code executes? Why can't the root be on the right?"</p>
         <p>"Of course, "<em>"now"</em>" the decision is arbitrary. I'm used to languages that put the root on the left, so that is what I chose."</p>
@@ -204,20 +147,46 @@ pub fn RightToLeft() -> impl IntoView {
 
 #[component]
 pub fn Constants() -> impl IntoView {
+    use ConstClass::*;
     use Primitive::*;
-    let constants = CONSTANTS
-        .iter()
-        .filter(|con| !con.doc.trim().is_empty())
-        .map(|con| view!(<p><Const con=con/>" - "{ con.doc }</p>))
-        .collect::<Vec<_>>();
+    let class_cols = [
+        vec![Math, Time, Color, Flags],
+        vec![External, Media, Spatial, System, Fun],
+    ];
+    let cols = class_cols.map(|col_classes| {
+        let mut tables = Vec::new();
+        for class in col_classes {
+            let mut rows = Vec::new();
+            for con in CONSTANTS.iter().filter(|con| con.class == class) {
+                let style = if con.is_deprecated() {
+                    "text-decoration: line-through;"
+                } else {
+                    ""
+                };
+                let view = view!(<tr>
+                    <td><div style=style><Const con=con/></div></td>
+                    <td><div class="const-desc">{
+                        doc_line_fragments_to_view(&con.doc_frags())
+                    }</div></td>
+                </tr>)
+                .into_view();
+                rows.push(view);
+            }
+            tables.push(view!(
+                <h3>{format!("{class:?}")}</h3>
+                <table id={format!("{class:?}")} class="bordered-table" style="width: 100%">{ rows }</table>
+            ));
+        }
+        view!(<div>{tables}</div>)
+    });
     view! {
-        <Title text="Constants - Uiua Docs"/>
+        <Title text=format!("Constants - {} Docs", lang())/>
         <h1>"Constants"</h1>
         <p>"These constants are available in every scope. However, unlike formattable constants like "<Prim prim=Pi/>", these constants can be shadowed within a scope."</p>
         <Editor example="e\ne ← 5\ne"/>
         <br/>
         <div>
-        { constants }
+        <div class="features">{ cols }</div>
         </div>
     }
 }
@@ -226,16 +195,16 @@ pub fn Constants() -> impl IntoView {
 pub fn Optimizations() -> impl IntoView {
     use Primitive::*;
     view! {
-        <Title text="Optimizations - Uiua Docs"/>
+        <Title text=format!("Optimizations - {} Docs", lang())/>
         <h1>"Optimizations"</h1>
-        <p>"The Uiua interpreter contains a number of optimizations that you can take advantage of to improve the performance of your code."</p>
+        <p>"The "{lang}" interpreter contains a number of optimizations that you can take advantage of to improve the performance of your code."</p>
 
         <Hd id="pervasive-functions">"Pervasive Functions"</Hd>
         <p>"All pervasive functions run on arrays in hot loops that should have performance comparable to an implementation in a languages like C or Rust. This includes all mathematical and comparison functions."</p>
-        <p>"The interpreter does its best to re-use allocated memory when possible instead of copying. Arrays are reference-counted, so an array's memory is only copied when it is modified "<em>"and"</em>" a duplicate exists somewhere. "<Prim prim=Dup/>" and "<Prim prim=Over/>" do not copy actual array memory. They only copy pointers and increment reference counts."</p>
+        <p>"The interpreter does its best to re-use allocated memory when possible instead of copying. Arrays are reference-counted, so an array's memory is only copied when it is modified "<em>"and"</em>" a duplicate exists somewhere. "<Prim prim=Dup/>" does not copy actual array memory. It only copies pointers and increments reference counts."</p>
         <p>"In this example, only the last line results in a copy:"</p>
         <Editor no_run=true example="+1 ⇡10\n×. ⇡10\n×+1⇡10⇡10\n+1.⇡10"/>
-        <p>"Using pervasive functions whenever possible, on the largest arrays possible, is the best way to get good performance out of Uiua."</p>
+        <p>"Using pervasive functions whenever possible, on the largest arrays possible, is the best way to get good performance out of "{lang}"."</p>
 
         <Hd id="iterating-modifiers">"Iterating Modifiers"</Hd>
         <p>"The modifiers "<Prim prim=Reduce/>", "<Prim prim=Scan/>", and "<Prim prim=Table/>" have special-case optimizations when used with certain functions. These optimizations eliminate all interpreter overhead while the loops are running, and are therefore very fast."</p>
@@ -243,7 +212,7 @@ pub fn Optimizations() -> impl IntoView {
         <table class="bordered-table cell-centered-table">
             <tr>
                 <th/>
-                <th><Prims prims=[Add, Sub, Mul, Div, Mod, Atan, Min, Max]/></th>
+                <th><Prims prims=[Add, Sub, Mul, Div, Modulus, Atan, Min, Max]/></th>
                 <th><Prims prims=[Eq, Ne]/></th>
                 <th><Prims prims=[Lt, Le, Gt, Ge]/></th>
                 <th><Prim prim=Join glyph_only=true/></th>
@@ -253,6 +222,44 @@ pub fn Optimizations() -> impl IntoView {
             <tr><th><Prim prim=Reduce/></th> <td>"✔"</td> <td></td>  <td></td> <td>"✔"</td> <td></td></tr>
             <tr><th><Prim prim=Scan/></th> <td>"✔"</td>  <td>"✔"</td> <td></td> <td></td> <td></td></tr>
         </table>
+
+        <p>"The pattern "<Prims prims=[Reduce]/><code>"F"</code><Prims prims=[Table]/><code>"G"</code>" is optimized to use much less memory and run much faster than the naive implementation. This only occurs when both functions have signature "<code>"|2.1"</code>". Rather than creating the entire table and then reducing it, each reduced row is generated as it is needed."</p>
+        <p>"On top of this, particular combinations of "<code>"F"</code>" and "<code>"G"</code>" are optimized to eliminate all interpreter overhead. All combinations of the following functions are optimized:"</p>
+        <table class="bordered-table cell-centered-table">
+            <tr><th><Prim prim=Reduce/></th><td><Prims prims=[Add, Mul, Min, Max]/></td></tr>
+            <tr><th><Prim prim=Table/></th><td><Prims prims=[Add, Sub, Mul, Div, Modulus, Atan, Eq, Ne, Lt, Le, Gt, Ge, Min, Max, Complex, Join, Couple]/></td></tr>
+        </table>
+
+        <Hd id="rows"><Prim prim=Rows/></Hd>
+        <p>"When used inside "<Prim prim=Rows/>", some functions have special-case implementations that operate on the whole array at once. This avoids the interpreter overhead inherent to "<Prim prim=Rows/>"."</p>
+        <p>"In addition to all pervasive functions, the following functions are optimized when used inside "<Prim prim=Rows/>":"</p>
+        <div style="display: flex; gap: 1em">
+            <table class="bordered-table cell-centered-table">
+                <tr><td><Prim prim=Deshape/></td></tr>
+                <tr><td><Prim prim=Reverse/></td></tr>
+                <tr><td><Prim prim=Transpose/></td></tr>
+                <tr><td><Prim prim=Classify/></td></tr>
+                <tr><td><Prim prim=Fix/></td></tr>
+                <tr><td><Prim prim=Box/></td></tr>
+                <tr><td><Prim prim=First/></td></tr>
+                <tr><td><Prims prims=[First, Reverse] show_names=true/></td></tr>
+                <tr><td><Prims prims=[Sort]/>" / "<Prims prims=[Select, Rise, Dup]/>" / "<Prims prims=[Select, By, Rise]/></td></tr>
+                <tr><td><Prims prims=[Reverse, Sort]/>" / "<Prims prims=[Select, Fall, Dup]/>" / "<Prims prims=[Select, By, Fall]/></td></tr>
+            </table>
+            <table class="bordered-table cell-centered-table">
+                <tr><td><Prims prims=[Gap, Rand] show_names=true/></td></tr>
+                <tr><td><Prims prims=[On, Rand] show_names=true/></td></tr>
+                <tr><td><Prims prims=[By, Rand] show_names=true/></td></tr>
+                <tr><td><Prim prim=Gap/><code>"constant"</code></td></tr>
+                <tr><td><Prim prim=On/><code>"constant"</code></td></tr>
+                <tr><td><Prim prim=By/><code>"constant"</code></td></tr>
+                <tr><td><Prims prims=[Un, Couple] show_names=true/></td></tr>
+                <tr><td><Prims prims=[Un, Join] show_names=true/></td></tr>
+                <tr><td><Prim prim=Rotate/></td></tr>
+                <tr><td><Prim prim=Reduce/></td></tr>
+            </table>
+        </div>
+        <p>"This optimization applies not just to "<Prim prim=Rows/>", but also "<Prim prim=Stencil/>", "<Prim prim=Each/>", "<Prims prims=[Rows, Rows]/>", "<Prims prims=[Rows, Rows, Rows]/>", etc."</p>
 
         <Hd id="complexity">"Complexity"</Hd>
         <p>"Some combinations of functions are special-cased in the interpreter to run in less time complexity or in fewer operations than is implied by each function individually."</p>
@@ -264,23 +271,98 @@ pub fn Optimizations() -> impl IntoView {
             <tr><th><Prims prims=[First, Reverse, Rise]/></th><td>"O(nlogn)"</td><td>"O(n)"</td></tr>
             <tr><th><Prims prims=[First, Fall]/></th><td>"O(nlogn)"</td><td>"O(n)"</td></tr>
             <tr><th><Prims prims=[First, Reverse, Fall]/></th><td>"O(nlogn)"</td><td>"O(n)"</td></tr>
-            <tr><th><Prims prims=[First, Where]/></th><td>"O(n)"</td><td>"O(where the first non-zero is)"</td></tr>
-            <tr><th><Prims prims=[Select, Rise, Dup]/></th><td>"Create intermediate "<Prim prim=Rise/>" array"</td><td>"Just sort"</td></tr>
-            <tr><th><Prims prims=[Select, Fall, Dup]/></th><td>"Create intermediate "<Prim prim=Fall/>" array"</td><td>"Just sort"</td></tr>
+            <tr><th><Prims prims=[First, Where]/></th><td>"O(n)"</td><td>"Stop at first non-zero from front"</td></tr>
+            <tr><th><Prims prims=[First, Reverse, Where]/></th><td>"O(n)"</td><td>"Stop at first non-zero from back"</td></tr>
+            <tr><th><Prims prims=[Select, Rise, Dup]/>" / "<Prims prims=[Select, By, Rise]/></th><td>"Create intermediate "<Prim prim=Rise/>" array"</td><td>"Just sort"</td></tr>
+            <tr><th><Prims prims=[Select, Fall, Dup]/>" / "<Prims prims=[Select, By, Fall]/></th><td>"Create intermediate "<Prim prim=Fall/>" array"</td><td>"Just sort"</td></tr>
+            <tr><th><Prims prims=[Reverse, Sort]/></th><td>"Sort then reverse"</td><td>"Sort backwards"</td></tr>
             <tr><th><Prims prims=[Dip, Dip, Dip]/>"…"</th><td><Prim prim=Dip/>" n times"</td><td>"Single "<Prim prim=Dip/>" of n values"</td></tr>
             <tr><th><Prims prims=[Transpose, Transpose, Transpose]/>"…"</th><td><Prim prim=Transpose/>" n times"</td><td>"Single "<Prim prim=Transpose/></td></tr>
-            <tr><th><Prims prims=[Rows, Transpose]/></th><td><Prim prim=Transpose/>" each row"</td><td>"Single "<Prim prim=Transpose/></td></tr>
-            <tr><th><Prims prims=[Rows, Reduce]/><code>"F"</code><Prims prims=[Windows]/></th><td>"Make "<Prim prim=Windows/>" then "<Prim prim=Reduce/>" each row"</td><td>"Apply "<code>"F"</code>" to adjacent rows"</td></tr>
-            <tr><th><Prims prims=[Rows, Reduce]/><code>"F"</code></th><td><Prim prim=Reduce/>" each row"</td><td><Prim prim=Reduce/>" each column"</td></tr>
+            <tr><th><Prims prims=[Len, Where]/></th><td>"Make "<Prim prim=Where/>" then get "<Prim prim=Len/></td><td>"Just count"</td></tr>
+            <tr><th><Prims prims=[MemberOf, Range]/></th><td>"Make "<Prim prim=Range/>" then check "<Prim prim=MemberOf/></td><td>"Just check bounds"</td></tr>
+            <tr><th><Prims prims=[MemberOf, Deshape]/><code>"₂"</code><Prims prims=[Range]/></th><td>"Make "<Prim prim=Range/>" then "<Prim prim=Deshape/>" then check "<Prim prim=MemberOf/></td><td>"Just check bounds"</td></tr>
+            <tr><th><Prim prim=First glyph_only=true/>"/"<Prim prim=Last glyph_only=true/> <Prims prims=[Un, Sort]/></th><td><Prims prims=[Un, Sort] show_names=true/>" then take the "<Prim prim=First/>"/"<Prim prim=Last/></td><td>"Just pick a random row"</td></tr>
+            <tr><th><Prims prims=[Match, By, Rotate]/><code>"1"</code></th><td>"Make a copy, "<Prim prim=Rotate/>", and "<Prim prim=Match/></td><td>"Just check that every row is the same"</td></tr>
+            <tr><th><Prims prims=[Reduce, Mul, Stencil, Match]/></th><td><Prim prim=Stencil/>" then "<Prim prim=Reduce/></td><td>"Just check that every row is the same"</td></tr>
+            <tr><th><Prims prims=[Abs, Complex]/></th><td>"Make intermediate "<Prim prim=Complex/>" array then get "<Prim prim=Abs/></td><td>"Directly compute the magnitude"</td></tr>
         </table>
+
+        <Hd id="sortedness-flags">"Sortedness Flags"</Hd>
+        <p>"The interpreter can sometimes mark arrays as being sorted up and/or down. These flags allow certain short-circuiting or optimized behavior for some algorithms."</p>
+        <p>"Sortedness flags are set when:"</p>
+        <ul>
+            <li>"An inline array with all-constant values (i.e "<code>"1_2_3"</code>" or "<code>"[7 6 6 4]"</code>") is already sorted at compile time."</li>
+            <li>"The "<Prim prim=Sort/>" function is used."</li>
+            <li>"The "<Prim prim=Where/>" function is used."</li>
+            <li>"A range is generated with "<Prim prim=Range/>" or "<Prim prim=Un/><Prim prim=Shape/>"."</li>
+            <li>"An array is passed to "<Prims prims=[Scan, Min]/>" or "<Prims prims=[Scan, Max]/>"."</li>
+            <li>"Two arrays are "<Prim prim=Couple/>"d."</li>
+            <li><Prim prim=Reshape/>" is called with at least one scalar argument."</li>
+        </ul>
+        <p>"The default behavior of most primitives is to clear sortedness flags. However, sortedness flags are maintained in these cases:"</p>
+        <ul>
+            <li>"A sorted array is "<Prim prim=Neg/>"d."</li>
+            <li>"A sorted array is "<Prim prim=Sign/>"ed."</li>
+            <li>"A sorted array is "<Prim prim=Floor/>"ed, "<Prim prim=Ceil/>"ed, or "<Prim prim=Round/>"ed."</li>
+            <li>"Two sorted arrays are "<Prim prim=Add/>"ed."</li>
+            <li>"A sorted array is passed to "<Prim prim=Add/>" or "<Prim prim=Sub/>" along with a scalar."</li>
+            <li>"A sorted array is "<Prim prim=Mul/>"d or "<Prim prim=Div/>"d with a scalar. The sort flags will be swapped if the scalar is negative."</li>
+            <li>"A sorted array is passed to "<Prim prim=Min/>" or "<Prim prim=Max/>" along with a scalar."</li>
+            <li>"A sorted array is "<Prim prim=Reverse/>"d. The sort flags will be swapped."</li>
+            <li>"A sorted array is "<Prim prim=Deduplicate/>"d or "<Prim prim=Classify/>"d."</li>
+            <li>"A sorted array is "<Prim prim=Un/><Prim prim=Keep/>"d."</li>
+            <li>"Two sorted arrays are passed to "<Prim prim=Select/>"."</li>
+            <li>"A sorted array is passed as the second argument to "<Prim prim=Keep/>", "<Prim prim=Take/>", or "<Prim prim=Drop/>" (without a "<Prim prim=Fill/>" value)."</li>
+            <li>"Two sorted arrays are "<Prim prim=Join/>"ed appropriately."</li>
+        </ul>
+        <p>"Sortedness flags are used to improve the performance of:"</p>
+        <ul>
+            <li><Prim prim=Sort/></li>
+            <li><Prim prim=Rise/>" and "<Prim prim=Fall/></li>
+            <li><Prim prim=First/><Prim prim=Rise/>" and "<Prim prim=Last/><Prim prim=Fall/></li>
+            <li><Prim prim=Deduplicate/>" and "<Prim prim=Classify/></li>
+            <li><Prims prims=[Reduce, Min]/>" and "<Prims prims=[Reduce, Max]/>" on rank-1 arrays"</li>
+            <li><Prims prims=[Scan, Min]/>" and "<Prims prims=[Scan, Max]/>" on rank-1 arrays"</li>
+            <li><Prim prim=MemberOf/>" and "<Prim prim=IndexOf/>" when searching for a single row"</li>
+            <li>"The "<a href="#complexity">"above"</a>" optimizations for checking if all rows of an array are the same"</li>
+            <li>"More may be added in the future"</li>
+        </ul>
+
+        <Hd id="other-optimizations">"Other Optimizations"</Hd>
+        <ul>
+            <li><Prim prim=Group/>" and "<Prim prim=Partition/>" are optimized to be fast with "<Prim prim=Len/>", "<Prim prim=First/>", "<Prim prim=Last/>"."</li>
+            <li>
+                <Prim prim=Tuples/>" with the following functions:"
+                <ul>
+                    <li><Prim prim=Lt/></li>
+                    <li><Prim prim=Le/></li>
+                    <li><Prim prim=Gt/></li>
+                    <li><Prim prim=Ge/></li>
+                    <li><Prim prim=Ne/></li>
+                    <li><Prim prim=Eq/></li>
+                    <li><Prim prim=Match/></li>
+                    <li><Prims prims=[Gap, Gap]/><code>"constant"</code></li>
+                    <li><Prims prims=[Gap, Len]/></li>
+                </ul>
+            </li>
+            <li>
+                "The following splitting patterns are optimized for monadic function "<code>"F"</code>":"
+                <ul>
+                    <li><Prims prims=[Partition]/><code>"F"</code><Prims prims=[By, Ne]/></li>
+                    <li><Prims prims=[Partition]/><code>"F"</code><Prims prims=[Ne]/><code>"constant"</code><Prims prims=[Dup]/></li>
+                    <li><Prims prims=[Partition]/><code>"F"</code><Prims prims=[Not, By, Mask]/></li>
+                    <li><Prims prims=[Partition]/><code>"F"</code><Prims prims=[Not, Mask]/><code>"constant"</code><Prims prims=[Dup]/></li>
+                </ul>
+            </li>
+        </ul>
     }
 }
 
 #[component]
 pub fn Changelog() -> impl IntoView {
     view! {
-        <Title text="Changelog - Uiua Docs"/>
-        { markdown(include_str!("../../changelog.md")) }
+        <Title text=format!("Changelog - {} Docs", lang())/>
+        { markdown_view(include_str!("../../changelog.md")) }
     }
 }
 
@@ -308,15 +390,15 @@ pub fn Combinators() -> impl IntoView {
             view!(<Prim prim=Flip/>).into_view(),
             ("⊂:", 2, "C", "Cardinal"),
         ),
-        (View::default(), ("⊢⇌", 1, "B", "Bluebird")),
+        (View::default(), ("□⊣", 1, "B", "Bluebird")),
         (View::default(), ("⇌⊂", 2, "B1", "Blackbird")),
         (
             view!(<Prim prim=On/>).into_view(),
             ("⊂⟜¯", 1, "S", "Starling"),
         ),
         (
-            view!(<Prim prim=Dup/>).into_view(),
-            ("≍⇌.", 1, "Σ", "Violet Starling"),
+            view!(<Prim prim=By/>).into_view(),
+            ("≍⊸⇌", 1, "Σ", "Violet Starling"),
         ),
         (view!(<Prim prim=Dip/>).into_view(), ("⊟⊙⇌", 2, "D", "Dove")),
         (View::default(), ("⊟⇌", 2, "Δ", "Zebra Dove")),
@@ -334,8 +416,8 @@ pub fn Combinators() -> impl IntoView {
             ("⊟⟜+", 2, "N", "Eastern Nicator"),
         ),
         (
-            view!(<Prim prim=Over/>).into_view(),
-            ("⊟+,", 2, "ν", "Western Nicator"),
+            view!(<Prim prim=By/>).into_view(),
+            ("⊟⊸+", 2, "ν", "Western Nicator"),
         ),
         (
             view!(<Prim prim=Dip/>).into_view(),
@@ -388,33 +470,52 @@ pub fn Combinators() -> impl IntoView {
             let note = ["N", "ν", "X", "χ", "R", "ρ"].contains(&symbol).then(|| {
                 view! {
                     <sup>" "<span
-                        style="text-decoration: underline dotted; font-size: 0.8em; cursor: help;"
+                        class="help-note"
                         title="N, ν, X, χ, R, and ρ are not standard named combinators. They are included here because Uiua can express them easily.">
                         "*"
                     </span></sup>
                 }
             });
-            let symbol = if let Some(sym) = symbol.strip_suffix(|c: char| c.is_ascii_digit()) {
+            let symbol_view = if let Some(sym) = symbol.strip_suffix(|c: char| c.is_ascii_digit()) {
                 let sub = symbol.chars().rev().take_while(char::is_ascii_digit).collect::<String>();
                 view!({ sym }<sub>{ sub }</sub>).into_view()
             } else {
                 symbol.into_view()
             };
+            let onclick = {
+                let diagram = diagram.clone();
+                move |_| {
+                    window().open_with_url_and_target(&diagram, "_blank").unwrap();
+                }
+            };
             view! {
                 <tr>
-                    <td>{ symbol }{ note }</td>
+                    <td>{ symbol_view }{ note }</td>
                     <td>{ bird }</td>
                     <td>{ code }</td>
                     <td><Editor example={&ex} nonprogressive=true/></td>
-                    <td><img src={diagram} alt={bird} class="combinator-diagram"/></td>
+                    <td><div style="position: relative">
+                        <object
+                            data={diagram}
+                            type="image/svg+xml"
+                            aria-label={bird}
+                            class="combinator-diagram"/>
+                        <button
+                            class="editor-right-button"
+                            style="position: absolute; top: 0; right: 0;"
+                            data-title="Open SVG"
+                            on:click=onclick>
+                            "🔗"
+                        </button>
+                    </div></td>
                 </tr>
             }
         })
         .collect::<Vec<_>>();
     view! {
-        <Title text="Combinators - Uiua Docs"/>
+        <Title text=format!("Combinators - {} Docs", lang())/>
         <h1>"Combinators"</h1>
-        <p>"This page contains a list of implementations of common combinators in Uiua. While it's not really necessary to know these to write Uiua programs, you may find the information interesting."</p>
+        <p>"This page contains a list of implementations of common combinators in "{lang}". While it's not really necessary to know these to write "{lang}" programs, you may find the information interesting."</p>
         <p>"A combinator is a function that only refers to its arguments. "<a href="https://en.wikipedia.org/wiki/Combinatory_logic">"Combinatory logic"</a>" is the branch of logic that deals with combinators."</p>
         <p>"Ever since Raymond Smullyan's book "<a href="https://en.wikipedia.org/wiki/To_Mock_a_Mockingbird">"To Mock a Mockingbird"</a>", people have been calling combinators by bird names. These bird names are included in the table."</p>
         <Hd id="reading">"Reading the Table"</Hd>
@@ -429,12 +530,155 @@ pub fn Combinators() -> impl IntoView {
                 <th title="Symbol">"Sym."</th>
                 <th>"Bird"</th>
                 <th>"Code"</th>
-                <th>"Example"</th>
+                <th style="width: 100%">"Example"</th>
                 <th>"Diagram"</th>
             </tr>
             { combinators }
         </table>
         <p>"This page is inspired by the "<a href="https://mlochbaum.github.io/BQN/doc/birds.html">"similar page"</a>" on the BQN website. The diagrams are also inspired by "<a href="https://mlochbaum.github.io/BQN/doc/tacit.html#combinators">"BQN's combinator diagrams"</a>"."</p>
         <p>"I referenced "<a href="https://combinatorylogic.com/table.html">"these"</a>" "<a href="https://www.angelfire.com/tx4/cus/combinator/birds.html">"lists"</a>" of combinators when making this page."</p>
+    }
+}
+
+#[component]
+pub fn Subscripts() -> impl IntoView {
+    use Primitive::*;
+
+    fn subscript<'a>(prim: Primitive, meaning: &'a str, example: &'a str) -> impl IntoView + 'a {
+        view!(<tr>
+            <td><Prim prim=prim/></td>
+            <td>{ meaning.to_string() }</td>
+            <td><Editor example=example nonprogressive=true/></td>
+        </tr>)
+    }
+
+    let stable = vec![
+        subscript(Couple, "Group N arrays as rows", "{⊟₃ 1 2 3 4 5}"),
+        subscript(Box, "Group N arrays as boxed rows", "□₃ 1_2_3 5 \"wow\""),
+        subscript(Deshape, "Change rank", "♭₂ ⇡ 2_2"),
+        subscript(Transpose, "Repeat", "# Experimental!\n△ ⍉₃ °△1_2_3_4_5"),
+        subscript(Sqrt, "Nth root", "√₃ [8 27 125]"),
+        subscript(Neg, "Turn one Nth in the complex plane", "⁅₃ ⍥₄⊸¯₄ 1"),
+        subscript(Round, "To N decimal places", "⁅₃ π"),
+        subscript(Floor, "To N decimal places", "# Experimental!\n⌊₄ π\n⌊₄ τ"),
+        subscript(Ceil, "To N decimal places", "# Experimental!\n⌈₄ π\n⌈₄ τ"),
+        subscript(First, "First N values", "⊢₂ \"hello\""),
+        subscript(Last, "Last N values", "⊣₂ \"hello\""),
+        subscript(Bits, "Force N bits", "⋯₄ [1 2 3]"),
+        subscript(Rand, "Random integer", "⚂₁₀₀"),
+        subscript(Len, "Length of the Nth axis", "⧻₁ °△2_3_4_5"),
+        subscript(Shape, "Shape of the first N axes", "△₂ °△2_3_4_5"),
+        subscript(On, "First N values", "{⟜₂[⊙⊙∘] 1 2 3}"),
+        subscript(By, "Last N values", "{⊸₂[⊙⊙∘] 1 2 3}"),
+        subscript(With, "Last N values", "{⤙₂[⊙⊙∘] 1 2 3}"),
+        subscript(Off, "First N values", "{⤚₂[⊙⊙∘] 1 2 3}"),
+        subscript(Both, "Apply to N argument sets", "[∩₃+ 1 2 3 4 5 6]"),
+        subscript(Each, "Apply to rank N subarrays", "∵₁□ °△2_3_4"),
+        subscript(Rows, "Apply to subarrays N deep", "≡₂□ °△2_3_4"),
+        subscript(Inventory, "Apply to subarrays N deep", "⍚₂⇡ °△2_3"),
+        subscript(Repeat, "Repetition count", "⍥₅(⊂⟜/+) [1 2]"),
+        subscript(Tuples, "Tuple size", "⧅₂< ⇡4"),
+        subscript(Stencil, "Window size", "⧈₃∘ ⇡6"),
+        subscript(Stack, "Print top N values", "?₂ 1 2 3 4"),
+    ];
+
+    let sided = vec![
+        subscript(
+            Both,
+            "Use left-most or right-most argument twice",
+            "[∩⌞⊟ @a@b@c]\n[∩⌟⊟ @a@b@c]",
+        ),
+        subscript(
+            Bracket,
+            "Use left-most or right-most argument twice",
+            "{⊓⌞⊟□₂ @a@b@c}\n{⊓⌟⊟□₂ @a@b@c}",
+        ),
+        subscript(
+            Rows,
+            "Fix left-most or right-most argument",
+            "# Experimental!\n≡⌞⊂ 1_2_3 4_5_6\n≡⌟⊂ 1_2_3 4_5_6",
+        ),
+        subscript(
+            Inventory,
+            "Fix left-most or right-most argument",
+            "# Experimental!\n⍚⌞⊂ 1_2_3 4_5_6\n⍚⌟⊂ 1_2_3 4_5_6",
+        ),
+        subscript(
+            Each,
+            "Fix left-most or right-most argument",
+            "# Experimental!\n∵⌞⊂ 1_2 3_4\n∵⌟⊂ 1_2 3_4",
+        ),
+        subscript(
+            Reach,
+            "Put the second argument above or below the outputs",
+            "# Experimental!\n{𝄐⌞⊟ 1 2 3}\n{𝄐⌟⊟ 1 2 3}",
+        ),
+        subscript(
+            Fill,
+            "Fill from the left instead of the right",
+            "# Experimental!\n ⬚0[1_2_3 4_5 6]\n⬚⌟0[1_2_3 4_5 6]\n⬚⌞0[1_2_3 4_5 6]",
+        ),
+    ];
+
+    view! {
+        <Title text=format!("Subscripts - {} Docs", lang())/>
+        <h1>"Subscripts"</h1>
+        <p>"By suffixing some functions or modifiers with a subscript number, their behavior can be modified."</p>
+        <p>"Subscript numbers are typed with a "<code>"__"</code>" followed by some digits. The formatter will turn them into subscript digit characters."</p>
+        <p>"The following functions and modifiers are supported. Not all are stable."</p>
+        <table class="header-centered-table cell-centered-table" style="width: 100%">
+            <tr>
+                <th>"Primitive"</th>
+                <th>"Meaning"</th>
+                <th style="width: 100%">"Example"</th>
+            </tr>
+            <tr>
+                <td>"Any "<span class="dyadic-function">"dyadic"</span>" pervasive function"</td>
+                <td>"Constant first argument"</td>
+                <td><Editor example="⊃+₁×₂ [1 2 3]" nonprogressive=true/></td>
+            </tr>
+            <tr>
+                <td><Prims prims=[Select, Pick, Take, Drop, Join, Rotate, Orient]/></td>
+                <td>"Constant first argument"</td>
+                <td><Editor example="⊃↙₂↻₃ [1 2 3 4 5]" nonprogressive=true/></td>
+            </tr>
+            { stable }
+        </table>
+        <Hd id="sided">"Sided Subscripts"</Hd>
+        <p>"Sided subscripts are an "<code>"# Experimental!"</code>" feature that allows using subscripts for some common patterns that might be thought of as having a \"side\"."</p>
+        <p>"Sided subscripts are typed like normal subscripts with "<code>"__"</code>", but followed by "<code>"<"</code>" for left or "<code>">"</code>" for right. The formatter will turn them into "<code>"⌞"</code>" and "<code>"⌟"</code>" respectively."</p>
+        <p>"Sided and numberic subscripts cannot currently be mixed."</p>
+        <table class="header-centered-table cell-centered-table" style="width: 100%">
+            <tr>
+                <th>"Primitive"</th>
+                <th>"Meaning"</th>
+                <th style="width: 60%">"Example"</th>
+            </tr>
+            <tr>
+                <td>"Any "<span class="dyadic-function">"dyadic"</span>" pervasive function"</td>
+                <td>"Fix left-most or right-most argument"</td>
+                <td><Editor example="# Experimental!\n+⌞ ×100. 1_2_3\n+⌟ ×100. 1_2_3" nonprogressive=true/></td>
+            </tr>
+            { sided }
+        </table>
+    }
+}
+
+#[component]
+pub fn Experimental() -> impl IntoView {
+    view! {
+        <Title text=format!("Experimental Features - {} Docs", lang())/>
+        <h1>"Experimental Features"</h1>
+        <p>{lang}" has a number of features that are considered experimental. They are available in the interpreter for testing, but may be removed or changed in the future."</p>
+        <p>"Using experimental features requires an "<code>"# Experimental!"</code>" comment to be placed at the top of a "{lang}" source file."</p>
+
+        <Hd id="functions-modifiers">"Experimental Functions and Modifiers"</Hd>
+        <ul>{
+            Primitive::non_deprecated().filter(Primitive::is_experimental).map(|prim| {
+                view! { <li><Prim prim=prim/></li> }
+            }).collect::<Vec<_>>()
+        }</ul>
+
+        <Markdown src="/text/experimental.md"/>
     }
 }

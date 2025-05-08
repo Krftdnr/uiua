@@ -1,11 +1,12 @@
 use std::{
+    borrow::Cow,
     fmt,
     hash::Hash,
     ops::{Deref, DerefMut, RangeBounds},
 };
 
 use serde::*;
-use tinyvec::{tiny_vec, TinyVec};
+use tinyvec::{ArrayVec, TinyVec};
 
 /// Uiua's array shape type
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
@@ -15,10 +16,17 @@ pub struct Shape {
 }
 
 impl Shape {
-    /// Create a new shape with no dimensions
-    pub fn scalar() -> Self {
-        Shape { dims: tiny_vec![] }
-    }
+    /// A shape with no dimensions
+    pub const SCALAR: Self = Shape {
+        dims: TinyVec::Inline(ArrayVec::from_array_empty([0; 3])),
+    };
+    /// An empty list shape
+    pub const EMPTY_LIST: Self = Shape {
+        dims: TinyVec::Inline(match ArrayVec::try_from_array_len([0, 0, 0], 1) {
+            Ok(v) => v,
+            Err(_) => unreachable!(),
+        }),
+    };
     /// Create a new scalar shape with the given capacity
     pub fn with_capacity(capacity: usize) -> Self {
         Shape {
@@ -41,9 +49,25 @@ impl Shape {
     pub fn insert(&mut self, index: usize, dim: usize) {
         self.dims.insert(index, dim);
     }
+    /// Get a mutable reference to the first dimension, setting it if empty
+    pub fn row_count_mut(&mut self) -> &mut usize {
+        if self.is_empty() {
+            self.push(1);
+        }
+        &mut self.dims[0]
+    }
     /// Remove the dimension at the given index
     pub fn remove(&mut self, index: usize) -> usize {
         self.dims.remove(index)
+    }
+    /// Get the row count
+    #[inline(always)]
+    pub fn row_count(&self) -> usize {
+        self.dims.first().copied().unwrap_or(1)
+    }
+    /// Get the row length
+    pub fn row_len(&self) -> usize {
+        self.dims.iter().skip(1).product()
     }
     /// Get the row shape
     pub fn row(&self) -> Shape {
@@ -51,30 +75,63 @@ impl Shape {
         shape.make_row();
         shape
     }
+    /// Get the row shape slice
+    pub fn row_slice(&self) -> &[usize] {
+        &self.dims[self.len().min(1)..]
+    }
     /// Get the number of elements
     pub fn elements(&self) -> usize {
         self.iter().product()
     }
     /// Make the shape its row shape
     pub fn make_row(&mut self) {
-        if self.len() > 0 {
+        if !self.is_empty() {
             self.dims.remove(0);
         }
     }
+    /// Make the shape 1-dimensional
+    pub fn deshape(&mut self) {
+        if self.len() != 1 {
+            *self = self.elements().into();
+        }
+    }
+    /// Add a 1-length dimension to the front of the array's shape
+    pub fn fix(&mut self) {
+        self.fix_depth(0);
+    }
+    pub(crate) fn fix_depth(&mut self, depth: usize) -> usize {
+        let depth = depth.min(self.len());
+        self.insert(depth, 1);
+        depth
+    }
+    /// Remove a 1-length dimension from the front of the array's shape
+    pub fn unfix(&mut self) -> Result<(), Cow<'static, str>> {
+        match self.unfix_inner() {
+            Some(1) => Ok(()),
+            Some(d) => Err(Cow::Owned(format!("Cannot unfix array with length {d}"))),
+            None if self.contains(&0) => Err("Cannot unfix empty array".into()),
+            None if self.is_empty() => Err("Cannot unfix scalar".into()),
+            None => Err(Cow::Owned(format!(
+                "Cannot unfix array with shape {self:?}"
+            ))),
+        }
+    }
+    /// Collapse the top two dimensions of the array's shape
+    pub fn undo_fix(&mut self) {
+        self.unfix_inner();
+    }
     /// Unfix the shape
-    pub fn unfix(&mut self) -> bool {
+    ///
+    /// Returns the first dimension
+    fn unfix_inner(&mut self) -> Option<usize> {
         match &mut **self {
-            [1, ..] => {
-                self.remove(0);
-                true
-            }
+            [1, ..] => Some(self.remove(0)),
             [a, b, ..] => {
                 let new_first_dim = *a * *b;
                 *b = new_first_dim;
-                self.remove(0);
-                true
+                Some(self.remove(0))
             }
-            _ => false,
+            _ => None,
         }
     }
     /// Extend the shape with the given dimensions
@@ -95,6 +152,11 @@ impl Shape {
     pub fn dims_mut(&mut self) -> &mut [usize] {
         &mut self.dims
     }
+    /// Truncate the shape
+    #[track_caller]
+    pub fn truncate(&mut self, len: usize) {
+        self.dims.truncate(len);
+    }
     pub(crate) fn flat_to_dims(&self, flat: usize, index: &mut Vec<usize>) {
         index.clear();
         let mut flat = flat;
@@ -111,6 +173,16 @@ impl Shape {
                 return None;
             }
             flat = flat * dim + i;
+        }
+        Some(flat)
+    }
+    pub(crate) fn i_dims_to_flat(&self, index: &[isize]) -> Option<usize> {
+        let mut flat = 0;
+        for (&dim, &i) in self.dims.iter().zip(index) {
+            if i < 0 || i >= dim as isize {
+                return None;
+            }
+            flat = flat * dim + i as usize;
         }
         Some(flat)
     }
@@ -145,6 +217,14 @@ impl From<&[usize]> for Shape {
     fn from(dims: &[usize]) -> Self {
         Self {
             dims: dims.iter().copied().collect(),
+        }
+    }
+}
+
+impl From<Vec<usize>> for Shape {
+    fn from(dims: Vec<usize>) -> Self {
+        Self {
+            dims: TinyVec::Heap(dims),
         }
     }
 }

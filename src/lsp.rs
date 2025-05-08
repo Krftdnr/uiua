@@ -4,37 +4,48 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fmt,
+    path::PathBuf,
     slice,
-    sync::Arc,
 };
 
 use crate::{
-    algorithm::invert::{invert_instrs, under_instrs},
-    ast::{Item, Modifier, PlaceholderOp, Ref, RefComponent, Word},
-    ident_modifier_args, instrs_are_pure,
+    ast::{Func, InlineMacro, Item, Modifier, ModuleKind, Ref, RefComponent, Subscript, Word},
+    ident_modifier_args, is_custom_glyph,
     lex::{CodeSpan, Sp},
     parse::parse,
-    Assembly, BindingInfo, BindingKind, Compiler, Ident, InputSrc, Inputs, PreEvalMode, Primitive,
-    SafeSys, Signature, SysBackend, UiuaError, Value, CONSTANTS,
+    Assembly, BindingInfo, BindingKind, BindingMeta, Compiler, Ident, InputSrc, Inputs, LocalName,
+    PreEvalMode, Primitive, Purity, SafeSys, Shape, Signature, SysBackend, UiuaError, Value,
+    CONSTANTS,
 };
 
 /// Kinds of span in Uiua code, meant to be used in the language server or other IDE tools
 #[allow(missing_docs)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpanKind {
-    Primitive(Primitive),
+    Primitive(Primitive, Option<Subscript>),
     String,
     Number,
     Comment,
     OutputComment,
     Strand,
-    Ident(Option<BindingDocs>),
+    Ident {
+        /// The documentation of the identifier
+        docs: Option<BindingDocs>,
+        /// Whether the identifier is the original binding name
+        original: bool,
+    },
     Label,
     Signature,
     Whitespace,
-    Placeholder(PlaceholderOp),
+    Placeholder(usize),
     Delimiter,
-    FuncDelim(Signature),
+    LexOrder,
+    FuncDelim(Signature, SetInverses),
+    MacroDelim(usize),
+    ImportSrc(ImportSrc),
+    Subscript(Option<Primitive>, Option<Subscript>),
+    Obverse(SetInverses),
 }
 
 /// Documentation information for a binding
@@ -42,12 +53,14 @@ pub enum SpanKind {
 pub struct BindingDocs {
     /// The span of the binding name where it was defined
     pub src_span: CodeSpan,
-    /// The comment of the binding
-    pub comment: Option<Arc<str>>,
     /// Whether the binding is public
     pub is_public: bool,
     /// The specific binding kind
     pub kind: BindingDocsKind,
+    /// An escape code used to type a glyph
+    pub escape: Option<String>,
+    /// Metadata about the binding
+    pub meta: BindingMeta,
 }
 
 /// The kind of a binding
@@ -69,56 +82,118 @@ pub enum BindingDocsKind {
     /// A modifier
     Modifier(usize),
     /// A module
-    Module,
+    Module {
+        /// The signature of the module's `New` function
+        sig: Option<Signature>,
+    },
+    /// An error
+    Error,
 }
 
-/// Get spans and their kinds from Uiua code
-pub fn spans(input: &str) -> (Vec<Sp<SpanKind>>, Inputs) {
-    spans_with_backend(input, SafeSys::default())
+/// Span data extracted from Uiua code
+#[derive(Debug)]
+pub struct Spans {
+    /// The spans
+    pub spans: Vec<Sp<SpanKind>>,
+    /// The inputs used to build the spans
+    pub inputs: Inputs,
+    /// Top-level values for lines
+    pub top_level_values: BTreeMap<usize, Vec<Value>>,
 }
 
-#[doc(hidden)]
-/// Used for coloring code in the REPL
-pub fn spans_with_compiler(input: &str, compiler: &Compiler) -> (Vec<Sp<SpanKind>>, Inputs) {
-    let mut compiler = compiler.clone();
-    let src = InputSrc::Str(compiler.asm.inputs.strings.len().saturating_sub(1));
-    let (items, _, _) = parse(input, src.clone(), &mut compiler.asm.inputs);
-    let spanner = Spanner {
-        asm: compiler.asm,
-        code_meta: compiler.code_meta,
-        errors: Vec::new(),
-        diagnostics: Vec::new(),
-    };
-    (spanner.items_spans(&items), spanner.asm.inputs.clone())
+impl Spans {
+    /// Get spans and their kinds from Uiua code
+    pub fn from_input(input: &str) -> Self {
+        Self::with_backend(input, SafeSys::default())
+    }
+    /// Get spans and their kinds from Uiua code with a custom backend
+    pub fn with_backend(input: &str, backend: impl SysBackend) -> Self {
+        let src = InputSrc::Str(0);
+        let (items, _, _) = parse(input, src.clone(), &mut Inputs::default());
+        let spanner = Spanner::new(src, input, backend);
+        let spans = spanner.items_spans(&items);
+        let inputs = spanner.asm.inputs;
+        let top_level_values = spanner
+            .code_meta
+            .top_level_values
+            .into_iter()
+            .map(|(span, vals)| (span.start.line as usize, vals))
+            .collect();
+        Spans {
+            spans,
+            inputs,
+            top_level_values,
+        }
+    }
+    #[doc(hidden)]
+    /// Get spans using the given compiler
+    pub fn with_compiler(input: &str, compiler: &Compiler) -> Self {
+        let mut compiler = compiler.clone();
+        let src = InputSrc::Str(compiler.asm.inputs.strings.len().saturating_sub(1));
+        let (items, _, _) = parse(input, src.clone(), &mut compiler.asm.inputs);
+        let spanner = Spanner {
+            src,
+            asm: compiler.asm,
+            code_meta: compiler.code_meta,
+            errors: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let spans = spanner.items_spans(&items);
+        let inputs = spanner.asm.inputs;
+        let top_level_values = spanner
+            .code_meta
+            .top_level_values
+            .into_iter()
+            .map(|(span, vals)| (span.start.line as usize, vals))
+            .collect();
+        Spans {
+            spans,
+            inputs,
+            top_level_values,
+        }
+    }
 }
 
-/// Get spans and their kinds from Uiua code with a custom backend
-pub fn spans_with_backend(input: &str, backend: impl SysBackend) -> (Vec<Sp<SpanKind>>, Inputs) {
-    let src = InputSrc::Str(0);
-    let (items, _, _) = parse(input, src.clone(), &mut Inputs::default());
-    let spanner = Spanner::new(src, input, backend);
-    (spanner.items_spans(&items), spanner.asm.inputs)
-}
-
-/// Metadata for code for use in IDE tools
+/// Code metadata for use in IDE tools
 #[derive(Debug, Clone, Default)]
 pub struct CodeMeta {
     /// A map of references to global bindings
-    pub global_references: HashMap<Sp<Ident>, usize>,
+    pub global_references: HashMap<CodeSpan, usize>,
     /// A map of references to shadowable constants
     pub constant_references: HashSet<Sp<Ident>>,
+    /// A map of identifiers to possible completions
+    pub completions: HashMap<CodeSpan, Vec<Completion>>,
     /// Spans of functions and their signatures and whether they are explicit
     pub function_sigs: SigDecls,
     /// A map of macro invocations to their expansions
-    pub macro_expansions: HashMap<CodeSpan, (Ident, String)>,
-    /// A map of incomplete ref paths to their module's index
-    pub incomplete_refs: HashMap<CodeSpan, usize>,
+    pub macro_expansions: HashMap<CodeSpan, (Option<Ident>, String)>,
+    /// A map of inline macro functions to their number of arguments
+    pub inline_macros: HashMap<CodeSpan, usize>,
+    /// A map of top-level binding names to their indices
+    pub top_level_names: HashMap<Ident, LocalName>,
     /// A map of the spans of top-level lines to values
     pub top_level_values: HashMap<CodeSpan, Vec<Value>>,
     /// A map of strand spans
     pub strands: BTreeMap<CodeSpan, Vec<CodeSpan>>,
-    /// A map of array spans
-    pub arrays: BTreeMap<CodeSpan, Vec<CodeSpan>>,
+    /// A map of inner array spans
+    pub array_inner_spans: BTreeMap<CodeSpan, Vec<CodeSpan>>,
+    /// A map of array shapes
+    pub array_shapes: BTreeMap<CodeSpan, Shape>,
+    /// A map of module spans to their source
+    pub import_srcs: HashMap<CodeSpan, ImportSrc>,
+    /// A map of obverse spans to their set inverses
+    pub obverses: HashMap<CodeSpan, SetInverses>,
+}
+
+/// A completion suggestion
+#[derive(Debug, Clone)]
+pub struct Completion {
+    /// The text of the completion
+    pub text: String,
+    /// The index of the binding
+    pub index: usize,
+    /// Whether this is a replacement
+    pub replace: bool,
 }
 
 /// Data for the signature of a function
@@ -130,11 +205,77 @@ pub struct SigDecl {
     pub explicit: bool,
     /// Whether the function is inline
     pub inline: bool,
+    /// Inverses
+    pub set_inverses: SetInverses,
 }
 
-pub(crate) type SigDecls = HashMap<CodeSpan, SigDecl>;
+/// Which inverses were set by `obverse`
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SetInverses {
+    pub un: bool,
+    pub anti: bool,
+    pub under: bool,
+}
+
+impl SetInverses {
+    /// Whether no inverses were set
+    pub fn is_empty(&self) -> bool {
+        !(self.un || self.anti || self.under)
+    }
+}
+
+struct FormatSetInverses<'a>(SetInverses, [&'a str; 3]);
+impl fmt::Display for FormatSetInverses<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let FormatSetInverses(set_inverses, names) = self;
+        let count =
+            set_inverses.un as usize + set_inverses.anti as usize + set_inverses.under as usize;
+        if count == 0 {
+            return Ok(());
+        }
+        write!(f, "Sets ")?;
+        for (i, (is_set, name)) in [set_inverses.un, set_inverses.anti, set_inverses.under]
+            .into_iter()
+            .zip(names)
+            .enumerate()
+        {
+            if !is_set {
+                continue;
+            }
+            if i > 0 {
+                match count {
+                    2 => write!(f, " and ")?,
+                    3 if i == 1 => write!(f, ", ")?,
+                    3 if i == 2 => write!(f, ", and ")?,
+                    _ => {}
+                }
+            }
+            write!(f, "{name}")?;
+        }
+        write!(f, " inverse{} here", if count == 1 { "" } else { "s" })
+    }
+}
+
+impl fmt::Display for SetInverses {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        FormatSetInverses(*self, ["° un", "⌝ anti", "⍜ under"]).fmt(f)
+    }
+}
+
+/// The source of an imported module
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportSrc {
+    /// A Git URL
+    Git(String),
+    /// A file path
+    File(PathBuf),
+}
+
+pub(crate) type SigDecls = BTreeMap<CodeSpan, SigDecl>;
 
 struct Spanner {
+    src: InputSrc,
     asm: Assembly,
     code_meta: CodeMeta,
     #[allow(dead_code)]
@@ -147,13 +288,14 @@ impl Spanner {
     fn new(src: InputSrc, input: &str, backend: impl SysBackend) -> Self {
         let mut compiler = Compiler::with_backend(backend);
         compiler.pre_eval_mode(PreEvalMode::Lsp);
-        let errors = match compiler.load_str_src(input, src) {
+        compiler.backend().set_output_enabled(false);
+        let errors = match compiler.load_str_src(input, src.clone()) {
             Ok(_) => Vec::new(),
-            Err(UiuaError::Multi(errors)) => errors,
-            Err(e) => vec![e],
+            Err(e) => e.into_multi(),
         };
         let diagnostics = compiler.take_diagnostics().into_iter().collect();
         Self {
+            src,
             asm: compiler.asm,
             code_meta: compiler.code_meta,
             errors,
@@ -167,35 +309,128 @@ impl Spanner {
         let mut spans = Vec::new();
         for item in items {
             match item {
-                Item::TestScope(items) => spans.extend(self.items_spans(&items.value)),
-                Item::Words(lines) => {
-                    for line in lines {
-                        spans.extend(self.words_spans(line))
+                Item::Module(m) => {
+                    spans.push(m.value.open_span.clone().sp(SpanKind::Delimiter));
+                    match &m.value.kind {
+                        ModuleKind::Named(name) => {
+                            let binding_docs = self.binding_docs(&name.span);
+                            spans.push(name.span.clone().sp(SpanKind::Ident {
+                                docs: binding_docs,
+                                original: true,
+                            }));
+                        }
+                        ModuleKind::Test => {}
+                    }
+                    if let Some(line) = &m.value.imports {
+                        spans.push(line.tilde_span.clone().sp(SpanKind::Delimiter));
+                        for item in &line.items {
+                            let binding_docs = self.reference_docs(&item.span);
+                            spans.push(item.span.clone().sp(SpanKind::Ident {
+                                docs: binding_docs,
+                                original: false,
+                            }));
+                        }
+                    }
+                    spans.extend(self.items_spans(&m.value.items));
+                    if let Some(close_span) = &m.value.close_span {
+                        spans.push(close_span.clone().sp(SpanKind::Delimiter));
                     }
                 }
+                Item::Words(line) => spans.extend(self.words_spans(line)),
                 Item::Binding(binding) => {
+                    if let Some(tilde_span) = &binding.tilde_span {
+                        spans.push(tilde_span.clone().sp(SpanKind::Delimiter));
+                    }
                     let binding_docs = self
                         .binding_docs(&binding.name.span)
                         .or_else(|| self.reference_docs(&binding.name.span));
-                    spans.push(binding.name.span.clone().sp(SpanKind::Ident(binding_docs)));
+                    spans.push(binding.name.span.clone().sp(SpanKind::Ident {
+                        docs: binding_docs,
+                        original: true,
+                    }));
                     spans.push(binding.arrow_span.clone().sp(SpanKind::Delimiter));
                     if let Some(sig) = &binding.signature {
                         spans.push(sig.span.clone().sp(SpanKind::Signature));
                     }
                     spans.extend(self.words_spans(&binding.words));
                 }
+                Item::Data(defs) => {
+                    for data in defs {
+                        spans.push(data.init_span.clone().sp(SpanKind::Delimiter));
+                        if let Some(name) = &data.name {
+                            spans.push(name.span.clone().sp(SpanKind::Ident {
+                                docs: self.binding_docs(&name.span),
+                                original: true,
+                            }));
+                            if let Some(fields) = &data.fields {
+                                spans.push(
+                                    name.span
+                                        .clone()
+                                        .end_to(&fields.open_span)
+                                        .sp(SpanKind::Whitespace),
+                                );
+                            }
+                        }
+                        if let Some(fields) = &data.fields {
+                            spans.push(fields.open_span.clone().sp(SpanKind::Delimiter));
+                            let mut prev: Option<CodeSpan> = None;
+                            for field in &fields.fields {
+                                if let Some(prev) = prev {
+                                    let curr = field.span();
+                                    if prev.end.line == curr.start.line {
+                                        spans.push(prev.end_to(&curr).sp(SpanKind::Whitespace))
+                                    }
+                                }
+                                spans.push(field.name.span.clone().sp(SpanKind::Ident {
+                                    docs: self.binding_docs(&field.name.span),
+                                    original: true,
+                                }));
+                                if let Some(validator) = &field.validator {
+                                    spans.push(validator.open_span.clone().sp(SpanKind::Delimiter));
+                                    spans.extend(self.words_spans(&validator.words));
+                                    if let Some(close_span) = &validator.close_span {
+                                        spans.push(close_span.clone().sp(SpanKind::Delimiter));
+                                    }
+                                }
+                                if let Some(init) = &field.init {
+                                    spans.push(init.arrow_span.clone().sp(SpanKind::Delimiter));
+                                    spans.extend(self.words_spans(&init.words));
+                                }
+                                prev = Some(field.span());
+                            }
+                            if let Some(span) = &fields.close_span {
+                                spans.push(span.clone().sp(SpanKind::Delimiter));
+                            }
+                        }
+                        if let Some(words) = &data.func {
+                            spans.extend(self.words_spans(words));
+                        }
+                    }
+                }
                 Item::Import(import) => {
                     if let Some(name) = &import.name {
                         let binding_docs = self.binding_docs(&name.span);
-                        spans.push(name.span.clone().sp(SpanKind::Ident(binding_docs)));
+                        spans.push(name.span.clone().sp(SpanKind::Ident {
+                            docs: binding_docs,
+                            original: false,
+                        }));
                     }
                     spans.push(import.tilde_span.clone().sp(SpanKind::Delimiter));
-                    spans.push(import.path.span.clone().sp(SpanKind::String));
+                    spans.push(
+                        if let Some(src) = self.code_meta.import_srcs.get(&import.path.span) {
+                            (import.path.span.clone()).sp(SpanKind::ImportSrc(src.clone()))
+                        } else {
+                            import.path.span.clone().sp(SpanKind::String)
+                        },
+                    );
                     for line in import.lines.iter().flatten() {
                         spans.push(line.tilde_span.clone().sp(SpanKind::Delimiter));
                         for item in &line.items {
                             let binding_docs = self.reference_docs(&item.span);
-                            spans.push(item.span.clone().sp(SpanKind::Ident(binding_docs)));
+                            spans.push(item.span.clone().sp(SpanKind::Ident {
+                                docs: binding_docs,
+                                original: false,
+                            }));
                         }
                     }
                 }
@@ -217,13 +452,12 @@ impl Spanner {
 
     fn reference_docs(&self, span: &CodeSpan) -> Option<BindingDocs> {
         // Look in global references
-        for (name, index) in &self.code_meta.global_references {
-            let Some(binding) = self.asm.bindings.get(*index) else {
-                continue;
-            };
-            if name.span != *span {
-                continue;
-            }
+        if let Some(binding) = self
+            .code_meta
+            .global_references
+            .get(span)
+            .and_then(|i| self.asm.bindings.get(*i))
+        {
             return Some(self.make_binding_docs(binding));
         }
         // Look in constant references
@@ -234,72 +468,132 @@ impl Spanner {
             let Some(constant) = CONSTANTS.iter().find(|c| c.name == name.value) else {
                 continue;
             };
-            let val = constant.value.clone();
+            let path = if let InputSrc::File(path) = &self.src {
+                Some(&**path)
+            } else {
+                None
+            };
+            #[cfg(feature = "native_sys")]
+            let sys = &crate::NativeSys;
+            #[cfg(not(feature = "native_sys"))]
+            let sys = &crate::SafeSys::new();
+            let val = constant.value.resolve(path, sys);
+            let meta = BindingMeta {
+                comment: Some(constant.doc().into()),
+                ..Default::default()
+            };
             return Some(BindingDocs {
                 src_span: span.clone(),
-                comment: Some(constant.doc.into()),
                 is_public: true,
                 kind: BindingDocsKind::Constant(Some(val)),
+                escape: None,
+                meta,
             });
         }
         None
     }
 
     fn make_binding_docs(&self, binfo: &BindingInfo) -> BindingDocs {
-        let mut comment = binfo.comment.clone();
-        if comment.is_none() {
+        let mut meta = binfo.meta.clone();
+        if meta.comment.is_none() {
+            let name = binfo.span.as_str(&self.asm.inputs, |s| s.to_string());
+            meta.comment = match name.as_str() {
+                "🦈" | "🏳️‍⚧️" => Some("Trans rights".into()),
+                "🤠" => Some("This town ain't big enough for the ∩ of us".into()),
+                "👽" => Some("Ayy, lmao".into()),
+                "🐈" | "😺" | "😸" | "😹" | "😻" | "😼" | "😽" | "🙀" | "🐱‍👤" => {
+                    Some("Meow".into())
+                }
+                "🐕" | "🐶" | "🦮" | "🐕‍🦺" => Some("Woof".into()),
+                "🐖" | "🐷" | "🐽" /* | "👮" */ => Some("Oink".into()),
+                "🐄" | "🐮" => Some("Moo".into()),
+                "🐸" => Some("Ribbit".into()),
+                "ඞ" => Some("SUS".into()),
+                _ => None,
+            };
+        }
+        if meta.comment.is_none() {
             match &binfo.kind {
-                BindingKind::Const(None) => comment = Some("constant".into()),
-                BindingKind::Module { .. } => comment = Some("module".into()),
-                BindingKind::Macro => comment = Some("macro".into()),
-                _ => {}
+                BindingKind::Const(None) => meta.comment = Some("constant".into()),
+                BindingKind::Import(_) | BindingKind::Module(_) | BindingKind::Scope(_) => {
+                    meta.comment = Some("module".into())
+                }
+                BindingKind::IndexMacro(_) | BindingKind::CodeMacro(_) => {
+                    meta.comment = Some("macro".into())
+                }
+                BindingKind::Func(_) => {}
+                BindingKind::Const(_) => {}
+                BindingKind::Error => {}
             }
         }
         let kind = match &binfo.kind {
             BindingKind::Const(val) => BindingDocsKind::Constant(val.clone()),
             BindingKind::Func(f) => BindingDocsKind::Function {
-                sig: f.signature(),
-                invertible: {
-                    let instrs = f.instrs(&self.asm);
-                    let mut compiler = Compiler::new().with_assembly(self.asm.clone());
-                    invert_instrs(instrs, &mut compiler).is_some()
-                },
-                underable: {
-                    let instrs = f.instrs(&self.asm);
-                    let mut compiler = Compiler::new().with_assembly(self.asm.clone());
-                    under_instrs(instrs, (1, 1).into(), &mut compiler).is_some()
-                },
-                pure: instrs_are_pure(f.instrs(&self.asm), &self.asm),
+                sig: f.sig,
+                invertible: self.asm[f].un_inverse(&self.asm).is_ok(),
+                underable: self.asm[f]
+                    .under_inverse(Signature::new(1, 1), false, &self.asm)
+                    .is_ok(),
+                pure: self.asm[f].is_pure(Purity::Pure, &self.asm),
             },
-            BindingKind::Macro => {
+            BindingKind::IndexMacro(args) => BindingDocsKind::Modifier(*args),
+            BindingKind::CodeMacro(_) => {
                 BindingDocsKind::Modifier(binfo.span.as_str(self.inputs(), ident_modifier_args))
             }
-            BindingKind::Module { .. } => BindingDocsKind::Module,
+            BindingKind::Import(_) | BindingKind::Scope(_) => BindingDocsKind::Module { sig: None },
+            BindingKind::Module(m) => {
+                let sig = if let Some(local) = m.names.get("Call").or_else(|| m.names.get("New")) {
+                    self.asm.bindings[local.index].kind.sig()
+                } else {
+                    None
+                };
+                BindingDocsKind::Module { sig }
+            }
+            BindingKind::Error => BindingDocsKind::Error,
         };
+        let escape = binfo.span.as_str(&self.asm.inputs, |s| {
+            is_custom_glyph(s).then(|| {
+                let c = s.chars().next().unwrap();
+                format!("\\\\{:x}", c as u32)
+            })
+        });
         BindingDocs {
             src_span: binfo.span.clone(),
-            comment,
             is_public: binfo.public,
             kind,
+            escape,
+            meta,
         }
     }
 
     fn words_spans(&self, words: &[Sp<Word>]) -> Vec<Sp<SpanKind>> {
         let mut spans = Vec::new();
-        for word in words {
+        'words: for word in words {
             match &word.value {
-                Word::Number(..) => spans.push(word.span.clone().sp(SpanKind::Number)),
-                Word::Char(_)
-                | Word::String(_)
-                | Word::MultilineString(_)
-                | Word::FormatString(_) => spans.push(word.span.clone().sp(SpanKind::String)),
+                Word::Number(_) => {
+                    for prim in Primitive::all().filter(|p| p.is_constant()) {
+                        if word.span.as_str(self.inputs(), |s| {
+                            prim.name().starts_with(s) || prim.to_string() == *s
+                        }) {
+                            spans.push(word.span.clone().sp(SpanKind::Primitive(prim, None)));
+                            continue 'words;
+                        }
+                    }
+                    spans.push(word.span.clone().sp(SpanKind::Number))
+                }
+                Word::Char(_) | Word::String(_) | Word::FormatString(_) => {
+                    spans.push(word.span.clone().sp(SpanKind::String))
+                }
                 Word::Label(_) => spans.push(word.span.clone().sp(SpanKind::Label)),
+                Word::MultilineString(lines) => {
+                    spans.extend((lines.iter()).map(|line| line.span.clone().sp(SpanKind::String)))
+                }
                 Word::MultilineFormatString(lines) => {
                     spans.extend((lines.iter()).map(|line| line.span.clone().sp(SpanKind::String)))
                 }
                 Word::Ref(r) => spans.extend(self.ref_spans(r)),
                 Word::IncompleteRef { path, .. } => spans.extend(self.ref_path_spans(path)),
-                Word::Strand(items) | Word::Undertied(items) => {
+                Word::Strand(items) => {
                     for i in 0..items.len() {
                         let word = &items[i];
                         if i > 0 {
@@ -317,8 +611,11 @@ impl Spanner {
                     }
                 }
                 Word::Array(arr) => {
+                    if let Some(down_span) = &arr.down_span {
+                        spans.push(down_span.clone().sp(SpanKind::LexOrder));
+                    }
                     spans.push(word.span.just_start(self.inputs()).sp(SpanKind::Delimiter));
-                    spans.extend(arr.lines.iter().flat_map(|w| self.words_spans(w)));
+                    spans.extend(self.items_spans(&arr.lines));
                     if arr.closed {
                         let end = word.span.just_end(self.inputs());
                         if end.as_str(self.inputs(), |s| s == "]")
@@ -328,76 +625,83 @@ impl Spanner {
                         }
                     }
                 }
-                Word::Func(func) => {
-                    let kind = if let Some(inline) = self.code_meta.function_sigs.get(&word.span) {
-                        SpanKind::FuncDelim(inline.sig)
+                Word::Func(func) => spans.extend(self.func_spans(func, &word.span)),
+                Word::Pack(pack) => {
+                    if let Some(down_span) = &pack.down_span {
+                        spans.push(down_span.clone().sp(SpanKind::LexOrder));
+                    }
+                    let mut kind = if let Some(inline) = pack
+                        .branches
+                        .first()
+                        .and_then(|br| self.code_meta.function_sigs.get(&br.span))
+                    {
+                        SpanKind::FuncDelim(inline.sig, inline.set_inverses)
                     } else {
                         SpanKind::Delimiter
                     };
                     spans.push(word.span.just_start(self.inputs()).sp(kind.clone()));
-                    if let Some(sig) = &func.signature {
-                        spans.push(sig.span.clone().sp(SpanKind::Signature));
-                    }
-                    spans.extend(func.lines.iter().flat_map(|w| self.words_spans(w)));
-                    if func.closed {
-                        let end = word.span.just_end(self.inputs());
-                        if end.as_str(self.inputs(), |s| s == ")")
-                            || end.as_str(self.inputs(), |s| s == "}")
-                        {
-                            spans.push(end.sp(kind));
-                        }
-                    }
-                }
-                Word::Switch(sw) => {
-                    if word.span.as_str(self.inputs(), |s| s.starts_with('?')) {
-                        spans.push(word.span.clone().sp(SpanKind::Delimiter));
-                        continue;
-                    }
-                    spans.push(word.span.just_start(self.inputs()).sp(SpanKind::Delimiter));
-                    for (i, branch) in sw.branches.iter().enumerate() {
+                    for (i, branch) in pack.branches.iter().enumerate() {
                         let start_span = branch.span.just_start(self.inputs());
                         if i > 0 && start_span.as_str(self.inputs(), |s| s == "|") {
-                            let kind = if let Some(SigDecl {
+                            kind = if let Some(SigDecl {
                                 sig,
+                                set_inverses,
                                 explicit: false,
                                 ..
                             }) = self.code_meta.function_sigs.get(&branch.span)
                             {
-                                SpanKind::FuncDelim(*sig)
+                                SpanKind::FuncDelim(*sig, *set_inverses)
                             } else {
                                 SpanKind::Delimiter
                             };
-                            spans.push(start_span.sp(kind));
+                            spans.push(start_span.sp(kind.clone()));
                         }
                         if let Some(sig) = &branch.value.signature {
                             spans.push(sig.span.clone().sp(SpanKind::Signature));
                         }
-                        spans.extend(branch.value.lines.iter().flat_map(|w| self.words_spans(w)));
+                        spans.extend(self.items_spans(&branch.value.lines));
                     }
-                    if sw.closed {
+                    if pack.closed {
                         let end = word.span.just_end(self.inputs());
                         if end.as_str(self.inputs(), |s| s == ")") {
-                            spans.push(end.sp(SpanKind::Delimiter));
+                            spans.push(end.sp(kind));
                         }
                     }
                 }
                 Word::Primitive(prim) => {
-                    spans.push(word.span.clone().sp(SpanKind::Primitive(*prim)))
-                }
-                Word::SemicolonPop => {
-                    spans.push(word.span.clone().sp(SpanKind::Primitive(Primitive::Pop)))
+                    spans.push(word.span.clone().sp(SpanKind::Primitive(*prim, None)))
                 }
                 Word::Modified(m) => {
-                    let modifier_span = &m.modifier.span;
                     match &m.modifier.value {
+                        Modifier::Primitive(Primitive::Obverse) => {
+                            spans.push(m.modifier.span.clone().sp(
+                                if let Some(set_inverses) =
+                                    self.code_meta.obverses.get(&m.modifier.span)
+                                {
+                                    SpanKind::Obverse(*set_inverses)
+                                } else {
+                                    SpanKind::Primitive(Primitive::Obverse, None)
+                                },
+                            ))
+                        }
                         Modifier::Primitive(p) => {
-                            spans.push(modifier_span.clone().sp(SpanKind::Primitive(*p)))
+                            spans.push((m.modifier.span.clone()).sp(SpanKind::Primitive(*p, None)))
                         }
                         Modifier::Ref(r) => spans.extend(self.ref_spans(r)),
+                        Modifier::Macro(mac) => {
+                            spans.extend(self.func_spans(&mac.func.value, &mac.func.span));
+                            let mac_delim_kind =
+                                SpanKind::MacroDelim(ident_modifier_args(&mac.ident.value));
+                            if let Some(span) = &mac.caret_span {
+                                spans.push(span.clone().sp(mac_delim_kind.clone()));
+                            }
+                            let ident_span = (mac.ident.span.clone()).sp(mac_delim_kind);
+                            spans.push(ident_span);
+                        }
                     }
                     spans.extend(self.words_spans(&m.operands));
                 }
-                Word::Spaces | Word::BreakLine | Word::UnbreakLine => {
+                Word::Spaces | Word::BreakLine | Word::FlipLine => {
                     spans.push(word.span.clone().sp(SpanKind::Whitespace))
                 }
                 Word::Comment(_) | Word::SemanticComment(_) => {
@@ -409,6 +713,68 @@ impl Spanner {
                 Word::Placeholder(op) => {
                     spans.push(word.span.clone().sp(SpanKind::Placeholder(*op)))
                 }
+                #[allow(clippy::match_single_binding)]
+                Word::Subscripted(sub) => {
+                    let n = Some(sub.script.value);
+                    match &sub.word.value {
+                        Word::Modified(m) => {
+                            match &m.modifier.value {
+                                Modifier::Primitive(p) => {
+                                    spans.push(
+                                        m.modifier.span.clone().sp(SpanKind::Primitive(*p, n)),
+                                    );
+                                    spans.push(
+                                        sub.script
+                                            .span
+                                            .clone()
+                                            .sp(SpanKind::Subscript(Some(*p), n)),
+                                    );
+                                }
+                                Modifier::Ref(r) => {
+                                    spans.extend(self.ref_spans(r));
+                                    spans.push(
+                                        sub.script.span.clone().sp(SpanKind::Subscript(None, n)),
+                                    );
+                                }
+                                Modifier::Macro(mac) => {
+                                    spans.extend(self.func_spans(&mac.func.value, &mac.func.span));
+                                    let mac_delim_kind =
+                                        SpanKind::MacroDelim(ident_modifier_args(&mac.ident.value));
+                                    if let Some(span) = &mac.caret_span {
+                                        spans.push(span.clone().sp(mac_delim_kind.clone()));
+                                    }
+                                    let ident_span = (mac.ident.span.clone()).sp(mac_delim_kind);
+                                    spans.push(ident_span);
+                                    spans.push(
+                                        sub.script.span.clone().sp(SpanKind::Subscript(None, n)),
+                                    );
+                                }
+                            }
+                            spans.extend(self.words_spans(&m.operands));
+                        }
+                        Word::Primitive(p) => {
+                            spans.push((sub.word.span.clone()).sp(SpanKind::Primitive(*p, n)));
+                            spans
+                                .push(sub.script.span.clone().sp(SpanKind::Subscript(Some(*p), n)));
+                        }
+                        _ => {
+                            spans.extend(self.words_spans(slice::from_ref(&sub.word)));
+                            spans.push(sub.script.span.clone().sp(SpanKind::Subscript(None, n)));
+                        }
+                    }
+                }
+                Word::InlineMacro(InlineMacro {
+                    ident,
+                    caret_span,
+                    func,
+                }) => {
+                    spans.extend(self.func_spans(&func.value, &func.span));
+                    let mac_delim_kind = SpanKind::MacroDelim(ident_modifier_args(&ident.value));
+                    if let Some(span) = caret_span {
+                        spans.push(span.clone().sp(mac_delim_kind.clone()));
+                    }
+                    spans.push(ident.span.clone().sp(mac_delim_kind));
+                }
             }
         }
         spans.retain(|sp| !sp.span.as_str(self.inputs(), str::is_empty));
@@ -416,16 +782,44 @@ impl Spanner {
     }
     fn ref_spans(&self, r: &Ref) -> Vec<Sp<SpanKind>> {
         let mut spans = self.ref_path_spans(&r.path);
-        let name_docs = self.reference_docs(&r.name.span);
-        spans.push(r.name.span.clone().sp(SpanKind::Ident(name_docs)));
+        let docs = self.reference_docs(&r.name.span);
+        spans.push(r.name.span.clone().sp(SpanKind::Ident {
+            docs,
+            original: false,
+        }));
         spans
     }
     fn ref_path_spans(&self, path: &[RefComponent]) -> Vec<Sp<SpanKind>> {
         let mut spans = Vec::new();
         for comp in path {
-            let module_docs = self.reference_docs(&comp.module.span);
-            spans.push(comp.module.span.clone().sp(SpanKind::Ident(module_docs)));
+            let docs = self.reference_docs(&comp.module.span);
+            spans.push(comp.module.span.clone().sp(SpanKind::Ident {
+                docs,
+                original: false,
+            }));
             spans.push(comp.tilde_span.clone().sp(SpanKind::Delimiter));
+        }
+        spans
+    }
+    fn func_spans(&self, func: &Func, span: &CodeSpan) -> Vec<Sp<SpanKind>> {
+        let mut spans = Vec::new();
+        let kind = if let Some(inline) = self.code_meta.function_sigs.get(span) {
+            SpanKind::FuncDelim(inline.sig, inline.set_inverses)
+        } else if let Some(margs) = self.code_meta.inline_macros.get(span) {
+            SpanKind::MacroDelim(*margs)
+        } else {
+            SpanKind::Delimiter
+        };
+        spans.push(span.just_start(self.inputs()).sp(kind.clone()));
+        if let Some(sig) = &func.signature {
+            spans.push(sig.span.clone().sp(SpanKind::Signature));
+        }
+        spans.extend(self.items_spans(&func.lines));
+        if func.closed {
+            let end = span.just_end(self.inputs());
+            if end.as_str(self.inputs(), |s| s == ")") || end.as_str(self.inputs(), |s| s == "}") {
+                spans.push(end.sp(kind));
+            }
         }
         spans
     }
@@ -437,11 +831,7 @@ pub use server::run_language_server;
 
 #[cfg(feature = "lsp")]
 mod server {
-    use std::{
-        env::current_dir,
-        path::{Path, PathBuf},
-        sync::Arc,
-    };
+    use std::{char::decode_utf16, env::current_dir, path::Path, sync::Arc};
 
     use dashmap::DashMap;
     use tower_lsp::{
@@ -460,12 +850,12 @@ mod server {
         is_ident_char,
         lex::{lex, Loc},
         primitive::{PrimClass, PrimDocFragment},
-        AsciiToken, Assembly, BindingInfo, NativeSys, PrimDocLine, Span, Token,
+        subscript, AsciiToken, Assembly, BindingInfo, NativeSys, PrimDocLine, Span, Token,
+        UiuaErrorKind,
     };
 
     pub struct LspDoc {
         pub input: String,
-        pub items: Vec<Item>,
         pub spans: Vec<Sp<SpanKind>>,
         pub asm: Assembly,
         pub code_meta: CodeMeta,
@@ -474,19 +864,22 @@ mod server {
     }
 
     impl LspDoc {
-        fn new(path: impl AsRef<Path>, input: String) -> Self {
-            let path = path.as_ref();
+        fn new(path: &Path, input: String) -> Self {
+            let path = path
+                .to_string_lossy()
+                .strip_prefix("\\\\?\\")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| path.to_path_buf());
             let path = current_dir()
                 .ok()
-                .and_then(|curr| pathdiff::diff_paths(path, curr))
-                .unwrap_or_else(|| path.to_path_buf());
+                .and_then(|curr| pathdiff::diff_paths(&path, curr))
+                .unwrap_or(path);
             let src = InputSrc::File(path.into());
             let (items, _, _) = parse(&input, src.clone(), &mut Inputs::default());
             let spanner = Spanner::new(src, &input, NativeSys);
             let spans = spanner.items_spans(&items);
             Self {
                 input,
-                items,
                 spans,
                 asm: spanner.asm,
                 code_meta: spanner.code_meta,
@@ -511,13 +904,16 @@ mod server {
                     client,
                     docs: DashMap::new(),
                 });
-                Server::new(stdin, stdout, socket).serve(service).await;
+                Server::new(stdin, stdout, socket)
+                    .concurrency_level(1)
+                    .serve(service)
+                    .await;
             });
     }
 
     struct Backend {
         client: Client,
-        docs: DashMap<Url, LspDoc>,
+        docs: DashMap<Url, Arc<LspDoc>>,
     }
 
     const UIUA_NUMBER_STT: SemanticTokenType = SemanticTokenType::new("uiua_number");
@@ -531,10 +927,11 @@ mod server {
     const MONADIC_MODIFIER_STT: SemanticTokenType = SemanticTokenType::new("monadic_modifier");
     const DYADIC_MODIFIER_STT: SemanticTokenType = SemanticTokenType::new("dyadic_modifier");
     const TRIADIC_MODIFIER_STT: SemanticTokenType = SemanticTokenType::new("triadic_modifier");
-    const MODULE_STT: SemanticTokenType = SemanticTokenType::new("module");
+    const MODULE_STT: SemanticTokenType = SemanticTokenType::new("uiua_module");
 
-    const SEMANTIC_TOKEN_TYPES: [SemanticTokenType; 13] = [
+    const UIUA_SEMANTIC_TOKEN_TYPES: [SemanticTokenType; 14] = [
         SemanticTokenType::COMMENT,
+        SemanticTokenType::PARAMETER,
         UIUA_NUMBER_STT,
         UIUA_STRING_STT,
         STACK_FUNCTION_STT,
@@ -547,6 +944,24 @@ mod server {
         DYADIC_MODIFIER_STT,
         TRIADIC_MODIFIER_STT,
         MODULE_STT,
+    ];
+
+    const NO_STT: SemanticTokenType = SemanticTokenType::new("none");
+    const GENERIC_SEMANTIC_TOKEN_TYPES: [SemanticTokenType; 14] = [
+        SemanticTokenType::COMMENT,
+        SemanticTokenType::PARAMETER,
+        SemanticTokenType::NUMBER,
+        SemanticTokenType::new("lifetime"),
+        NO_STT,
+        SemanticTokenType::PROPERTY,
+        SemanticTokenType::STRING,
+        SemanticTokenType::METHOD,
+        NO_STT,
+        NO_STT,
+        SemanticTokenType::TYPE,
+        SemanticTokenType::KEYWORD,
+        NO_STT,
+        SemanticTokenType::NAMESPACE,
     ];
 
     #[tower_lsp::async_trait]
@@ -585,7 +1000,10 @@ mod server {
                             SemanticTokensOptions {
                                 work_done_progress_options: WorkDoneProgressOptions::default(),
                                 legend: SemanticTokensLegend {
-                                    token_types: SEMANTIC_TOKEN_TYPES.to_vec(),
+                                    token_types: UIUA_SEMANTIC_TOKEN_TYPES
+                                        .into_iter()
+                                        .chain(GENERIC_SEMANTIC_TOKEN_TYPES)
+                                        .collect(),
                                     token_modifiers: vec![],
                                 },
                                 range: Some(false),
@@ -616,226 +1034,302 @@ mod server {
             self.debug("Uiua language server initialized").await;
         }
 
-        async fn did_open(&self, param: DidOpenTextDocumentParams) {
-            let path = uri_path(&param.text_document.uri);
+        async fn did_open(&self, params: DidOpenTextDocumentParams) {
+            let path = uri_path(&params.text_document.uri);
             self.docs.insert(
-                param.text_document.uri,
-                LspDoc::new(path, param.text_document.text),
+                params.text_document.uri,
+                LspDoc::new(&path, params.text_document.text).into(),
             );
         }
 
         async fn did_change(&self, params: DidChangeTextDocumentParams) {
             let path = uri_path(&params.text_document.uri);
-            let doc = LspDoc::new(path, params.content_changes[0].text.clone());
-            self.docs.insert(params.text_document.uri, doc);
+            let doc = LspDoc::new(&path, params.content_changes[0].text.clone());
+            self.docs.insert(params.text_document.uri, doc.into());
         }
 
         async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+            const SET_INVERSES_LINKS: [&str; 3] = [
+                "[`° un`](https://uiua.org/docs/un)",
+                "[`⌝ anti`](https://uiua.org/docs/anti)",
+                "[`⍜ under`](https://uiua.org/docs/under)",
+            ];
+
             let Some(doc) =
                 (self.docs).get(&params.text_document_position_params.text_document.uri)
             else {
                 return Ok(None);
             };
-            let (line, col) = lsp_pos_to_uiua(params.text_document_position_params.position);
-            let mut prim_range = None;
+            let path = uri_path(&params.text_document_position_params.text_document.uri);
+            let (line, col) =
+                lsp_pos_to_uiua(params.text_document_position_params.position, &doc.input);
+
             // Hovering a primitive
             for sp in &doc.spans {
-                if sp.span.contains_line_col(line, col) {
+                if sp.span.contains_line_col(line, col) && sp.span.src == path {
                     match sp.value {
-                        SpanKind::Primitive(prim) => {
-                            prim_range = Some((prim, uiua_span_to_lsp(&sp.span)));
+                        SpanKind::Primitive(prim, _) => {
+                            return Ok(Some(Hover {
+                                contents: HoverContents::Markup(MarkupContent {
+                                    kind: MarkupKind::Markdown,
+                                    value: full_prim_doc_markdown(prim),
+                                }),
+                                range: Some(uiua_span_to_lsp(&sp.span, &doc.asm.inputs)),
+                            }));
+                        }
+                        SpanKind::Obverse(set_inverses) => {
+                            let value = if set_inverses.is_empty() {
+                                full_prim_doc_markdown(Primitive::Obverse)
+                            } else {
+                                format!(
+                                    "{}\n\n{}",
+                                    FormatSetInverses(set_inverses, SET_INVERSES_LINKS),
+                                    full_prim_doc_markdown(Primitive::Obverse)
+                                )
+                            };
+                            return Ok(Some(Hover {
+                                contents: HoverContents::Markup(MarkupContent {
+                                    kind: MarkupKind::Markdown,
+                                    value,
+                                }),
+                                range: Some(uiua_span_to_lsp(&sp.span, &doc.asm.inputs)),
+                            }));
                         }
                         _ => {}
                     }
                 }
             }
             // Hovering a binding
-            let mut binding_docs: Option<Sp<&BindingDocs>> = None;
-            if prim_range.is_none() {
-                for span_kind in &doc.spans {
-                    if let SpanKind::Ident(Some(docs)) = &span_kind.value {
-                        if span_kind.span.contains_line_col(line, col) {
-                            binding_docs = Some(span_kind.span.clone().sp(docs));
-                            break;
+            for span_kind in &doc.spans {
+                let SpanKind::Ident {
+                    docs: Some(docs), ..
+                } = &span_kind.value
+                else {
+                    continue;
+                };
+                if span_kind.span.contains_line_col(line, col) && span_kind.span.src == path {
+                    let docs = span_kind.span.clone().sp(docs);
+                    let span = docs.span;
+                    let docs = docs.value;
+                    let mut value = String::new();
+                    value.push_str("```uiua\n");
+                    span.as_str(&doc.asm.inputs, |s| value.push_str(s));
+                    match docs.kind {
+                        BindingDocsKind::Function { sig, .. } => {
+                            value.push_str(&format!(" {sig}"));
                         }
+                        _ => {}
                     }
+                    if !docs.is_public && !matches!(docs.kind, BindingDocsKind::Module { .. }) {
+                        value.push_str(" (private)");
+                    }
+                    match &docs.kind {
+                        BindingDocsKind::Constant(Some(val)) => {
+                            let s = val.show();
+                            value.push('\n');
+                            if s.len() < 250 {
+                                value.push_str(&s);
+                            } else {
+                                value.push_str(&val.shape_string())
+                            }
+                        }
+                        _ => {}
+                    }
+                    value.push_str("\n```");
+                    if let Some(escape) = &docs.escape {
+                        value.push_str(&format!("\n`{escape}`"));
+                    }
+                    match docs.kind {
+                        BindingDocsKind::Function {
+                            invertible,
+                            underable,
+                            pure,
+                            ..
+                        } => {
+                            if pure || invertible || underable {
+                                value.push_str("\n\n");
+                                if pure {
+                                    value.push_str("pure");
+                                }
+                                if invertible {
+                                    if pure {
+                                        value.push_str(" | ");
+                                    }
+                                    value.push_str("[`° un`](https://uiua.org/docs/un)");
+                                }
+                                if underable {
+                                    if pure || invertible {
+                                        value.push_str(" | ");
+                                    }
+                                    value.push_str("[`⍜ under`](https://uiua.org/docs/under)");
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    if let Some(comment) = &docs.meta.comment {
+                        value.push_str("\n\n");
+                        if let Some(sig) = &comment.sig {
+                            value.push('`');
+                            value.push_str(&sig.to_string());
+                            value.push_str("`\n\n");
+                        }
+                        value.push_str(&comment.text);
+                    }
+                    if let Some(counts) = &docs.meta.counts {
+                        value.push_str("\n\n");
+                        value.push_str(&counts.to_string());
+                    }
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value,
+                        }),
+                        range: Some(uiua_span_to_lsp(&span, &doc.asm.inputs)),
+                    }));
                 }
             }
             // Hovering an inline function
-            let mut inline_function_sig: Option<Sp<Signature>> = None;
-            if prim_range.is_none() && binding_docs.is_none() {
-                for (span, inline) in &doc.code_meta.function_sigs {
-                    if !inline.explicit && span.contains_line_col(line, col) {
-                        inline_function_sig = Some(span.clone().sp(inline.sig));
-                    }
-                }
-            }
-
-            Ok(Some(if let Some((prim, range)) = prim_range {
-                Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: full_prim_doc_markdown(prim),
-                    }),
-                    range: Some(range),
-                }
-            } else if let Some(docs) = binding_docs {
-                let span = docs.span;
-                let docs = docs.value;
-                let mut value = "```uiua\n".to_string();
-                span.as_str(&doc.asm.inputs, |s| value.push_str(s));
-                match docs.kind {
-                    BindingDocsKind::Function { sig, .. } => {
-                        value.push_str(&format!(" {sig}"));
-                    }
-                    _ => {}
-                }
-                if !docs.is_public && !matches!(docs.kind, BindingDocsKind::Module) {
-                    value.push_str(" (private)");
-                }
-                match &docs.kind {
-                    BindingDocsKind::Constant(Some(val)) => {
-                        let s = val.show();
-                        value.push('\n');
-                        if s.len() < 250 {
-                            value.push_str(&s);
-                        } else {
-                            value.push_str(&val.shape_string())
-                        }
-                    }
-                    _ => {}
-                }
-                value.push_str("\n```");
-                match docs.kind {
-                    BindingDocsKind::Function {
-                        invertible,
-                        underable,
-                        pure,
-                        ..
-                    } => {
-                        if pure || invertible || underable {
-                            value.push_str("\n\n");
-                            if pure {
-                                value.push_str("pure");
-                            }
-                            if invertible {
-                                if pure {
-                                    value.push_str(" | ");
-                                }
-                                value.push_str("[`° un`](https://uiua.org/docs/un)");
-                            }
-                            if underable {
-                                if invertible {
-                                    value.push_str(" | ");
-                                }
-                                value.push_str("[`⍜ under`](https://uiua.org/docs/under)");
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                if let Some(comment) = &docs.comment {
+            if let Some((span, sig_decl)) = (doc.code_meta.function_sigs.iter())
+                .filter(|(span, inline)| {
+                    !inline.explicit && span.contains_line_col(line, col) && span.src == path
+                })
+                .min_by_key(|(span, _)| span.char_count())
+            {
+                let mut value = format!("```uiua\n{}\n```", sig_decl.sig);
+                if !sig_decl.set_inverses.is_empty() {
                     value.push_str("\n\n");
-                    value.push_str(comment);
+                    value.push_str(
+                        &FormatSetInverses(sig_decl.set_inverses, SET_INVERSES_LINKS).to_string(),
+                    );
                 }
-                Hover {
+                return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
                         value,
                     }),
-                    range: Some(uiua_span_to_lsp(&span)),
+                    range: Some(uiua_span_to_lsp(span, &doc.asm.inputs)),
+                }));
+            }
+            // Hovering an array
+            for (span, arr_meta) in &doc.code_meta.array_shapes {
+                if span.contains_line_col(line, col) && span.src == path {
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: format!("`{}`", arr_meta),
+                        }),
+                        range: Some(uiua_span_to_lsp(span, &doc.asm.inputs)),
+                    }));
                 }
-            } else if let Some(sig) = inline_function_sig {
-                Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: format!("```uiua\n{}\n```", sig.value),
-                    }),
-                    range: Some(uiua_span_to_lsp(&sig.span)),
+            }
+            // Hovering a git import
+            for (span, src) in &doc.code_meta.import_srcs {
+                if span.contains_line_col(line, col) && span.src == path {
+                    match src {
+                        ImportSrc::Git(url) => {
+                            return Ok(Some(Hover {
+                                contents: HoverContents::Markup(MarkupContent {
+                                    kind: MarkupKind::Markdown,
+                                    value: format!("[View Git repository]({url})"),
+                                }),
+                                range: Some(uiua_span_to_lsp(span, &doc.asm.inputs)),
+                            }))
+                        }
+                        ImportSrc::File(_) => {}
+                    };
                 }
-            } else {
-                return Ok(None);
-            }))
+            }
+
+            Ok(None)
         }
 
         async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
             fn make_completion(
-                name: String,
+                doc: &LspDoc,
+                text: String,
                 span: &CodeSpan,
                 binding: &BindingInfo,
             ) -> CompletionItem {
                 let kind = match &binding.kind {
-                    BindingKind::Const(Some(val)) if val.meta().map_keys.is_some() => {
+                    BindingKind::Const(Some(val)) if val.meta.map_keys.is_some() => {
                         CompletionItemKind::STRUCT
                     }
                     BindingKind::Const(_) => CompletionItemKind::CONSTANT,
                     BindingKind::Func(_) => CompletionItemKind::FUNCTION,
-                    BindingKind::Macro => CompletionItemKind::FUNCTION,
-                    BindingKind::Module { .. } => CompletionItemKind::MODULE,
+                    BindingKind::IndexMacro(_) | BindingKind::CodeMacro(_) => {
+                        CompletionItemKind::FUNCTION
+                    }
+                    BindingKind::Import(_) | BindingKind::Module(_) | BindingKind::Scope(_) => {
+                        CompletionItemKind::MODULE
+                    }
+                    BindingKind::Error => CompletionItemKind::FUNCTION,
                 };
                 CompletionItem {
-                    label: name.clone(),
+                    label: text.clone(),
                     kind: Some(kind),
                     label_details: Some(CompletionItemLabelDetails {
-                        description: (binding.kind.signature())
+                        description: (binding.kind.sig())
                             .map(|sig| format!("{:<4}", sig.to_string())),
                         ..Default::default()
                     }),
-                    documentation: binding.comment.as_ref().map(|c| {
+                    sort_text: text.split('~').next_back().map(Into::into),
+                    filter_text: text.split('~').next_back().map(Into::into),
+                    documentation: binding.meta.comment.as_ref().map(|c| {
                         Documentation::MarkupContent(MarkupContent {
                             kind: MarkupKind::Markdown,
-                            value: c.to_string(),
+                            value: c.text.to_string(),
                         })
                     }),
                     text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                        range: uiua_span_to_lsp(span),
-                        new_text: name,
+                        range: uiua_span_to_lsp(span, &doc.asm.inputs),
+                        new_text: text,
                     })),
+                    deprecated: binding.meta.deprecation.is_some().then_some(true),
                     ..Default::default()
                 }
             }
 
             let doc_uri = &params.text_document_position.text_document.uri;
-            let doc = if let Some(doc) = self.docs.get(doc_uri) {
+            let doc = if let Some(doc) = self.doc(doc_uri) {
                 doc
             } else {
                 return Ok(None);
             };
-            let (line, col) = lsp_pos_to_uiua(params.text_document_position.position);
-
-            // Find an incomplete ref path at the cursor position
-            if let Some((span, index)) =
-                doc.code_meta.incomplete_refs.iter().find(|(span, _)| {
-                    span.end.line as usize == line && span.end.col as usize == col
-                })
-            {
-                if let BindingKind::Module(module) = &doc.asm.bindings[*index].kind {
-                    let mut completions = Vec::new();
-                    let mut span = span.clone();
-                    span.start = span.end;
-                    for binding in self.bindings_in_file(doc_uri, module) {
-                        if !binding.public {
-                            continue;
-                        }
-                        let item_name = binding.span.as_str(&doc.asm.inputs, |s| s.to_string());
-                        completions.push(make_completion(item_name, &span, &binding));
-                    }
-                    return Ok(Some(CompletionResponse::Array(completions)));
-                }
-            }
+            let (line, col) = lsp_pos_to_uiua(params.text_document_position.position, &doc.input);
 
             // Find the span at the cursor position
-            let Some(sp) = (doc.spans.iter()).find(|sp| sp.span.contains_line_col(line, col))
+            let Some(sp) = (doc.spans.iter()).find(|sp| sp.span.contains_line_col_end(line, col))
             else {
                 return Ok(None);
             };
+            // Don't complete identifiers for new bindings
+            if let SpanKind::Ident { original: true, .. } = &sp.value {
+                return Ok(None);
+            }
 
             let Ok(token) = std::str::from_utf8(&doc.input.as_bytes()[sp.span.byte_range()]) else {
                 return Ok(None);
             };
 
+            let mut completions = Vec::new();
+
+            // Collect binding completions
+            let path = uri_path(doc_uri);
+            if let Some((span, compls)) = (doc.code_meta.completions.iter())
+                .find(|(span, _)| span.contains_line_col_end(line, col) && span.src == path)
+            {
+                let mut end_span = span.clone();
+                end_span.start = end_span.end;
+                for compl in compls {
+                    let binfo = &doc.asm.bindings[compl.index];
+                    let span = if compl.replace { span } else { &end_span };
+                    completions.push(make_completion(&doc, compl.text.clone(), span, binfo));
+                }
+            }
+
             // Collect primitive completions
-            let mut completions: Vec<_> = Primitive::non_deprecated()
+            let prim_completions = Primitive::non_deprecated()
                 .filter(|p| p.name().starts_with(token))
                 .map(|prim| {
                     CompletionItem {
@@ -850,7 +1344,7 @@ mod server {
                                 ..Default::default()
                             })
                         } else {
-                            prim.signature().map(|sig| CompletionItemLabelDetails {
+                            prim.sig().map(|sig| CompletionItemLabelDetails {
                                 description: Some(format!("{:<4}", sig.to_string())),
                                 ..Default::default()
                             })
@@ -867,7 +1361,7 @@ mod server {
                             value: full_prim_doc_markdown(prim),
                         })),
                         text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                            range: uiua_span_to_lsp(&sp.span),
+                            range: uiua_span_to_lsp(&sp.span, &doc.asm.inputs),
                             new_text: prim
                                 .glyph()
                                 .map(|c| c.to_string())
@@ -886,55 +1380,24 @@ mod server {
                         )),
                         ..Default::default()
                     }
-                })
-                .collect();
-
-            // Collect binding completions
-            for binding in self.bindings_in_file(doc_uri, &uri_path(doc_uri)) {
-                let Some(name) = binding.span.try_as_str(&doc.asm.inputs, |s| s.to_string()) else {
-                    continue;
-                };
-
-                if let BindingKind::Module(module) = &binding.kind {
-                    for binding in self.bindings_in_file(doc_uri, module) {
-                        if !binding.public {
-                            continue;
-                        }
-                        let item_name = binding.span.as_str(&doc.asm.inputs, |s| s.to_string());
-                        if !item_name.to_lowercase().starts_with(&token.to_lowercase()) {
-                            continue;
-                        }
-                        completions.push(make_completion(
-                            format!("{name}~{item_name}"),
-                            &sp.span,
-                            &binding,
-                        ));
-                    }
-                }
-
-                if !name.to_lowercase().starts_with(&token.to_lowercase()) {
-                    continue;
-                }
-                completions.push(make_completion(name, &sp.span, &binding));
-            }
+                });
+            completions.extend(prim_completions);
 
             // Collect constant completions
             for constant in &CONSTANTS {
-                if !constant
-                    .name
-                    .to_lowercase()
-                    .starts_with(&token.to_lowercase())
-                {
+                if !constant.name.starts_with(token) {
                     continue;
                 }
                 completions.push(CompletionItem {
                     label: constant.name.into(),
                     kind: Some(CompletionItemKind::CONSTANT),
-                    detail: Some(constant.doc.into()),
+                    detail: Some(constant.doc().into()),
                     text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                        range: uiua_span_to_lsp(&sp.span),
+                        range: uiua_span_to_lsp(&sp.span, &doc.asm.inputs),
                         new_text: constant.name.into(),
                     })),
+                    sort_text: Some(format!("\u{ffff}{}", constant.name)),
+                    filter_text: Some(format!("\u{ffff}{}", constant.name)),
                     ..Default::default()
                 });
             }
@@ -946,19 +1409,12 @@ mod server {
             &self,
             params: DocumentFormattingParams,
         ) -> Result<Option<Vec<TextEdit>>> {
-            let doc = if let Some(doc) = self.docs.get(&params.text_document.uri) {
+            let doc = if let Some(doc) = self.doc(&params.text_document.uri) {
                 doc
             } else {
                 return Ok(None);
             };
-
-            match format_str(
-                &doc.input,
-                &FormatConfig {
-                    backend: Arc::new(crate::NativeSys),
-                    ..FormatConfig::find().unwrap_or_default()
-                },
-            ) {
+            match format_str(&doc.input, &FormatConfig::find().unwrap_or_default()) {
                 Ok(formatted) => {
                     let range = Range::new(Position::new(0, 0), Position::new(u32::MAX, u32::MAX));
                     Ok(Some(vec![TextEdit {
@@ -987,6 +1443,7 @@ mod server {
                 }])
                 .await
                 .unwrap_or_default();
+
             let enabled = if let [serde_json::Value::Bool(enabled)] = config.as_slice() {
                 *enabled
             } else {
@@ -1005,56 +1462,79 @@ mod server {
             };
 
             // Check if in a string or comment
-            let (line, col) = lsp_pos_to_uiua(params.text_document_position.position);
+            let (line, col) = lsp_pos_to_uiua(params.text_document_position.position, &doc.input);
             for span in &doc.spans {
                 if matches!(
                     span.value,
                     SpanKind::String | SpanKind::Comment | SpanKind::Label
-                ) && span.span.contains_line_col(line, col)
+                ) && (span.span.contains_line_col_end(line, col)
+                    || span.span.end.line + 1 == line as u16 && col == 1)
                 {
                     return Ok(None);
                 }
             }
 
-            // Get ident
+            // Determine text before cursor
             let pos = params.text_document_position.position;
             let is_newline = params.ch == "\n";
-            let is_underscore = params.ch == "_";
-            let mut is_undertie = false;
-            let line = if is_newline { pos.line - 1 } else { pos.line };
+            let line = if is_newline {
+                pos.line.saturating_sub(1)
+            } else {
+                pos.line
+            };
             let Some(line_str) = doc.input.lines().nth(line as usize) else {
                 return Ok(None);
             };
+            let line16: Vec<u16> = line_str.encode_utf16().collect();
             let col = if is_newline {
-                line_str.chars().count() as u32
+                line16.len() as u32
             } else {
-                pos.character - 1
+                let col = pos.character.saturating_sub(1);
+                if decode_utf16(line16.iter().take(col as usize).copied()).any(|c| c.is_err()) {
+                    col.saturating_sub(1)
+                } else {
+                    col
+                }
             };
-            let before = line_str.chars().take(col as usize).collect::<String>();
+            let mut before = String::from_utf16(&line16[..col as usize]).unwrap();
+            let mut formatted = String::new();
+            let mut start = col;
+            if let Some(pos) = before.rfind("__") {
+                // Subscript
+                let digit_ends = params.ch.parse::<u8>().is_ok();
+                if !digit_ends {
+                    let s = &before[pos + 2..];
+                    if let Some((sub, rest)) = subscript(s) {
+                        if sub.is_useable() {
+                            start = col.saturating_sub(before[pos..].encode_utf16().count() as u32);
+                            before = rest.to_string();
+                            formatted = sub.to_string();
+                        }
+                    }
+                }
+            }
+
+            // Primitive ident
             let mut ident = (before.chars().rev())
                 .take_while(|&c| is_ident_char(c))
                 .collect::<String>();
             ident = ident.chars().rev().collect();
+
             // Get formatted
-            let mut start = col - ident.chars().count() as u32;
-            let mut formatted = String::new();
+            if start == col {
+                start = col.saturating_sub(ident.encode_utf16().count() as u32);
+            }
             if ident.is_empty() {
-                if is_underscore && before.ends_with('_') {
-                    formatted.push('‿');
-                    start -= 1;
-                    is_undertie = true;
-                } else {
-                    let mut ascii_prims: Vec<_> = Primitive::non_deprecated()
-                        .filter_map(|p| p.ascii().map(|a| (p, a.to_string())))
-                        .collect();
-                    ascii_prims.sort_by_key(|(_, a)| a.len());
-                    ascii_prims.reverse();
-                    for (prim, ascii) in ascii_prims {
-                        if before.ends_with(&ascii) {
-                            formatted.push_str(&prim.to_string());
-                            start -= ascii.chars().count() as u32;
-                            break;
-                        }
+                let mut ascii_prims: Vec<_> = Primitive::non_deprecated()
+                    .filter_map(|p| p.ascii().map(|a| (p, a.to_string())))
+                    .collect();
+                ascii_prims.sort_by_key(|(_, a)| a.len());
+                ascii_prims.reverse();
+                for (prim, ascii) in ascii_prims {
+                    if before.ends_with(&ascii) {
+                        formatted.push_str(&prim.to_string());
+                        start = start.saturating_sub(ascii.encode_utf16().count() as u32);
+                        break;
                     }
                 }
             } else if let Some(prims) = Primitive::from_format_name_multi(&ident) {
@@ -1062,6 +1542,7 @@ mod server {
                     formatted.push_str(&p.to_string());
                 }
             }
+
             if formatted.is_empty() {
                 return Ok(None);
             }
@@ -1070,13 +1551,14 @@ mod server {
             let mut end = pos;
             if params.ch.chars().all(|c| c.is_whitespace()) {
                 formatted.push_str(&params.ch);
-            } else if !is_undertie {
-                end.character -= 1;
+            } else {
+                end.character = end.character.saturating_sub(1);
             }
             let start = Position {
                 line,
                 character: start,
             };
+
             Ok(Some(vec![TextEdit {
                 range: Range { start, end },
                 new_text: formatted,
@@ -1087,34 +1569,65 @@ mod server {
             &self,
             params: SemanticTokensParams,
         ) -> Result<Option<SemanticTokensResult>> {
-            let Some(doc) = self.docs.get(&params.text_document.uri) else {
+            let Some(doc) = self.doc(&params.text_document.uri) else {
                 return Ok(None);
             };
+
+            let config = self
+                .client
+                .configuration(vec![ConfigurationItem {
+                    scope_uri: Some(params.text_document.uri.clone()),
+                    section: Some("uiua.semanticHighlighting.customTokenTypes".into()),
+                }])
+                .await
+                .unwrap_or_default();
+            let custom_highlighting = if let [serde_json::Value::Bool(enabled)] = config.as_slice()
+            {
+                *enabled
+            } else {
+                true
+            };
+
             let mut tokens = Vec::new();
             let mut prev_line = 0;
             let mut prev_char = 0;
+            let for_prim = |p: Primitive, sub: Option<Subscript>| {
+                let args = p.subscript_sig(sub).map(|sig| sig.args()).or(p.args());
+                Some(match p.class() {
+                    PrimClass::Stack | PrimClass::Debug | PrimClass::Planet
+                        if p.modifier_args().is_none() =>
+                    {
+                        STACK_FUNCTION_STT
+                    }
+                    PrimClass::Constant => UIUA_NUMBER_STT,
+                    _ if p.modifier_args() == Some(1) => MONADIC_MODIFIER_STT,
+                    _ if p.modifier_args() == Some(2) => DYADIC_MODIFIER_STT,
+                    _ if p.modifier_args() == Some(3) => TRIADIC_MODIFIER_STT,
+                    _ if args == Some(0) => NOADIC_FUNCTION_STT,
+                    _ if args == Some(1) => MONADIC_FUNCTION_STT,
+                    _ if args == Some(2) => DYADIC_FUNCTION_STT,
+                    _ if args == Some(3) => TRIADIC_FUNCTION_STT,
+                    _ if args == Some(4) => TETRADIC_FUNCTION_STT,
+                    _ => return None,
+                })
+            };
             for sp in &doc.spans {
                 let token_type = match &sp.value {
                     SpanKind::String => UIUA_STRING_STT,
                     SpanKind::Number => UIUA_NUMBER_STT,
-                    SpanKind::Comment => SemanticTokenType::COMMENT,
-                    SpanKind::Primitive(p) => match p.class() {
-                        PrimClass::Stack | PrimClass::Planet if p.modifier_args().is_none() => {
-                            STACK_FUNCTION_STT
-                        }
-                        _ if p.modifier_args() == Some(1) => MONADIC_MODIFIER_STT,
-                        _ if p.modifier_args() == Some(2) => DYADIC_MODIFIER_STT,
-                        _ if p.modifier_args() == Some(3) => TRIADIC_MODIFIER_STT,
-                        _ if p.args() == Some(0) => NOADIC_FUNCTION_STT,
-                        _ if p.args() == Some(1) => MONADIC_FUNCTION_STT,
-                        _ if p.args() == Some(2) => DYADIC_FUNCTION_STT,
-                        _ if p.args() == Some(3) => TRIADIC_FUNCTION_STT,
-                        _ if p.args() == Some(4) => TETRADIC_FUNCTION_STT,
-                        _ => continue,
-                    },
-                    SpanKind::Ident(Some(docs)) => match docs.kind {
+                    SpanKind::Comment | SpanKind::OutputComment => SemanticTokenType::COMMENT,
+                    SpanKind::Primitive(p, sub) => {
+                        let Some(stt) = for_prim(*p, *sub) else {
+                            continue;
+                        };
+                        stt
+                    }
+                    SpanKind::Obverse(_) => for_prim(Primitive::Obverse, None).unwrap(),
+                    SpanKind::Ident {
+                        docs: Some(docs), ..
+                    } => match docs.kind {
                         BindingDocsKind::Constant(_) => continue,
-                        BindingDocsKind::Function { sig, .. } => match sig.args {
+                        BindingDocsKind::Function { sig, .. } => match sig.args() {
                             0 => NOADIC_FUNCTION_STT,
                             1 => MONADIC_FUNCTION_STT,
                             2 => DYADIC_FUNCTION_STT,
@@ -1128,28 +1641,41 @@ mod server {
                             3 => TRIADIC_MODIFIER_STT,
                             _ => continue,
                         },
-                        BindingDocsKind::Module => MODULE_STT,
+                        BindingDocsKind::Module { .. } => MODULE_STT,
+                        BindingDocsKind::Error => continue,
                     },
+                    SpanKind::Subscript(Some(prim), n) => {
+                        let Some(stt) = for_prim(*prim, *n) else {
+                            continue;
+                        };
+                        stt
+                    }
+                    SpanKind::Placeholder(_) => SemanticTokenType::PARAMETER,
                     _ => continue,
                 };
-                let token_type = SEMANTIC_TOKEN_TYPES
+                let mut token_type = UIUA_SEMANTIC_TOKEN_TYPES
                     .iter()
                     .position(|t| t == &token_type)
                     .unwrap() as u32;
+                if !custom_highlighting {
+                    token_type += UIUA_SEMANTIC_TOKEN_TYPES.len() as u32;
+                }
                 let span = &sp.span;
-                let start = uiua_loc_to_lsp(span.start);
+                let start = uiua_span_to_lsp(span, &doc.asm.inputs).start;
                 let delta_start = if start.line == prev_line {
                     start.character - prev_char
                 } else {
                     start.character
                 };
-                tokens.push(SemanticToken {
+                let length = span.as_str(&doc.asm.inputs, |s| s.encode_utf16().count()) as u32;
+                let token = SemanticToken {
                     delta_line: start.line - prev_line,
                     delta_start,
-                    length: (span.end.char_pos - span.start.char_pos),
+                    length,
                     token_type,
                     token_modifiers_bitset: 0,
-                });
+                };
+                tokens.push(token);
                 prev_line = start.line;
                 prev_char = start.character;
             }
@@ -1163,18 +1689,20 @@ mod server {
             &self,
             params: CodeActionParams,
         ) -> Result<Option<CodeActionResponse>> {
-            let Some(doc) = self.docs.get(&params.text_document.uri) else {
+            let Some(doc) = self.doc(&params.text_document.uri) else {
                 return Ok(None);
             };
-            let (line, col) = lsp_pos_to_uiua(params.range.start);
+            let (line, col) = lsp_pos_to_uiua(params.range.start, &doc.input);
             let path = uri_path(&params.text_document.uri);
             let mut actions = Vec::new();
 
             // Add explicit signature
-            for (span, inline) in &doc.code_meta.function_sigs {
-                if inline.explicit || !span.contains_line_col(line, col) || span.src != path {
-                    continue;
-                }
+            if let Some((span, inline)) = (doc.code_meta.function_sigs.iter())
+                .filter(|(span, inline)| {
+                    !inline.explicit && span.contains_line_col(line, col) && span.src == path
+                })
+                .min_by_key(|(span, _)| span.char_count())
+            {
                 let mut insertion_span = span.just_start(&doc.asm.inputs);
                 if span.as_str(&doc.asm.inputs, |s| s.starts_with('(')) {
                     if span.start.line as usize == line && span.start.col as usize == col {
@@ -1196,12 +1724,8 @@ mod server {
                             [(
                                 params.text_document.uri.clone(),
                                 vec![TextEdit {
-                                    range: uiua_span_to_lsp(&insertion_span),
-                                    new_text: if inline.sig.outputs == 0 {
-                                        format!("|{} ", inline.sig.args)
-                                    } else {
-                                        format!("{} ", inline.sig)
-                                    },
+                                    range: uiua_span_to_lsp(&insertion_span, &doc.asm.inputs),
+                                    new_text: format!("{} ", inline.sig),
                                 }],
                             )]
                             .into(),
@@ -1210,7 +1734,6 @@ mod server {
                     }),
                     ..Default::default()
                 }));
-                break;
             }
 
             // Expand macro
@@ -1219,14 +1742,18 @@ mod server {
                     continue;
                 }
                 actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                    title: format!("Expand macro {name}"),
+                    title: if let Some(name) = name {
+                        format!("Expand macro {name}")
+                    } else {
+                        "Expand macro".into()
+                    },
                     kind: Some(CodeActionKind::REFACTOR_INLINE),
                     edit: Some(WorkspaceEdit {
                         changes: Some(
                             [(
                                 params.text_document.uri.clone(),
                                 vec![TextEdit {
-                                    range: uiua_span_to_lsp(span),
+                                    range: uiua_span_to_lsp(span, &doc.asm.inputs),
                                     new_text: expanded.clone(),
                                 }],
                             )]
@@ -1252,7 +1779,7 @@ mod server {
                                 [(
                                     params.text_document.uri.clone(),
                                     vec![TextEdit {
-                                        range: uiua_span_to_lsp(&span.span),
+                                        range: uiua_span_to_lsp(&span.span, &doc.asm.inputs),
                                         new_text: "".into(),
                                     }],
                                 )]
@@ -1286,7 +1813,7 @@ mod server {
                             [(
                                 params.text_document.uri.clone(),
                                 vec![TextEdit {
-                                    range: uiua_span_to_lsp(span),
+                                    range: uiua_span_to_lsp(span, &doc.asm.inputs),
                                     new_text,
                                 }],
                             )]
@@ -1299,7 +1826,7 @@ mod server {
             }
 
             // Convert to strand syntax
-            for (span, parts) in &doc.code_meta.arrays {
+            for (span, parts) in &doc.code_meta.array_inner_spans {
                 if !span.contains_line_col(line, col) || span.src != path {
                     continue;
                 }
@@ -1318,7 +1845,7 @@ mod server {
                             [(
                                 params.text_document.uri.clone(),
                                 vec![TextEdit {
-                                    range: uiua_span_to_lsp(span),
+                                    range: uiua_span_to_lsp(span, &doc.asm.inputs),
                                     new_text,
                                 }],
                             )]
@@ -1328,6 +1855,39 @@ mod server {
                     }),
                     ..Default::default()
                 }));
+            }
+
+            // Add experimental
+            if !doc.input.contains("# Experimental!") {
+                for error in &doc.errors {
+                    let UiuaErrorKind::Run { message, .. } = &error.kind else {
+                        continue;
+                    };
+                    let Span::Code(span) = &message.span else {
+                        continue;
+                    };
+                    if span.src != path || !message.value.contains("# Experimental!") {
+                        continue;
+                    }
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title: "Add # Experimental! comment".into(),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        edit: Some(WorkspaceEdit {
+                            changes: Some(
+                                [(
+                                    params.text_document.uri.clone(),
+                                    vec![TextEdit {
+                                        range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                                        new_text: "# Experimental!\n".into(),
+                                    }],
+                                )]
+                                .into(),
+                            ),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }));
+                }
             }
 
             Ok(if actions.is_empty() {
@@ -1342,7 +1902,7 @@ mod server {
             else {
                 return Ok(None);
             };
-            let (line, col) = lsp_pos_to_uiua(params.text_document_position.position);
+            let (line, col) = lsp_pos_to_uiua(params.text_document_position.position, &doc.input);
             let path = uri_path(&params.text_document_position.text_document.uri);
             let mut binding: Option<(&BindingInfo, usize)> = None;
             // Check for span in bindings
@@ -1354,8 +1914,8 @@ mod server {
             }
             // Check for span in binding references
             if binding.is_none() {
-                for (name, index) in &doc.code_meta.global_references {
-                    if name.span.contains_line_col(line, col) && name.span.src == path {
+                for (name_span, index) in &doc.code_meta.global_references {
+                    if name_span.contains_line_col(line, col) && name_span.src == path {
                         binding = Some((&doc.asm.bindings[*index], *index));
                         break;
                     }
@@ -1372,23 +1932,25 @@ mod server {
                         params.text_document_position.text_document.uri.clone()
                     }
                     InputSrc::File(file) => path_to_uri(file)?,
+                    InputSrc::Literal(_) => return Ok(None),
                 },
                 vec![TextEdit {
-                    range: uiua_span_to_lsp(&binding.span),
+                    range: uiua_span_to_lsp(&binding.span, &doc.asm.inputs),
                     new_text: params.new_name.clone(),
                 }],
             );
             for entry in &self.docs {
                 let uri = entry.key();
                 let doc = entry.value();
-                for (name, idx) in &doc.code_meta.global_references {
+                for (name_span, idx) in &doc.code_meta.global_references {
                     if *idx == index {
-                        let uri = match &name.span.src {
+                        let uri = match &name_span.src {
                             InputSrc::Str(_) | InputSrc::Macro(_) => uri.clone(),
                             InputSrc::File(file) => path_to_uri(file)?,
+                            InputSrc::Literal(_) => continue,
                         };
                         changes.entry(uri).or_default().push(TextEdit {
-                            range: uiua_span_to_lsp(&name.span),
+                            range: uiua_span_to_lsp(name_span, &doc.asm.inputs),
                             new_text: params.new_name.clone(),
                         });
                     }
@@ -1411,21 +1973,37 @@ mod server {
                 return Ok(None);
             };
             let position = params.text_document_position_params.position;
-            let (line, col) = lsp_pos_to_uiua(position);
+            let (line, col) = lsp_pos_to_uiua(position, &doc.input);
             let path = uri_path(&params.text_document_position_params.text_document.uri);
-            for (name, idx) in &doc.code_meta.global_references {
-                if name.span.contains_line_col(line, col) && name.span.src == path {
+            // Check global references
+            for (name_span, idx) in &doc.code_meta.global_references {
+                if name_span.contains_line_col(line, col) && name_span.src == path {
                     let binding = &doc.asm.bindings[*idx];
                     let uri = match &binding.span.src {
                         InputSrc::Str(_) | InputSrc::Macro(_) => {
                             params.text_document_position_params.text_document.uri
                         }
                         InputSrc::File(file) => path_to_uri(file)?,
+                        InputSrc::Literal(_) => continue,
                     };
                     return Ok(Some(GotoDefinitionResponse::Scalar(Location {
                         uri,
-                        range: uiua_span_to_lsp(&binding.span),
+                        range: uiua_span_to_lsp(&binding.span, &doc.asm.inputs),
                     })));
+                }
+            }
+            // Check import sources
+            for (span, src) in &doc.code_meta.import_srcs {
+                if span.contains_line_col(line, col) && span.src == path {
+                    match src {
+                        ImportSrc::File(path) => {
+                            return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                                uri: path_to_uri(path)?,
+                                range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                            })))
+                        }
+                        ImportSrc::Git(_) => {}
+                    };
                 }
             }
             Ok(None)
@@ -1441,20 +2019,21 @@ mod server {
                 return Ok(None);
             };
             let position = params.text_document_position_params.position;
-            let (line, col) = lsp_pos_to_uiua(position);
+            let (line, col) = lsp_pos_to_uiua(position, &doc.input);
             let path = uri_path(&params.text_document_position_params.text_document.uri);
-            for (name, idx) in &doc.code_meta.global_references {
-                if name.span.contains_line_col(line, col) && name.span.src == path {
+            for (name_span, idx) in &doc.code_meta.global_references {
+                if name_span.contains_line_col(line, col) && name_span.src == path {
                     let binding = &doc.asm.bindings[*idx];
                     let uri = match &binding.span.src {
                         InputSrc::Str(_) | InputSrc::Macro(_) => {
                             params.text_document_position_params.text_document.uri
                         }
                         InputSrc::File(file) => path_to_uri(file)?,
+                        InputSrc::Literal(_) => continue,
                     };
                     return Ok(Some(GotoDeclarationResponse::Scalar(Location {
                         uri,
-                        range: uiua_span_to_lsp(&binding.span),
+                        range: uiua_span_to_lsp(&binding.span, &doc.asm.inputs),
                     })));
                 }
             }
@@ -1466,7 +2045,7 @@ mod server {
             params: DocumentDiagnosticParams,
         ) -> Result<DocumentDiagnosticReportResult> {
             let mut diagnostics = Vec::new();
-            let Some(doc) = self.docs.get(&params.text_document.uri) else {
+            let Some(doc) = self.doc(&params.text_document.uri) else {
                 return Ok(DocumentDiagnosticReportResult::Report(
                     DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
                         related_documents: None,
@@ -1477,67 +2056,101 @@ mod server {
                     }),
                 ));
             };
-            for mut err in &doc.errors {
-                let mut trace = None;
-                match err {
-                    UiuaError::Fill(e) => err = &**e,
-                    UiuaError::Traced { error, trace: tr } => {
-                        err = &**error;
-                        trace = Some(tr);
+
+            fn path_locs<'a>(span: &'a CodeSpan, path: &Path) -> Option<&'a CodeSpan> {
+                match &span.src {
+                    InputSrc::File(file) if file.canonicalize().ok().as_deref() == Some(path) => {
+                        Some(span)
                     }
-                    _ => (),
+                    InputSrc::Macro(span) => path_locs(span, path),
+                    _ => None,
                 }
-                match err {
-                    UiuaError::Run(message, _) => {
-                        let span = match &message.span {
-                            Span::Code(span) => span,
-                            Span::Builtin => {
-                                if let Some(span) = trace.into_iter().flatten().find_map(|frame| {
-                                    match &frame.span {
-                                        Span::Code(span) => Some(span),
-                                        _ => None,
-                                    }
-                                }) {
-                                    span
-                                } else {
-                                    continue;
-                                }
-                            }
+            }
+
+            let path = uri_path(&params.text_document.uri);
+            let range = |err: &UiuaError, span: &Span| -> Option<Range> {
+                let span = match span {
+                    Span::Code(span) => path_locs(span, &path)?,
+                    Span::Builtin => err.trace.iter().find_map(|frame| match &frame.span {
+                        Span::Code(span) => Some(span),
+                        _ => None,
+                    })?,
+                };
+                Some(uiua_span_to_lsp(span, &doc.asm.inputs))
+            };
+
+            // Errors
+            for err in &doc.errors {
+                match &err.kind {
+                    UiuaErrorKind::Run { message, .. } => {
+                        let Some(range) = range(err, &message.span) else {
+                            continue;
                         };
                         diagnostics.push(Diagnostic {
                             severity: Some(DiagnosticSeverity::ERROR),
-                            range: uiua_span_to_lsp(span),
+                            range,
                             message: message.value.clone(),
                             ..Default::default()
                         });
                     }
-                    UiuaError::Parse(errors, _) => {
-                        for err in errors {
+                    UiuaErrorKind::Parse(errors, _) => {
+                        for parse_err in errors {
+                            let Some(range) = range(err, &Span::Code(parse_err.span.clone()))
+                            else {
+                                continue;
+                            };
                             diagnostics.push(Diagnostic {
                                 severity: Some(DiagnosticSeverity::ERROR),
-                                range: uiua_span_to_lsp(&err.span),
-                                message: err.value.to_string(),
+                                range,
+                                message: parse_err.value.to_string(),
                                 ..Default::default()
                             });
                         }
+                    }
+                    UiuaErrorKind::Throw(value, span, _) => {
+                        let Some(range) = range(err, span) else {
+                            continue;
+                        };
+                        diagnostics.push(Diagnostic {
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            range,
+                            message: value.format(),
+                            ..Default::default()
+                        })
                     }
                     _ => {}
                 }
             }
 
+            // Diagnostics
             for diag in &doc.diagnostics {
                 let sev = match diag.kind {
                     crate::DiagnosticKind::Warning => DiagnosticSeverity::WARNING,
-                    crate::DiagnosticKind::Advice | crate::DiagnosticKind::Style => {
-                        DiagnosticSeverity::INFORMATION
-                    }
+                    crate::DiagnosticKind::Advice
+                    | crate::DiagnosticKind::Style
+                    | crate::DiagnosticKind::Info => DiagnosticSeverity::INFORMATION,
                 };
-                diagnostics.push(Diagnostic {
-                    severity: Some(sev),
-                    range: uiua_span_to_lsp(&diag.span),
-                    message: diag.message.clone(),
-                    ..Default::default()
-                });
+                if let Span::Code(span) = &diag.span {
+                    diagnostics.push(Diagnostic {
+                        severity: Some(sev),
+                        range: uiua_span_to_lsp(span, &doc.asm.inputs),
+                        message: diag.message.clone(),
+                        ..Default::default()
+                    });
+                }
+            }
+
+            // Unused
+            for binfo in &doc.asm.bindings {
+                if binfo.span.src == path && !binfo.used {
+                    diagnostics.push(Diagnostic {
+                        severity: Some(DiagnosticSeverity::HINT),
+                        range: uiua_span_to_lsp(&binfo.span, &doc.asm.inputs),
+                        message: "Unused private binding".into(),
+                        tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+                        ..Default::default()
+                    });
+                }
             }
 
             Ok(DocumentDiagnosticReportResult::Report(
@@ -1552,7 +2165,7 @@ mod server {
         }
 
         async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
-            let Some(doc) = self.docs.get(&params.text_document.uri) else {
+            let Some(doc) = self.doc(&params.text_document.uri) else {
                 return Ok(None);
             };
             let config = self
@@ -1574,14 +2187,14 @@ mod server {
                 .await
                 .unwrap_or_default();
             let (binding_sigs, inline_sigs, min_length, show_values) = if let [serde_json::Value::Bool(
-                binding_sigs,
-            ), serde_json::Value::Bool(
-                inline_sigs,
-            ), serde_json::Value::Number(
-                min_length,
-            ), serde_json::Value::Bool(
-                show_values,
-            )] = config.as_slice()
+                    binding_sigs,
+                ), serde_json::Value::Bool(
+                    inline_sigs,
+                ), serde_json::Value::Number(
+                    min_length,
+                ), serde_json::Value::Bool(
+                    show_values,
+                )] = config.as_slice()
             {
                 (
                     *binding_sigs,
@@ -1633,9 +2246,13 @@ mod server {
                     continue;
                 }
                 let sig = decl.sig.to_string();
-                let mut position = uiua_loc_to_lsp(span.start);
+                let mut position = uiua_span_to_lsp(span, &doc.asm.inputs).start;
                 if decl.inline {
-                    position.character += 1;
+                    if span.as_str(&doc.asm.inputs, |s| s.starts_with(['(', '⟨', '|'])) {
+                        position.character += 1;
+                    } else if span.before_str(&doc.asm.inputs, |s| s.ends_with(' ')) {
+                        position.character = position.character.saturating_sub(1);
+                    }
                 }
                 hints.push(InlayHint {
                     text_edits: Some(vec![TextEdit {
@@ -1683,7 +2300,7 @@ mod server {
                     };
                     hints.push(InlayHint {
                         text_edits: None,
-                        position: uiua_loc_to_lsp(span.end),
+                        position: uiua_span_to_lsp(span, &doc.asm.inputs).end,
                         label,
                         kind: None,
                         tooltip: Some(tooltip),
@@ -1702,7 +2319,7 @@ mod server {
             else {
                 return Ok(None);
             };
-            let (line, col) = lsp_pos_to_uiua(params.text_document_position.position);
+            let (line, col) = lsp_pos_to_uiua(params.text_document_position.position, &doc.input);
             let path = uri_path(&params.text_document_position.text_document.uri);
             for (i, binfo) in doc.asm.bindings.iter().enumerate() {
                 if binfo.span.contains_line_col(line, col) && binfo.span.src == path {
@@ -1710,13 +2327,14 @@ mod server {
                     for entry in &self.docs {
                         let uri = entry.key();
                         let doc = entry.value();
-                        for (name, idx) in &doc.code_meta.global_references {
+                        for (name_span, idx) in &doc.code_meta.global_references {
                             if *idx == i {
-                                let uri = match &name.span.src {
+                                let uri = match &name_span.src {
                                     InputSrc::Str(_) | InputSrc::Macro(_) => uri.clone(),
                                     InputSrc::File(file) => path_to_uri(file)?,
+                                    InputSrc::Literal(_) => continue,
                                 };
-                                let range = uiua_span_to_lsp(&name.span);
+                                let range = uiua_span_to_lsp(name_span, &doc.asm.inputs);
                                 locations.push(Location { uri, range });
                             }
                         }
@@ -1731,7 +2349,7 @@ mod server {
             &self,
             params: InlineValueParams,
         ) -> Result<Option<Vec<InlineValue>>> {
-            let Some(doc) = self.docs.get(&params.text_document.uri) else {
+            let Some(doc) = self.doc(&params.text_document.uri) else {
                 return Ok(None);
             };
             let mut inline_values = Vec::new();
@@ -1740,7 +2358,7 @@ mod server {
                     continue;
                 };
                 inline_values.push(InlineValue::Text(InlineValueText {
-                    range: uiua_span_to_lsp(span),
+                    range: uiua_span_to_lsp(span, &doc.asm.inputs),
                     text: value.show(),
                 }));
             }
@@ -1753,25 +2371,8 @@ mod server {
     }
 
     impl Backend {
-        fn bindings_in_file(
-            &self,
-            doc_uri: &Url,
-            path: &Path,
-        ) -> impl Iterator<Item = BindingInfo> + '_ {
-            let doc_uri = doc_uri.clone();
-            let canonical_path = path.canonicalize().ok();
-            self.docs.get(&doc_uri).into_iter().flat_map(move |doc| {
-                (doc.asm.bindings.iter())
-                    .filter(|binfo| {
-                        let path = match &binfo.span.src {
-                            InputSrc::File(file) => file.to_path_buf(),
-                            InputSrc::Str(_) | InputSrc::Macro(_) => uri_path(&doc_uri),
-                        };
-                        path.canonicalize().ok() == canonical_path
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
+        fn doc(&self, uri: &Url) -> Option<Arc<LspDoc>> {
+            self.docs.get(uri).map(|doc| Arc::clone(&doc))
         }
         async fn debug(&self, message: impl Into<String>) {
             self.client
@@ -1789,25 +2390,41 @@ mod server {
     }
 
     fn uri_path(uri: &Url) -> PathBuf {
-        let path = uri.path().replace("/c%3A", "C:");
+        let path = uri.path().replace("/c%3A", "C:").replace("%20", " ");
         let path = PathBuf::from(path);
         path.canonicalize().unwrap_or(path)
     }
 
-    fn lsp_pos_to_uiua(pos: Position) -> (usize, usize) {
-        (pos.line as usize + 1, pos.character as usize + 1)
+    fn lsp_pos_to_uiua(pos: Position, input: &str) -> (usize, usize) {
+        let line_no = pos.line as usize;
+        let line = input.split('\n').nth(line_no).unwrap();
+        let mut lsp_col = pos.character as usize;
+        let mut uiua_col = 1;
+        for c in line.chars() {
+            if lsp_col == 0 {
+                break;
+            }
+            lsp_col -= c.len_utf16();
+            uiua_col += 1;
+        }
+        (line_no + 1, uiua_col)
     }
 
-    fn uiua_loc_to_lsp(loc: Loc) -> Position {
-        Position::new(loc.line as u32 - 1, loc.col as u32 - 1)
+    fn uiua_loc_to_lsp(loc: Loc, input: &str) -> Position {
+        let line_no = loc.line.saturating_sub(1) as usize;
+        let line = input.split('\n').nth(line_no).unwrap();
+        let line_start = line.as_ptr() as usize - input.as_ptr() as usize;
+        let end = loc.byte_pos as usize - line_start;
+        let col = line[..end].encode_utf16().count() as u32;
+        Position::new(line_no as u32, col)
     }
 
-    fn uiua_locs_to_lsp(start: Loc, end: Loc) -> Range {
-        Range::new(uiua_loc_to_lsp(start), uiua_loc_to_lsp(end))
+    fn uiua_locs_to_lsp(start: Loc, end: Loc, input: &str) -> Range {
+        Range::new(uiua_loc_to_lsp(start, input), uiua_loc_to_lsp(end, input))
     }
 
-    fn uiua_span_to_lsp(span: &CodeSpan) -> Range {
-        uiua_locs_to_lsp(span.start, span.end)
+    fn uiua_span_to_lsp(span: &CodeSpan, inputs: &Inputs) -> Range {
+        uiua_locs_to_lsp(span.start, span.end, &inputs.get(&span.src))
     }
 
     fn doc_frag_markdown(md: &mut String, frag: &PrimDocFragment) {
@@ -1834,7 +2451,7 @@ mod server {
 
     fn full_prim_doc_markdown(prim: Primitive) -> String {
         let sig = prim
-            .signature()
+            .sig()
             .map(|sig| format!(" {}", sig))
             .unwrap_or_default();
         let mut value = format!("```uiua\n{}{}\n```", prim.format(), sig);
@@ -1867,7 +2484,7 @@ mod server {
 ",
                         ex.input()
                     ));
-                    match ex.output() {
+                    match ex.output_strings() {
                         Ok(lines) => {
                             for line in lines.iter().flat_map(|l| l.lines()) {
                                 value.push_str(&format!("> {line}\n"));

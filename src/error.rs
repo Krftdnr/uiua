@@ -1,4 +1,4 @@
-use std::{convert::Infallible, error::Error, fmt, io, path::PathBuf, sync::Arc};
+use std::{convert::Infallible, error::Error, fmt, io, mem::take, path::PathBuf, sync::Arc};
 
 use colored::*;
 
@@ -7,13 +7,30 @@ use crate::{
     lex::{Sp, Span},
     parse::ParseError,
     value::Value,
-    CodeSpan, InputSrc, Inputs,
+    CodeSpan, Ident, InputSrc, Inputs,
 };
 
-/// An error produced when running a Uiua program
+/// An error produced when running/compiling/formatting a Uiua program
 #[derive(Debug, Clone)]
 #[must_use]
-pub enum UiuaError {
+pub struct UiuaError {
+    /// The kind of error
+    pub kind: UiuaErrorKind,
+    /// A stack trace of the error
+    pub trace: Vec<TraceFrame>,
+    /// Whether the error is fill-related
+    pub is_fill: bool,
+    /// Whether the error can escape a single `try`
+    pub is_case: bool,
+    /// Bundled errors
+    pub multi: Vec<Self>,
+    /// Additional info about the error
+    pub infos: Vec<(String, Option<Span>)>,
+}
+
+/// The kind of an error produced when running/compiling/formatting a Uiua program
+#[derive(Debug, Clone)]
+pub enum UiuaErrorKind {
     /// An error occurred while loading a file
     Load(PathBuf, Arc<io::Error>),
     /// An error occurred while formatting a file
@@ -21,24 +38,42 @@ pub enum UiuaError {
     /// An error occurred while parsing a file
     Parse(Vec<Sp<ParseError>>, Box<Inputs>),
     /// An error occurred while compiling or executing a program
-    Run(Sp<String, Span>, Box<Inputs>),
-    /// An error with a trace attached
-    Traced {
-        /// The error itself
-        error: Box<Self>,
-        /// The stack trace
-        trace: Vec<TraceFrame>,
+    Run {
+        /// The error message
+        message: Sp<String, Span>,
+        /// Associated information
+        info: Vec<Sp<String, Span>>,
+        /// The inputs
+        inputs: Box<Inputs>,
     },
     /// An error thrown by `assert`
     Throw(Box<Value>, Span, Box<Inputs>),
     /// Maximum execution time exceeded
     Timeout(Span, Box<Inputs>),
-    /// A wrapper marking this error as being fill-related
-    Fill(Box<Self>),
-    /// The interpreter panicked
-    Panic(String),
-    /// Multiple errors
-    Multi(Vec<Self>),
+    /// The compiler panicked
+    CompilerPanic(String),
+    /// The program was interrupted
+    Interrupted,
+}
+
+impl UiuaErrorKind {
+    /// Turn the error kind into an error
+    pub fn error(self) -> UiuaError {
+        self.into()
+    }
+}
+
+impl From<UiuaErrorKind> for UiuaError {
+    fn from(kind: UiuaErrorKind) -> Self {
+        Self {
+            kind,
+            trace: Vec::new(),
+            is_fill: false,
+            is_case: false,
+            multi: Vec::new(),
+            infos: Vec::new(),
+        }
+    }
 }
 
 /// Uiua's result type
@@ -48,113 +83,100 @@ pub type UiuaResult<T = ()> = Result<T, UiuaError>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceFrame {
     /// The function that was called
-    pub id: FunctionId,
+    pub id: Option<FunctionId>,
     /// The span of the call
     pub span: Span,
 }
 
 impl fmt::Display for UiuaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            UiuaError::Load(path, e) => {
+        match &self.kind {
+            UiuaErrorKind::Load(path, e) => {
                 write!(f, "failed to load {}: {e}", path.to_string_lossy())
             }
-            UiuaError::Format(path, e) => {
+            UiuaErrorKind::Format(path, e) => {
                 write!(f, "failed to format {}: {e}", path.to_string_lossy())
             }
-            UiuaError::Parse(errors, _) => {
+            UiuaErrorKind::Parse(errors, _) => {
                 for error in errors {
                     writeln!(f, "{error}")?;
                 }
                 Ok(())
             }
-            UiuaError::Run(error, _) => write!(f, "{error}"),
-            UiuaError::Traced { error, trace } => {
-                write!(f, "{error}")?;
-                for line in format_trace(trace) {
-                    writeln!(f, "{line}")?;
-                }
-                Ok(())
-            }
-            UiuaError::Throw(value, span, _) => write!(f, "{span}: {value}"),
-            UiuaError::Timeout(..) => write!(f, "Maximum execution time exceeded"),
-            UiuaError::Fill(error) => error.fmt(f),
-            UiuaError::Panic(message) => message.fmt(f),
-            UiuaError::Multi(errors) => {
-                for error in errors {
-                    writeln!(f, "{error}")?;
-                }
-                Ok(())
-            }
+            UiuaErrorKind::Run { message: error, .. } => write!(f, "{error}"),
+            UiuaErrorKind::Throw(value, span, _) => write!(f, "{span}: {value}"),
+            UiuaErrorKind::Timeout(..) => write!(f, "Maximum execution time exceeded"),
+            UiuaErrorKind::CompilerPanic(message) => message.fmt(f),
+            UiuaErrorKind::Interrupted => write!(f, "# Program interrupted"),
         }
     }
 }
 
 impl UiuaError {
-    pub(crate) fn inner(&self) -> &Self {
-        match self {
-            UiuaError::Traced { error, .. } => error.inner(),
-            UiuaError::Fill(error) => error.inner(),
-            error => error,
-        }
-    }
-    /// Get the message of the error
-    pub fn message(&self) -> String {
-        match self {
-            UiuaError::Traced { error, .. } => error.message(),
-            error => error.to_string(),
-        }
+    /// Attach some info to the error
+    pub fn with_info(mut self, info: impl IntoIterator<Item = (String, Option<Span>)>) -> Self {
+        self.infos.extend(info);
+        self
     }
     /// Get the value of the error if it was thrown by `assert`
     pub fn value(self) -> Value {
-        match self {
-            UiuaError::Throw(value, ..) => *value,
-            UiuaError::Traced { error, .. } => error.value(),
-            error => error.message().into(),
+        match self.kind {
+            UiuaErrorKind::Throw(value, ..) => *value,
+            _ => self.to_string().into(),
         }
     }
-    /// Check if the error is fill-related
-    pub(crate) fn is_fill(&self) -> bool {
-        match self {
-            UiuaError::Traced { error, .. } => error.is_fill(),
-            UiuaError::Fill(_) => true,
-            _ => false,
-        }
+    /// Turn the error into a multi-error
+    pub fn into_multi(mut self) -> Vec<Self> {
+        let mut multi = take(&mut self.multi);
+        multi.insert(0, self);
+        multi
+    }
+    /// Create an error from multiple errors
+    pub fn from_multi(multi: impl IntoIterator<Item = Self>) -> Self {
+        let mut iter = multi.into_iter();
+        let mut error = iter
+            .next()
+            .unwrap_or_else(|| UiuaErrorKind::CompilerPanic("Unknown error".into()).error());
+        error.multi.extend(iter);
+        error
     }
     /// Mark the error as fill-related
-    pub(crate) fn fill(self) -> Self {
-        UiuaError::Fill(Box::new(self))
+    pub(crate) fn fill(mut self) -> Self {
+        self.is_fill = true;
+        self
     }
     /// Add a span to the trace of the error
     pub fn trace(mut self, span: CodeSpan) -> Self {
         let frame = TraceFrame {
-            id: FunctionId::Anonymous(span.clone()),
+            id: None,
             span: Span::Code(span),
         };
-        if let UiuaError::Traced { trace, .. } = &mut self {
-            trace.push(frame);
-            self
-        } else {
-            UiuaError::Traced {
-                error: Box::new(self),
-                trace: vec![frame],
-            }
+        self.trace.push(frame);
+        self
+    }
+    pub(crate) fn trace_macro(mut self, name: Option<Ident>, span: CodeSpan) -> Self {
+        let frame = TraceFrame {
+            id: Some(FunctionId::Macro(name, span.clone())),
+            span: Span::Code(span),
+        };
+        self.trace.push(frame);
+        self
+    }
+    pub(crate) fn track_caller(&mut self, new_span: impl Into<Span>) {
+        self.trace.clear();
+        match &mut self.kind {
+            UiuaErrorKind::Run { message, .. } => message.span = new_span.into(),
+            UiuaErrorKind::Throw(_, span, _) => *span = new_span.into(),
+            _ => {}
         }
     }
-    pub(crate) fn trace_macro(mut self, span: CodeSpan) -> Self {
-        let frame = TraceFrame {
-            id: FunctionId::Macro(span.clone()),
-            span: Span::Code(span),
-        };
-        if let UiuaError::Traced { trace, .. } = &mut self {
-            trace.push(frame);
-            self
-        } else {
-            UiuaError::Traced {
-                error: Box::new(self),
-                trace: vec![frame],
-            }
-        }
+    /// Make a Load error
+    pub fn load(path: PathBuf, error: io::Error) -> Self {
+        UiuaErrorKind::Load(path, Arc::new(error)).into()
+    }
+    /// Make a Format error
+    pub fn format(path: PathBuf, error: io::Error) -> Self {
+        UiuaErrorKind::Format(path, Arc::new(error)).into()
     }
 }
 
@@ -162,7 +184,7 @@ fn format_trace(trace: &[TraceFrame]) -> Vec<String> {
     let max_id_length = trace
         .iter()
         .filter(|frame| frame.span != Span::Builtin)
-        .map(|frame| frame.id.to_string().chars().count())
+        .map(|frame| (frame.id.as_ref()).map_or(0, |id| id.to_string().chars().count()))
         .max()
         .unwrap_or(0);
     let max_span_length = trace
@@ -173,19 +195,62 @@ fn format_trace(trace: &[TraceFrame]) -> Vec<String> {
         })
         .max()
         .unwrap_or(0);
-    let mut lines = Vec::new();
-    for frame in trace {
-        if frame.id == FunctionId::Main {
+    let mut lines: Vec<String> = Vec::new();
+    let mut i = 0;
+    'outer: while i < trace.len() {
+        let frame = &trace[i];
+        if frame.id == Some(FunctionId::Main) {
+            i += 1;
             continue;
         }
-        lines.push(match &frame.span {
-            Span::Code(span) => format!(
-                "  in {:max_id_length$} at {:max_span_length$}",
-                frame.id.to_string(),
-                span
-            ),
-            Span::Builtin => format!("  in {:max_id_length$}", frame.id.to_string()),
+        // Look for cycles
+        for n in 1..=4 {
+            if i >= n
+                && i + n < trace.len()
+                && trace[i - n..][..n]
+                    .iter()
+                    .zip(&trace[i..][..n])
+                    .all(|(a, b)| a.id == b.id)
+            {
+                for (i, line) in lines.iter_mut().rev().take(n).rev().enumerate() {
+                    let sep = match (n, i) {
+                        (1, _) => " ×",
+                        (_, 0) => " ┬×",
+                        (n, i) if i == n - 1 => " ┘",
+                        _ => " ┤",
+                    };
+                    if let Some((msg, n)) = line
+                        .rsplit_once(sep)
+                        .and_then(|(a, b)| b.parse::<usize>().ok().map(|n| (a, n)))
+                    {
+                        *line = format!("{msg}{sep}{}", n + 1);
+                    } else {
+                        if !line.ends_with(sep) {
+                            line.push_str(sep);
+                        }
+                        if i == 0 {
+                            line.push('2');
+                        }
+                    }
+                }
+                i += n;
+                continue 'outer;
+            }
+        }
+        lines.push(match (&frame.id, &frame.span) {
+            (Some(id), Span::Code(span)) => {
+                format!("  in {id:max_id_length$} at {span:max_span_length$}")
+            }
+            (Some(id), Span::Builtin) => format!("  in {id:max_id_length$}"),
+            (None, Span::Code(span)) => {
+                format!("  at {span:max_span_length$}")
+            }
+            (None, Span::Builtin) => {
+                i += 1;
+                continue;
+            }
         });
+        i += 1;
     }
     lines
 }
@@ -202,44 +267,83 @@ impl UiuaError {
     /// Get a rich-text report for the error
     pub fn report(&self) -> Report {
         let kind = ReportKind::Error;
-        match self {
-            UiuaError::Parse(errors, inputs) => Report::new_multi(
+        let mut report = match &self.kind {
+            UiuaErrorKind::Parse(errors, inputs) => Report::new_multi(
                 kind,
                 inputs,
                 errors
                     .iter()
                     .map(|error| (error.value.to_string(), error.span.clone().into())),
             ),
-            UiuaError::Run(error, inputs) => {
-                Report::new_multi(kind, inputs, [(&error.value, error.span.clone())])
+            UiuaErrorKind::Run {
+                message,
+                info,
+                inputs,
+            } => {
+                let mut report =
+                    Report::new_multi(kind, inputs, [(&message.value, message.span.clone())]);
+                for info in info {
+                    report.fragments.push(ReportFragment::Newline);
+                    report.fragments.extend(
+                        Report::new_multi(
+                            DiagnosticKind::Info.into(),
+                            inputs,
+                            [(&info.value, info.span.clone())],
+                        )
+                        .fragments,
+                    );
+                }
+                report
             }
-            UiuaError::Traced { error, trace } => error.report().trace(trace),
-            UiuaError::Throw(message, span, inputs) => {
+            UiuaErrorKind::Throw(message, span, inputs) => {
                 Report::new_multi(kind, inputs, [(&message, span.clone())])
             }
-            UiuaError::Timeout(span, inputs) => Report::new_multi(
+            UiuaErrorKind::Timeout(span, inputs) => Report::new_multi(
                 kind,
                 inputs,
                 [("Maximum execution time exceeded", span.clone())],
             ),
-            UiuaError::Fill(error) => error.report(),
-            UiuaError::Panic(message) => Report::new(kind, message),
-            UiuaError::Load(..) | UiuaError::Format(..) => Report::new(kind, self.to_string()),
-            UiuaError::Multi(errors) => {
-                let mut fragments = Vec::new();
-                for (i, error) in errors.iter().enumerate() {
-                    if i > 0 {
-                        fragments.push(ReportFragment::Newline);
-                    }
-                    fragments.extend(error.report().fragments);
-                }
-                Report {
-                    kind,
-                    fragments,
+            UiuaErrorKind::CompilerPanic(message) => Report::new(kind, message),
+            UiuaErrorKind::Load(..) | UiuaErrorKind::Format(..) => {
+                Report::new(kind, self.to_string())
+            }
+            UiuaErrorKind::Interrupted => {
+                return Report {
+                    fragments: vec![ReportFragment::Plain(self.to_string())],
                     color: true,
                 }
             }
+        };
+        report = report.trace(&self.trace);
+        let default_inputs = Inputs::default();
+        let inputs = match &self.kind {
+            UiuaErrorKind::Parse(_, inputs)
+            | UiuaErrorKind::Run { inputs, .. }
+            | UiuaErrorKind::Throw(_, _, inputs)
+            | UiuaErrorKind::Timeout(_, inputs) => inputs,
+            _ => &default_inputs,
+        };
+        for (info, span) in &self.infos {
+            if let Some(span) = span {
+                report.fragments.extend(
+                    Report::new_multi(DiagnosticKind::Info.into(), inputs, [(info, span.clone())])
+                        .fragments,
+                );
+            } else {
+                report.fragments.push(ReportFragment::Newline);
+                report.fragments.push(ReportFragment::Colored(
+                    "Info".into(),
+                    DiagnosticKind::Info.into(),
+                ));
+                report.fragments.push(ReportFragment::Plain(": ".into()));
+                report.fragments.push(ReportFragment::Plain(info.into()));
+            }
         }
+        for error in &self.multi {
+            report.fragments.push(ReportFragment::Newline);
+            report.fragments.extend(error.report().fragments);
+        }
+        report
     }
 }
 
@@ -247,7 +351,7 @@ impl UiuaError {
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
     /// The span of the message
-    pub span: CodeSpan,
+    pub span: Span,
     /// The message itself
     pub message: String,
     /// What kind of diagnostic this is
@@ -279,12 +383,14 @@ impl Ord for Diagnostic {
 /// Kinds of non-error diagnostics
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DiagnosticKind {
-    /// Something that really needs to be fixed
-    Warning,
-    /// Something that should be fixed for performance reasons
-    Advice,
+    /// Informational message
+    Info,
     /// Bad code style
     Style,
+    /// Something that should be fixed for performance reasons
+    Advice,
+    /// Something that really needs to be fixed
+    Warning,
 }
 
 impl fmt::Display for Diagnostic {
@@ -296,14 +402,14 @@ impl fmt::Display for Diagnostic {
 impl Diagnostic {
     /// Create a new diagnostic
     pub fn new(
-        message: impl Into<String>,
-        span: CodeSpan,
+        message: String,
+        span: impl Into<Span>,
         kind: DiagnosticKind,
         inputs: Inputs,
     ) -> Self {
         Self {
-            message: message.into(),
-            span,
+            message,
+            span: span.into(),
             kind,
             inputs,
         }
@@ -313,7 +419,7 @@ impl Diagnostic {
         Report::new_multi(
             ReportKind::Diagnostic(self.kind),
             &self.inputs,
-            [(&self.message, self.span.clone().into())],
+            [(&self.message, self.span.clone())],
         )
     }
 }
@@ -327,6 +433,12 @@ pub enum ReportKind {
     Diagnostic(DiagnosticKind),
 }
 
+impl From<DiagnosticKind> for ReportKind {
+    fn from(kind: DiagnosticKind) -> Self {
+        ReportKind::Diagnostic(kind)
+    }
+}
+
 impl ReportKind {
     /// Get the string that prefixes the formatted report
     pub fn str(&self) -> &'static str {
@@ -335,6 +447,7 @@ impl ReportKind {
             ReportKind::Diagnostic(DiagnosticKind::Warning) => "Warning",
             ReportKind::Diagnostic(DiagnosticKind::Advice) => "Advice",
             ReportKind::Diagnostic(DiagnosticKind::Style) => "Style",
+            ReportKind::Diagnostic(DiagnosticKind::Info) => "Info",
         }
     }
 }
@@ -345,7 +458,7 @@ pub enum ReportFragment {
     /// Just plain text
     Plain(String),
     /// Text colored according to the report kind
-    Colored(String),
+    Colored(String, ReportKind),
     /// Faint text
     Faint(String),
     /// Even fainter text
@@ -357,14 +470,24 @@ pub enum ReportFragment {
 /// A rich-text error/diagnostic report
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
-    /// What kind of report this is
-    pub kind: ReportKind,
     /// The rich-text fragments of the report
     pub fragments: Vec<ReportFragment>,
     /// Whether to color the report with ANSI escape codes when converting it to a string
     ///
     /// Defaults to `true`
     pub color: bool,
+}
+
+impl From<UiuaError> for Report {
+    fn from(error: UiuaError) -> Self {
+        error.report()
+    }
+}
+
+impl From<UiuaError> for Vec<Report> {
+    fn from(error: UiuaError) -> Self {
+        error.into_multi().into_iter().map(Into::into).collect()
+    }
 }
 
 impl Report {
@@ -387,7 +510,7 @@ impl Report {
     pub fn new(kind: ReportKind, message: impl Into<String>) -> Self {
         let message = message.into();
         let mut fragments = vec![
-            ReportFragment::Colored(kind.str().into()),
+            ReportFragment::Colored(kind.str().into(), kind),
             ReportFragment::Plain(": ".into()),
         ];
         if message.lines().count() > 1 {
@@ -395,7 +518,6 @@ impl Report {
         }
         fragments.push(ReportFragment::Plain(message));
         Self {
-            kind,
             fragments,
             color: true,
         }
@@ -411,7 +533,7 @@ impl Report {
             if i > 0 {
                 fragments.push(ReportFragment::Newline);
             }
-            fragments.push(ReportFragment::Colored(kind.str().into()));
+            fragments.push(ReportFragment::Colored(kind.str().into(), kind));
             fragments.push(ReportFragment::Plain(": ".into()));
             let message = message.to_string();
             for (i, line) in message.lines().enumerate() {
@@ -456,7 +578,7 @@ impl Report {
                     .collect();
                 let post_color: String = line.chars().skip(end_char_pos as usize).collect();
                 fragments.push(ReportFragment::Faint(pre_color));
-                fragments.push(ReportFragment::Colored(color));
+                fragments.push(ReportFragment::Colored(color, kind));
                 fragments.push(ReportFragment::Faint(post_color));
                 fragments.push(ReportFragment::Newline);
                 fragments.push(ReportFragment::Plain(
@@ -465,11 +587,65 @@ impl Report {
                 fragments.push(ReportFragment::Plain(" ".repeat(start_char_pos as usize)));
                 fragments.push(ReportFragment::Colored(
                     "─".repeat(end_char_pos.saturating_sub(start_char_pos).max(1) as usize),
+                    kind,
                 ));
             }
         }
         Self {
-            kind,
+            fragments,
+            color: true,
+        }
+    }
+    /// A report that tests have finished
+    pub fn tests(successes: usize, failures: usize, not_run: usize) -> Self {
+        let mut fragments = if successes == 0 && not_run == 0 {
+            if failures == 0 {
+                vec![]
+            } else {
+                vec![ReportFragment::Colored(
+                    match failures {
+                        1 => "Test failed".into(),
+                        2 => "Both tests failed".into(),
+                        _ => format!("All {failures} tests failed"),
+                    },
+                    ReportKind::Error,
+                )]
+            }
+        } else {
+            let mut fragments = vec![ReportFragment::Colored(
+                match (successes, failures) {
+                    (1, 0) if not_run == 0 => "Test passed".into(),
+                    (2, 0) if not_run == 0 => "Both tests passed".into(),
+                    (suc, 0) if not_run == 0 => format!("All {suc} tests passed"),
+                    (suc, _) => {
+                        format!("{suc} test{} passed", if suc == 1 { "" } else { "s" })
+                    }
+                },
+                DiagnosticKind::Info.into(),
+            )];
+            if failures > 0 {
+                fragments.extend([
+                    ReportFragment::Plain(", ".into()),
+                    ReportFragment::Colored(format!("{failures} failed"), ReportKind::Error),
+                ])
+            }
+            fragments
+        };
+        if not_run > 0 {
+            if fragments.is_empty() {
+                fragments.push(ReportFragment::Colored(
+                    format!("0 of {not_run} tests ran"),
+                    ReportKind::Error,
+                ));
+            } else {
+                fragments.push(ReportFragment::Plain(", ".into()));
+                fragments.push(ReportFragment::Colored(
+                    format!("{not_run} didn't run"),
+                    DiagnosticKind::Warning.into(),
+                ));
+            }
+        }
+        Report {
             fragments,
             color: true,
         }
@@ -483,9 +659,9 @@ impl fmt::Display for Report {
                 ReportFragment::Plain(s)
                 | ReportFragment::Faint(s)
                 | ReportFragment::Fainter(s) => write!(f, "{s}")?,
-                ReportFragment::Colored(s) => {
+                ReportFragment::Colored(s, kind) => {
                     if self.color {
-                        let s = s.color(match self.kind {
+                        let s = s.color(match kind {
                             ReportKind::Error => Color::Red,
                             ReportKind::Diagnostic(DiagnosticKind::Warning) => Color::Yellow,
                             ReportKind::Diagnostic(DiagnosticKind::Style) => Color::Green,
@@ -494,6 +670,7 @@ impl fmt::Display for Report {
                                 g: 150,
                                 b: 255,
                             },
+                            ReportKind::Diagnostic(DiagnosticKind::Info) => Color::BrightCyan,
                         });
                         write!(f, "{s}")?
                     } else {

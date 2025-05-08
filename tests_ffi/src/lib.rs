@@ -59,6 +59,19 @@ pub unsafe extern "C" fn multi_list(
     }
 }
 
+#[no_mangle]
+pub unsafe fn change_string(s: *mut *const c_char) {
+    let new_str = CString::new("Hello, World!").unwrap();
+    *s = new_str.into_raw();
+}
+
+#[no_mangle]
+pub unsafe fn change_string_to_sum(a: c_int, b: c_int, s: *mut *const c_char) {
+    let sum = a + b;
+    let new_str = CString::new(format!("{} + {} = {}", a, b, sum)).unwrap();
+    *s = new_str.into_raw();
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Vec2 {
@@ -179,6 +192,58 @@ pub struct TwoInts {
 #[no_mangle]
 pub unsafe extern "C" fn two_ints_new(a: *const c_int, b: *const c_int) -> TwoInts {
     TwoInts { a, b }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn array_ptr(arr: *const c_int, len: c_int) -> *const c_int {
+    let copied = std::slice::from_raw_parts(arr, len as usize).to_vec();
+    copied.leak().as_ptr()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dummy_md5(
+    m: *const c_uchar,
+    len: c_int,
+    out: *mut c_uchar,
+) -> *const c_uchar {
+    if len == 0 {
+        return std::ptr::null();
+    }
+    let len = len as isize;
+    if out.is_null() {
+        let new_out = vec![0; 16].leak().as_mut_ptr();
+        for i in 0..len.min(16) {
+            *new_out.offset(i) = *m.offset(i);
+        }
+        new_out
+    } else {
+        for i in 0..len.min(16) {
+            *out.offset(i) = *m.offset(i);
+        }
+        out
+    }
+}
+
+#[repr(C)]
+pub struct VoidStruct {
+    pub a: *const c_void,
+    pub b: *const c_void,
+}
+
+#[no_mangle]
+pub extern "C" fn make_void_struct(_: c_int) -> VoidStruct {
+    VoidStruct {
+        a: std::ptr::null(),
+        b: std::ptr::null(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn make_void_struct_a(a: c_int) -> VoidStruct {
+    VoidStruct {
+        a: Box::into_raw(Box::new(a)) as *const c_void,
+        b: std::ptr::null(),
+    }
 }
 
 #[test]

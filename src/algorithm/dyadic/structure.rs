@@ -1,22 +1,29 @@
 //! Code for pick, select, take, and drop
 
 use std::{
+    borrow::Cow,
     cmp::Ordering,
-    iter::{once, repeat},
-    mem::replace,
+    collections::HashSet,
+    iter::{once, repeat, repeat_n},
 };
 
 use ecow::EcoVec;
 
-use crate::algorithm::{op_bytes_ref_retry_fill, op_bytes_retry_fill};
 use crate::{
-    algorithm::FillContext,
-    cowslice::{cowslice, CowSlice},
-    Array, ArrayValue, FormatShape, Primitive, Shape, Uiua, UiuaResult, Value,
+    algorithm::{validate_size, FillContext},
+    cowslice::{cowslice, extend_repeat_slice, CowSlice},
+    grid_fmt::GridFmt,
+    val_as_arr, Array, ArrayValue, FormatShape, Primitive, Shape, Uiua, UiuaResult, Value,
 };
 
 impl<T: Clone> Array<T> {
+    #[track_caller]
     pub(crate) fn remove_row(&mut self, index: usize) {
+        debug_assert!(
+            index < self.row_count(),
+            "Index {index} is out of bounds of {} rows",
+            self.row_count()
+        );
         let row_len = self.row_len();
         let data = self.data.as_mut_slice();
         let start = index * row_len;
@@ -28,7 +35,7 @@ impl<T: Clone> Array<T> {
         self.shape[0] -= 1;
     }
     pub(crate) fn set_row(&mut self, index: usize, row: Self) {
-        let row_len = row.row_len();
+        let row_len = self.row_len();
         let start = index * row_len;
         for (a, b) in self.data.as_mut_slice()[start..]
             .iter_mut()
@@ -48,17 +55,36 @@ impl<T: Clone> Array<T> {
 }
 
 impl Value {
-    pub(crate) fn as_shaped_indices(&self, env: &Uiua) -> UiuaResult<(&[usize], Vec<isize>)> {
+    #[track_caller]
+    pub(crate) fn remove_row(&mut self, index: usize) {
+        val_as_arr!(self, |a| a.remove_row(index))
+    }
+    pub(crate) fn as_shaped_indices(
+        &self,
+        filled: bool,
+        env: &Uiua,
+    ) -> UiuaResult<(&[usize], Vec<isize>)> {
         Ok(match self {
             Value::Num(arr) => {
                 let mut index_data = Vec::with_capacity(arr.element_count());
                 for &n in &arr.data {
-                    if n.fract() != 0.0 {
-                        return Err(env.error(format!(
-                            "Index must be an array of integers, but {n} is not an integer"
-                        )));
-                    }
-                    index_data.push(n as isize);
+                    index_data.push(if n.fract() != 0.0 {
+                        if filled {
+                            isize::MAX
+                        } else if n.fract().is_nan() {
+                            return Err(env.error(format!(
+                                "{} cannot be used as an index without a fill",
+                                n.grid_string(false)
+                            )));
+                        } else {
+                            return Err(env.error(format!(
+                                "Index must be an array of integers, but {} is not an integer",
+                                n.grid_string(false)
+                            )));
+                        }
+                    } else {
+                        n as isize
+                    });
                 }
                 (&arr.shape, index_data)
             }
@@ -78,22 +104,19 @@ impl Value {
         })
     }
     /// Use this array as an index to pick from another
-    pub fn pick(self, from: Self, env: &Uiua) -> UiuaResult<Self> {
-        let (index_shape, index_data) = self.as_shaped_indices(env)?;
+    pub fn pick(self, mut from: Self, env: &Uiua) -> UiuaResult<Self> {
+        from.match_fill(env);
+        let (index_shape, index_data) = self.as_shaped_indices(env.is_scalar_filled(&from), env)?;
         Ok(match from {
             Value::Num(a) => Value::Num(a.pick(index_shape, &index_data, env)?),
-            Value::Byte(a) => op_bytes_retry_fill(
-                a,
-                |a| a.pick(index_shape, &index_data, env).map(Into::into),
-                |a| a.pick(index_shape, &index_data, env).map(Into::into),
-            )?,
+            Value::Byte(a) => Value::Byte(a.pick(index_shape, &index_data, env)?),
             Value::Complex(a) => Value::Complex(a.pick(index_shape, &index_data, env)?),
             Value::Char(a) => Value::Char(a.pick(index_shape, &index_data, env)?),
             Value::Box(a) => Value::Box(a.pick(index_shape, &index_data, env)?),
         })
     }
     pub(crate) fn undo_pick(self, index: Self, into: Self, env: &Uiua) -> UiuaResult<Self> {
-        let (idx_shape, index_data) = index.as_shaped_indices(env)?;
+        let (idx_shape, index_data) = index.as_shaped_indices(env.is_scalar_filled(&self), env)?;
         if idx_shape.len() > 1 {
             let last_axis_len = *idx_shape.last().unwrap();
             if last_axis_len == 0 {
@@ -114,12 +137,12 @@ impl Value {
                         let a = if a >= 0 {
                             a as usize
                         } else {
-                            into.shape()[i] - a.unsigned_abs()
+                            into.shape[i] - a.unsigned_abs()
                         };
                         let b = if b >= 0 {
                             b as usize
                         } else {
-                            into.shape()[i] - b.unsigned_abs()
+                            into.shape[i] - b.unsigned_abs()
                         };
                         a == b
                     });
@@ -200,23 +223,29 @@ impl<T: ArrayValue> Array<T> {
             )));
         }
         let mut picked = self.data.clone();
+        let fill = env.scalar_fill::<T>().map(|fv| fv.value);
         for (d, (&s, &i)) in self.shape.iter().zip(index).enumerate() {
             let row_len: usize = self.shape[d + 1..].iter().product();
             let s = s as isize;
             if i >= s || i < -s {
-                match env.scalar_fill::<T>() {
+                match &fill {
                     Ok(fill) => {
-                        picked = cowslice![fill; row_len];
+                        picked = cowslice![fill.clone(); row_len];
                         continue;
                     }
                     Err(e) => {
-                        return Err(env
-                            .error(format!(
-                                "Index {i} is out of bounds of length {s} (dimension {d}) in shape {}{e}",
-                                self.shape()
-                            ))
-                            .fill());
+                        let message = format!(
+                            "Index {i} is out of bounds of length {s} \
+                            (dimension {d}) in shape {}{e}",
+                            self.shape
+                        );
+                        return Err(env.error(message).fill());
                     }
+                }
+            } else if i < 0 {
+                if let Ok(fill) = &fill {
+                    picked = cowslice![fill.clone(); row_len];
+                    continue;
                 }
             }
             let i = if i >= 0 { i as usize } else { (s + i) as usize };
@@ -254,10 +283,10 @@ impl<T: ArrayValue> Array<T> {
             .collect();
         if self.shape != expected_shape {
             return Err(env.error(format!(
-                "Attempted to undo pick, but the shape of the selected \
+                "Attempted to undo pick, but the shape of the picked \
                 array changed from {} to {}",
                 FormatShape(&expected_shape),
-                self.shape()
+                self.shape
             )));
         }
         let index_row_len: usize = index_shape[1..].iter().product();
@@ -270,6 +299,8 @@ impl<T: ArrayValue> Array<T> {
                 into = from.undo_pick(&index_shape[1..], index_row, into, env)?;
             }
         }
+        into.meta.take_sorted_flags();
+        into.validate();
         Ok(into)
     }
     fn unpick_single(self, index: &[isize], mut into: Self, env: &Uiua) -> UiuaResult<Self> {
@@ -280,30 +311,39 @@ impl<T: ArrayValue> Array<T> {
                 index.len()
             )));
         }
-        let expected_shape = &into.shape()[index.len()..];
+        let expected_shape = &into.shape[index.len()..];
         if self.shape != expected_shape {
             return Err(env.error(format!(
-                "Attempted to undo pick, but the shape of the selected \
+                "Attempted to undo pick, but the shape of the picked \
                 array changed from {} to {}",
                 FormatShape(expected_shape),
-                self.shape()
+                self.shape
             )));
         }
         let mut start = 0;
-        for (i, (&ind, &f)) in index.iter().zip(into.shape()).enumerate() {
+        let has_fill = env.scalar_fill::<T>().is_ok() || env.scalar_unfill::<T>().is_ok();
+        for (i, (&ind, &s)) in index.iter().zip(&into.shape).enumerate() {
             let ind = if ind >= 0 {
                 ind as usize
             } else {
-                (f as isize + ind) as usize
+                if has_fill {
+                    return Ok(into);
+                }
+                (s as isize + ind) as usize
             };
+            if ind >= s {
+                return Ok(into);
+            }
             start += ind * into.shape[i + 1..].iter().product::<usize>();
         }
-        for (f, i) in (into.data.as_mut_slice().iter_mut())
+        for (x, i) in (into.data.as_mut_slice().iter_mut())
             .skip(start)
             .zip(self.data)
         {
-            *f = i;
+            *x = i;
         }
+        into.meta.take_sorted_flags();
+        into.validate();
         Ok(into)
     }
 }
@@ -311,35 +351,37 @@ impl<T: ArrayValue> Array<T> {
 impl Value {
     /// Use this value to `take` from another
     pub fn take(self, from: Self, env: &Uiua) -> UiuaResult<Self> {
-        if from.rank() == 0 {
-            return Err(env.error("Cannot take from scalar"));
-        }
-        let index = self.as_ints(env, "Index must be a list of integers")?;
-        Ok(match from {
-            Value::Num(a) => Value::Num(a.take(&index, env)?),
-            Value::Byte(a) => op_bytes_retry_fill(
-                a,
-                |a| a.take(&index, env).map(Into::into),
-                |a| a.take(&index, env).map(Into::into),
-            )?,
-            Value::Complex(a) => Value::Complex(a.take(&index, env)?),
-            Value::Char(a) => Value::Char(a.take(&index, env)?),
-            Value::Box(a) => Value::Box(a.take(&index, env)?),
-        })
+        let index =
+            self.as_ints_or_infs(env, "Taken amount must be a list of integers or infinity")?;
+        from.take_impl(&index, env)
+    }
+    pub(crate) fn take_impl(
+        mut self,
+        index: &[Result<isize, bool>],
+        env: &Uiua,
+    ) -> UiuaResult<Self> {
+        self.match_fill(env);
+        val_as_arr!(self, |a| a.take(index, env).map(Into::into))
     }
     /// Use this value to `drop` from another
     pub fn drop(self, from: Self, env: &Uiua) -> UiuaResult<Self> {
-        let index = self.as_ints(env, "Index must be a list of integers")?;
-        Ok(match from {
-            Value::Num(a) => Value::Num(a.drop(&index, env)?),
-            Value::Byte(a) => Value::Byte(a.drop(&index, env)?),
-            Value::Complex(a) => Value::Complex(a.drop(&index, env)?),
-            Value::Char(a) => Value::Char(a.drop(&index, env)?),
-            Value::Box(a) => Value::Box(a.drop(&index, env)?),
-        })
+        let index =
+            self.as_ints_or_infs(env, "Dropped amount must be a list of integers or infinity")?;
+        val_as_arr!(from, |a| a.drop(&index, env).map(Into::into))
     }
     pub(crate) fn undo_take(self, index: Self, into: Self, env: &Uiua) -> UiuaResult<Self> {
-        let index = index.as_ints(env, "Index must be a list of integers")?;
+        let index = match index.as_ints(env, None) {
+            Ok(indices) => indices,
+            Err(_) => {
+                let with_infs = index
+                    .as_ints_or_infs(env, "Taken amount must be a list of integers or infinity")?;
+                let mut indices = Vec::with_capacity(with_infs.len());
+                for (i, d) in with_infs.into_iter().zip(&into.shape) {
+                    indices.push(i.unwrap_or(*d as isize));
+                }
+                indices
+            }
+        };
         self.generic_bin_into(
             into,
             |a, b| a.undo_take(&index, b, env).map(Into::into),
@@ -349,7 +391,7 @@ impl Value {
             |a, b| a.undo_take(&index, b, env).map(Into::into),
             |a, b| {
                 env.error(format!(
-                    "Cannot untake {} into {}",
+                    "Cannot undo take {} into {}",
                     a.type_name(),
                     b.type_name()
                 ))
@@ -357,7 +399,20 @@ impl Value {
         )
     }
     pub(crate) fn undo_drop(self, index: Self, into: Self, env: &Uiua) -> UiuaResult<Self> {
-        let index = index.as_ints(env, "Index must be a list of integers")?;
+        let index = match index.as_ints(env, None) {
+            Ok(indices) => indices,
+            Err(_) => {
+                let with_infs = index.as_ints_or_infs(
+                    env,
+                    "Dropped amount must be a list of integers or infinity",
+                )?;
+                let mut indices = Vec::with_capacity(with_infs.len());
+                for (i, d) in with_infs.into_iter().zip(&into.shape) {
+                    indices.push(i.unwrap_or(*d as isize));
+                }
+                indices
+            }
+        };
         self.generic_bin_into(
             into,
             |a, b| a.undo_drop(&index, b, env).map(Into::into),
@@ -374,30 +429,74 @@ impl Value {
             },
         )
     }
+    pub(crate) fn anti_drop(&self, mut target: Self, env: &Uiua) -> UiuaResult<Self> {
+        let index = self.as_ints(env, "Index must be an integer or list of integers")?;
+        target.match_fill(env);
+        val_as_arr!(target, |a| a.anti_drop(&index, env).map(Into::into))
+    }
+    #[track_caller]
+    pub(crate) fn drop_n(&mut self, n: usize) {
+        val_as_arr!(self, |a| a.drop_front_n(n))
+    }
+    pub(crate) fn un_take(&mut self, env: &Uiua) -> UiuaResult<Value> {
+        self.match_fill(env);
+        val_as_arr!(self, |a| a.un_take(env))
+    }
 }
 
 impl<T: ArrayValue> Array<T> {
     /// `take` from this array
-    pub fn take(mut self, index: &[isize], env: &Uiua) -> UiuaResult<Self> {
-        let map_keys = self.take_map_keys();
+    pub fn take(mut self, index: &[Result<isize, bool>], env: &Uiua) -> UiuaResult<Self> {
+        if self.rank() == 0 {
+            self.shape.push(1);
+        }
+
+        if index.len() > self.rank() {
+            return Err(env.error(format!(
+                "Cannot take from rank {} array with index of length {}",
+                self.rank(),
+                index.len()
+            )));
+        }
+
+        let mut fill = env.array_fill::<T>().map_err(Cow::Borrowed);
+        if let Ok(fill_val) = &fill {
+            if !self.shape[index.len()..].ends_with(&fill_val.value.shape) {
+                fill = Err(Cow::Owned(format!(
+                    ". A fill is set, but its shape {} \
+                    is not compatible with the array's shape {} \
+                    when doing a {}-axis take",
+                    fill_val.value.shape,
+                    self.shape,
+                    index.len()
+                )))
+            }
+        }
+
+        let map_keys = self.meta.take_map_keys();
         let row_count = self.row_count();
         let mut arr = match index {
             [] => self,
             &[taking] => {
                 let row_len = self.row_len();
                 let row_count = self.row_count();
+                let taking = taking.unwrap_or(row_count as isize);
                 let abs_taking = taking.unsigned_abs();
                 let mut filled = false;
                 if taking >= 0 {
                     if abs_taking > row_count {
-                        match T::get_fill(env) {
+                        match fill {
                             Ok(fill) => {
                                 filled = true;
-                                self.data.extend_from_slice(&vec![
-                                    fill;
-                                    (abs_taking - row_count)
-                                        * row_len
-                                ]);
+                                let fill_elems = fill.value.element_count();
+                                if fill_elems > 0 {
+                                    let reps = (abs_taking - row_count) * row_len / fill_elems;
+                                    self.data.extend_repeat_slice_fill(
+                                        fill.map_ref(|arr| arr.data.as_slice()),
+                                        reps,
+                                    );
+                                }
+                                self.meta.take_sorted_flags();
                             }
                             Err(e) => {
                                 return Err(env
@@ -415,13 +514,20 @@ impl<T: ArrayValue> Array<T> {
                         self.data.truncate(abs_taking * row_len);
                     }
                 } else if abs_taking > row_count {
-                    match T::get_fill(env) {
+                    match fill {
                         Ok(fill) => {
                             filled = true;
-                            let new_data =
-                                EcoVec::from_elem(fill, (abs_taking - row_count) * row_len);
-                            let old_data = replace(&mut self.data, new_data.into());
-                            self.data.extend_from_slice(&old_data);
+                            let fill_elems = fill.value.element_count();
+                            let diff = abs_taking - row_count;
+                            if fill_elems > 0 {
+                                let reps = diff * row_len / fill_elems;
+                                self.data.extend_repeat_slice_fill(
+                                    fill.map_ref(|arr| arr.data.as_slice()),
+                                    reps,
+                                );
+                            }
+                            self.data.as_mut_slice().rotate_right(diff * row_len);
+                            self.meta.take_sorted_flags();
                         }
                         Err(e) => {
                             return Err(env
@@ -448,7 +554,7 @@ impl<T: ArrayValue> Array<T> {
                 } else if filled {
                     self.shape.push(abs_taking);
                 }
-                self.validate_shape();
+                self.validate();
                 self
             }
             &[taking, ref sub_index @ ..] => {
@@ -459,13 +565,14 @@ impl<T: ArrayValue> Array<T> {
                         index.len()
                     )));
                 }
+                let taking = taking.unwrap_or(row_count as isize);
                 let abs_taking = taking.unsigned_abs();
                 if sub_index
                     .iter()
                     .zip(&self.shape[1..])
-                    .all(|(&i, &s)| i.unsigned_abs() == s)
+                    .all(|(&i, &s)| i.map_or(true, |i| i.unsigned_abs() == s))
                 {
-                    return self.take(&[taking], env);
+                    return self.take(&[Ok(taking)], env);
                 }
                 let mut new_rows = Vec::with_capacity(abs_taking);
                 let mut arr = if taking >= 0 {
@@ -476,13 +583,22 @@ impl<T: ArrayValue> Array<T> {
                     let mut arr = Array::from_row_arrays_infallible(new_rows);
                     // Extend with fill values if necessary
                     if abs_taking > arr.row_count() {
-                        match T::get_fill(env) {
+                        match fill {
                             Ok(fill) => {
-                                let row_len: usize =
-                                    sub_index.iter().map(|&i| i.unsigned_abs()).product();
-                                arr.data.extend(
-                                    repeat(fill).take((abs_taking - arr.row_count()) * row_len),
-                                );
+                                let row_len: usize = (sub_index.iter())
+                                    .chain(repeat(&Err(true)))
+                                    .zip(&self.shape[1..])
+                                    .map(|(&i, &s)| i.map_or(s, isize::unsigned_abs))
+                                    .product();
+                                let fill_elems = fill.value.element_count();
+                                if fill_elems > 0 {
+                                    let reps = (abs_taking - row_count) * row_len / fill_elems;
+                                    arr.data.extend_repeat_slice_fill(
+                                        fill.map_ref(|arr| arr.data.as_slice()),
+                                        reps,
+                                    );
+                                }
+                                arr.meta.take_sorted_flags();
                             }
                             Err(e) => {
                                 return Err(env
@@ -507,14 +623,23 @@ impl<T: ArrayValue> Array<T> {
                     let mut arr = Array::from_row_arrays_infallible(new_rows);
                     // Prepend with fill values if necessary
                     if abs_taking > arr.row_count() {
-                        match T::get_fill(env) {
+                        match fill {
                             Ok(fill) => {
-                                let row_len: usize =
-                                    sub_index.iter().map(|&i| i.unsigned_abs()).product();
-                                arr.data = repeat(fill)
-                                    .take((abs_taking - arr.row_count()) * row_len)
-                                    .chain(arr.data)
-                                    .collect();
+                                let row_len: usize = (sub_index.iter())
+                                    .chain(repeat(&Err(true)))
+                                    .zip(&self.shape[1..])
+                                    .map(|(&i, &s)| i.map_or(s, |i| i.unsigned_abs()))
+                                    .product();
+                                let fill_elems = fill.value.element_count();
+                                let diff = abs_taking - row_count;
+                                if fill_elems > 0 {
+                                    let reps = diff * row_len / fill_elems;
+                                    arr.data.extend_repeat_slice_fill(
+                                        fill.map_ref(|arr| arr.data.as_slice()),
+                                        reps,
+                                    );
+                                }
+                                arr.data.as_mut_slice().rotate_right(diff * row_len);
                             }
                             Err(e) => {
                                 return Err(env
@@ -531,13 +656,17 @@ impl<T: ArrayValue> Array<T> {
                     }
                     arr
                 };
-                arr.shape = index.iter().map(|&i| i.unsigned_abs()).collect();
-                arr.validate_shape();
+                arr.shape = self.shape;
+                for (i, s) in index.iter().zip(&mut *arr.shape) {
+                    *s = i.map_or(*s, isize::unsigned_abs);
+                }
+                arr.validate();
                 arr
             }
         };
         if let Some(mut map_keys) = map_keys {
             if let Some(taking) = index.first().copied() {
+                let taking = taking.unwrap_or(row_count as isize);
                 if taking.unsigned_abs() > row_count {
                     return Err(env.error(format!(
                         "Cannot {} {} a map array",
@@ -551,20 +680,21 @@ impl<T: ArrayValue> Array<T> {
                     map_keys.drop(row_count - taking.unsigned_abs());
                 }
             }
-            arr.meta_mut().map_keys = Some(map_keys);
+            arr.meta.map_keys = Some(map_keys);
         }
         Ok(arr)
     }
     /// `drop` from this array
-    pub fn drop(mut self, index: &[isize], env: &Uiua) -> UiuaResult<Self> {
+    pub fn drop(mut self, index: &[Result<isize, bool>], env: &Uiua) -> UiuaResult<Self> {
+        let map_keys = self.meta.take_map_keys();
         if self.rank() == 0 {
-            return Err(env.error("Cannot drop from scalar"));
+            self.shape.push(1);
         }
-        let map_keys = self.take_map_keys();
         let row_count = self.row_count();
         let mut arr = match index {
             [] => self,
             &[dropping] => {
+                let dropping = dropping.unwrap_or(row_count as isize);
                 let row_len = self.row_len();
                 let row_count = self.row_count();
                 let abs_dropping = dropping.unsigned_abs().min(row_count);
@@ -577,7 +707,7 @@ impl<T: ArrayValue> Array<T> {
                     self.shape.push(1);
                 }
                 self.shape[0] = self.shape[0].saturating_sub(abs_dropping);
-                self.validate_shape();
+                self.validate();
                 self
             }
             &[dropping, ref sub_index @ ..] => {
@@ -588,6 +718,7 @@ impl<T: ArrayValue> Array<T> {
                         index.len()
                     )));
                 }
+                let dropping = dropping.unwrap_or(row_count as isize);
                 let abs_dropping = dropping.unsigned_abs();
                 let mut new_rows = Vec::with_capacity(abs_dropping);
                 let row_count = self.row_count();
@@ -603,11 +734,11 @@ impl<T: ArrayValue> Array<T> {
                 };
                 if row_count == abs_dropping {
                     let mut shape = self.shape;
-                    for (s, n) in shape
-                        .iter_mut()
-                        .zip(once(abs_dropping).chain(sub_index.iter().map(|&i| i.unsigned_abs())))
-                    {
-                        *s = s.saturating_sub(n);
+                    for (s, n) in shape.iter_mut().zip(once(&Err(true)).chain(sub_index)) {
+                        *s = match n {
+                            Ok(n) => s.saturating_sub(n.unsigned_abs()),
+                            Err(_) => 0,
+                        };
                     }
                     Array::new(shape, CowSlice::new())
                 } else {
@@ -617,169 +748,492 @@ impl<T: ArrayValue> Array<T> {
         };
         if let Some(mut map_keys) = map_keys {
             if let Some(dropping) = index.first().copied() {
-                if dropping >= 0 {
-                    map_keys.drop(dropping.unsigned_abs());
+                let abs_dropping = dropping.map_or(row_count, isize::unsigned_abs);
+                if dropping.map_or(true, |i| i >= 0) {
+                    map_keys.drop(abs_dropping);
                 } else {
-                    let taken = row_count.saturating_sub(dropping.unsigned_abs());
+                    let taken = row_count.saturating_sub(abs_dropping);
                     map_keys.take(taken);
                 }
             }
-            arr.meta_mut().map_keys = Some(map_keys);
+            arr.meta.map_keys = Some(map_keys);
         }
         Ok(arr)
     }
     fn undo_take(self, index: &[isize], into: Self, env: &Uiua) -> UiuaResult<Self> {
-        self.undo_take_impl("take", "taken", index, into, env)
+        let mut undex = Vec::with_capacity(index.len());
+        let mut end = Vec::with_capacity(index.len());
+        for &i in index {
+            undex.push(i.unsigned_abs());
+            end.push(i < 0);
+        }
+        self.undo_take_impl("take", "taken", &undex, &end, into, env)
     }
     fn undo_take_impl(
         self,
         name: &str,
         past: &str,
-        index: &[isize],
-        into: Self,
+        undex: &[usize],
+        end: &[bool],
+        mut into: Self,
         env: &Uiua,
     ) -> UiuaResult<Self> {
-        if self.map_keys().is_some() {
+        if self.meta.map_keys.is_some() {
             return Err(env.error("Cannot undo take from map array"));
+        }
+        let into_rank = into.rank();
+        if into.rank() == 0 {
+            into.shape.push(1);
         }
         let from = self;
         match from.rank().cmp(&into.rank()) {
             Ordering::Less => {
                 if from.shape[..] != into.shape[1..] {
                     return Err(env.error(format!(
-                        "Attempted to undo {name}, but the {past} section's rank was \
-                        modified to be incompatible",
+                        "Attempted to undo {name}, but the {past} section's rank \
+                        decreased from {into_rank} to {}",
+                        from.rank()
                     )));
                 }
             }
             Ordering::Equal => {}
             Ordering::Greater => {
                 return Err(env.error(format!(
-                    "Attempted to undo {name}, but the {past} section's rank was modified from {} to {}",
-                    into.rank(),
+                    "Attempted to undo {name}, but the {past} section's rank \
+                    increased from {into_rank} to {}",
                     from.rank()
                 )));
             }
         }
-        Ok(match index {
-            [] => into,
-            &[untaking] => {
-                let into = into.drop(&[untaking], env)?;
-                if untaking >= 0 {
-                    from.join(into, env)
+        Ok(match (undex, end) {
+            ([], []) => into,
+            (&[untaking], &[end]) => {
+                let dropped = if end {
+                    -(untaking as isize)
                 } else {
-                    into.join(from, env)
+                    untaking as isize
+                };
+                let into = into.drop(&[Ok(dropped)], env)?;
+                if end {
+                    into.join(from, true, env)
+                } else {
+                    from.join(into, true, env)
                 }?
             }
-            &[untaking, ref sub_index @ ..] => {
-                let abs_untaking = untaking.unsigned_abs();
-                if abs_untaking != from.row_count() {
+            (&[untaking, ref sub_index @ ..], &[end, ref sub_end @ ..]) => {
+                if untaking != from.row_count() {
                     return Err(env.error(format!(
                         "Attempted to undo {name}, but the {past} section's row \
-                        count was modified from {} to {}",
-                        abs_untaking,
+                        count was modified from {untaking} to {}",
                         from.row_count()
                     )));
                 }
                 let into_row_count = into.row_count();
                 let mut new_rows = Vec::with_capacity(into_row_count);
-                if untaking >= 0 {
-                    for (from, into) in from.rows().zip(into.rows()) {
-                        new_rows.push(from.undo_take_impl(name, past, sub_index, into, env)?);
-                    }
-                    new_rows.extend(into.rows().skip(abs_untaking));
-                } else {
-                    let start = into_row_count.saturating_sub(abs_untaking);
+                if end {
+                    let start = into_row_count.saturating_sub(untaking);
                     new_rows.extend(into.rows().take(start));
                     for (from, into) in from.rows().zip(into.rows().skip(start)) {
-                        new_rows.push(from.undo_take_impl(name, past, sub_index, into, env)?);
+                        new_rows
+                            .push(from.undo_take_impl(name, past, sub_index, sub_end, into, env)?);
                     }
+                } else {
+                    for (from, into) in from.rows().zip(into.rows()) {
+                        new_rows
+                            .push(from.undo_take_impl(name, past, sub_index, sub_end, into, env)?);
+                    }
+                    new_rows.extend(into.rows().skip(untaking));
                 }
                 Array::from_row_arrays(new_rows, env)?
             }
+            _ => unreachable!(),
         })
     }
-    fn undo_drop(self, index: &[isize], into: Self, env: &Uiua) -> UiuaResult<Self> {
-        if self.map_keys().is_some() {
+    fn undo_drop(self, index: &[isize], mut into: Self, env: &Uiua) -> UiuaResult<Self> {
+        if self.meta.map_keys.is_some() {
             return Err(env.error("Cannot undo drop from map array"));
         }
-        let index: Vec<isize> = index
-            .iter()
-            .zip(&into.shape)
-            .map(|(&i, &s)| {
-                if i >= 0 {
-                    (i - s as isize).min(0)
-                } else {
-                    (i + s as isize).max(0)
+        if into.rank() == 0 {
+            into.shape.push(1);
+        }
+        let mut undex = Vec::with_capacity(index.len());
+        let mut end = Vec::with_capacity(index.len());
+        for (&i, &s) in index.iter().zip(&into.shape) {
+            if i >= 0 {
+                undex.push((s as isize - i).max(0) as usize);
+                end.push(true);
+            } else {
+                undex.push((i + s as isize).max(0) as usize);
+                end.push(false);
+            }
+        }
+        self.undo_take_impl("drop", "dropped", &undex, &end, into, env)
+    }
+    fn anti_drop(mut self, mut index: &[isize], env: &Uiua) -> UiuaResult<Self> {
+        let fill = env
+            .array_fill::<T>()
+            .map(|fv| fv.value)
+            .unwrap_or_else(|_| T::proxy().into());
+        if self.shape.len() < index.len() {
+            return Err(env.error(format!(
+                "Index array specifies {} axes, \
+                but the array is rank {}",
+                index.len(),
+                self.shape.len()
+            )));
+        }
+        // Validate fill shape
+        if !self.shape[index.len()..].ends_with(&fill.shape) {
+            return Err(env.error(format!(
+                "Cannot antidrop {} {} of array with \
+                shape {} with fill of shape {}",
+                index.len(),
+                if index.len() == 1 { "axis" } else { "axes" },
+                self.shape,
+                fill.shape
+            )));
+        }
+
+        // Trim trailing zeros
+        while index.last() == Some(&0) {
+            index = &index[..index.len() - 1];
+        }
+
+        if index.iter().all(|&p| p == 0) {
+            return Ok(self);
+        }
+        self.meta.take_sorted_flags();
+
+        // Single axis case
+        if index.len() == 1 {
+            let row_shape = self.shape.row();
+            if !row_shape.ends_with(&fill.shape) {
+                return Err(env.error(format!(
+                    "Cannot antidrop array of shape {} \
+                    with fill of shape {}",
+                    self.shape, fill.shape
+                )));
+            }
+            let n = index[0];
+            let fill_elems = fill.shape.elements();
+            let reps = if fill_elems == 0 {
+                0
+            } else {
+                row_shape.elements() / fill_elems
+            };
+            self.data
+                .extend_repeat_slice(&fill.data, n.unsigned_abs() * reps);
+            if n > 0 {
+                (self.data.as_mut_slice())
+                    .rotate_right(n.unsigned_abs() * reps * fill.shape.elements());
+            }
+            self.shape[0] += n.unsigned_abs();
+            self.validate();
+            return Ok(self);
+        }
+
+        let n = index.len();
+        let contig_row_size: usize = self.shape[n - 1..].iter().product();
+        let mut new_shape = self.shape.clone();
+        for (p, d) in index.iter().zip(&mut *new_shape) {
+            *d += p.unsigned_abs();
+        }
+        let elem_count = validate_size::<T>(new_shape.iter().copied(), env)?;
+        let mut new_data = EcoVec::with_capacity(elem_count);
+        if self.shape.contains(&0) {
+            for _ in 0..elem_count / fill.shape.elements() {
+                new_data.extend_from_slice(&fill.data);
+            }
+            return Ok(Array::new(new_shape, new_data));
+        }
+
+        // Calculate padding numbers
+        let mut slice_sizes = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut size = index[i].unsigned_abs();
+            for j in i + 1..self.shape.len() {
+                size *= index.get(j).copied().unwrap_or(0).unsigned_abs() + self.shape[j];
+            }
+            slice_sizes.push((size / fill.shape.elements()) as isize * index[i].signum());
+        }
+        let cap_size = slice_sizes.remove(0);
+        let sliver_size = slice_sizes.pop().unwrap_or(0);
+        // println!("cap_size: {cap_size}");
+        // println!("sliver_size: {sliver_size}");
+        // println!("slice_sizes: {slice_sizes:?}");
+        let mut curr = vec![0; n - 1];
+        let maxes = self.shape[..n - 1].to_vec();
+        // println!("contig_row_size: {contig_row_size}");
+        // println!("maxes: {maxes:?}");
+        // Add leading cap
+        if cap_size > 0 {
+            extend_repeat_slice(&mut new_data, &fill.data, cap_size.unsigned_abs());
+        }
+        'outer: for i in 0.. {
+            // println!("curr: {curr:?}");
+            // Add leading slices
+            for i in 0..n - 1 {
+                if i != n - 2 && index[i + 1] > 0 && curr[i + 1..].iter().all(|&c| c == 0) {
+                    // println!("  extend {i} {:?}", slice_sizes[i]);
+                    extend_repeat_slice(&mut new_data, &fill.data, slice_sizes[i].unsigned_abs());
                 }
-            })
-            .collect();
-        self.undo_take_impl("drop", "dropped", &index, into, env)
+            }
+            // Add leading sliver
+            if sliver_size > 0 {
+                // println!("  sliver: {}", sliver_size);
+                extend_repeat_slice(&mut new_data, &fill.data, sliver_size.unsigned_abs());
+            }
+            // Add array row
+            new_data.extend_from_slice(&self.data[contig_row_size * i..][..contig_row_size]);
+            // Add trailing sliver
+            if sliver_size < 0 {
+                // println!("  sliver: {}", sliver_size);
+                extend_repeat_slice(&mut new_data, &fill.data, sliver_size.unsigned_abs());
+            }
+            // Add trailing slices
+            for i in 0..n - 1 {
+                if i != n - 2
+                    && (curr[i + 1..].iter().enumerate()).all(|(j, &c)| c == maxes[i + 1 + j] - 1)
+                {
+                    // println!("  extend {i} {:?}", slice_sizes[i]);
+                    if index[i + 1] < 0 {
+                        extend_repeat_slice(
+                            &mut new_data,
+                            &fill.data,
+                            slice_sizes[i].unsigned_abs(),
+                        );
+                    }
+                }
+            }
+            // Increment curr
+            for i in (0..n - 1).rev() {
+                curr[i] += 1;
+                if curr[i] == maxes[i] {
+                    curr[i] = 0;
+                } else {
+                    continue 'outer;
+                }
+            }
+            break;
+        }
+        // Add trailing cap
+        if cap_size < 0 {
+            extend_repeat_slice(&mut new_data, &fill.data, cap_size.unsigned_abs());
+        }
+        Ok(Array::new(new_shape, new_data))
+    }
+    #[track_caller]
+    pub(crate) fn drop_front_n(&mut self, n: usize) {
+        let row_len = self.row_len();
+        let start = n * row_len;
+        self.data = self.data.slice(start..);
+        self.shape[0] -= n;
+    }
+    fn un_take(&mut self, env: &Uiua) -> UiuaResult<Value> {
+        let fill = env
+            .scalar_unfill::<T>()
+            .map_err(|e| env.error(format!("Cannot untake without a fill value{e}")))?
+            .value;
+        if self.shape.contains(&0) {
+            return Ok(Value::from(0.0));
+        }
+        let mut curr_row_len = self.element_count();
+        let mut take_amnt = EcoVec::new();
+        for (i, d) in self.shape.clone().into_iter().enumerate() {
+            let prev_row_len = curr_row_len;
+            curr_row_len /= d;
+            let taken = (self.data.chunks_exact(prev_row_len))
+                .map(|row| {
+                    row.rchunks_exact(curr_row_len)
+                        .take_while(|row| row.iter().all(|x| x.array_eq(&fill)))
+                        .count()
+                })
+                .min()
+                .unwrap();
+            let remaining_per_row = (d - taken) * curr_row_len;
+            if i == 0 {
+                self.data.truncate(remaining_per_row);
+                self.shape[i] -= taken;
+            } else {
+                let max = self.element_count() / prev_row_len;
+                let slice = self.data.as_mut_slice();
+                for j in 1..max {
+                    for k in 0..remaining_per_row {
+                        slice[j * remaining_per_row + k] = slice[j * prev_row_len + k].clone();
+                    }
+                }
+                self.shape[i] -= taken;
+                self.data.truncate(self.shape.elements());
+            }
+            take_amnt.push(taken as f64);
+        }
+        while take_amnt.last() == Some(&0.0) {
+            take_amnt.pop();
+        }
+        for (t, &d) in take_amnt.make_mut().iter_mut().zip(&self.shape) {
+            *t += d as f64;
+        }
+        if take_amnt.len() == 1 {
+            return Ok(take_amnt[0].into());
+        }
+        let mut take_amnt = Value::from(take_amnt);
+        take_amnt.compress();
+        self.validate();
+        Ok(take_amnt)
     }
 }
 
 impl Value {
     /// Use this value to `select` from another
-    pub fn select(&self, from: &Self, env: &Uiua) -> UiuaResult<Self> {
-        let (indices_shape, indices_data) = self.as_shaped_indices(env)?;
-        Ok(match from {
-            Value::Num(a) => a.select(indices_shape, &indices_data, env)?.into(),
-            Value::Byte(a) => op_bytes_ref_retry_fill(
-                a,
-                |a| Ok(a.select(indices_shape, &indices_data, env)?.into()),
-                |a| Ok(a.select(indices_shape, &indices_data, env)?.into()),
-            )?,
-            Value::Complex(a) => a.select(indices_shape, &indices_data, env)?.into(),
-            Value::Char(a) => a.select(indices_shape, &indices_data, env)?.into(),
-            Value::Box(a) => a.select(indices_shape, &indices_data, env)?.into(),
+    pub fn select(self, mut from: Self, env: &Uiua) -> UiuaResult<Self> {
+        from.match_fill(env);
+        let (indices_shape, indices_data) =
+            self.as_shaped_indices(env.is_scalar_filled(&from), env)?;
+        val_as_arr!(from, |a| {
+            let mut a = a;
+            a.select(indices_shape, &indices_data, env).map(Into::into)
         })
     }
     pub(crate) fn undo_select(self, index: Self, into: Self, env: &Uiua) -> UiuaResult<Self> {
-        let (idx_shape, ind) = index.as_shaped_indices(env)?;
+        let mut from = self;
+        let (idx_shape, mut ind) = index.as_shaped_indices(env.is_scalar_filled(&from), env)?;
+        let into_row_count = into.row_count();
+        // Sort indices
         let mut sorted_indices: Vec<_> = ind.iter().copied().enumerate().collect();
-        sorted_indices.sort_unstable_by_key(|(_, index)| *index);
+        sorted_indices.sort_unstable_by_key(|(_, index)| {
+            index_in_bounds(*index, into_row_count).then(|| normalize_index(*index, into_row_count))
+        });
+        // Remove rows that correspond to indices that are out of bounds
+        // This is because those values came from a fill
+        let mut idx_shape = Cow::Borrowed(idx_shape);
+        let reduced = ind.iter().any(|&i| !index_in_bounds(i, into_row_count));
+        if reduced {
+            if from.rank() == 0 {
+                return Ok(into);
+            }
+            let from_row_count = from.row_count();
+            let mut n = 0;
+            sorted_indices.reverse();
+            sorted_indices.retain(|&(i, j)| {
+                let keep = index_in_bounds(j, into_row_count) || i >= from_row_count;
+                if !keep {
+                    from.remove_row(i);
+                    n += 1;
+                }
+                keep
+            });
+            sorted_indices.reverse();
+            from.validate();
+            if idx_shape.is_empty() {
+                idx_shape = Cow::Owned(vec![n]);
+            } else {
+                idx_shape.to_mut()[0] -= n;
+            }
+        }
+        // Ensure there are no duplicate indices
         let depth = idx_shape.len().saturating_sub(1);
+        let from_row_count = from.row_count();
         if sorted_indices.windows(2).any(|win| {
             let (ai, a) = win[0];
             let (bi, b) = win[1];
-            let a = if a >= 0 {
-                a as usize
-            } else {
-                into.row_count() - a.unsigned_abs()
-            };
-            let b = if b >= 0 {
-                b as usize
-            } else {
-                into.row_count() - b.unsigned_abs()
-            };
-            a == b && self.depth_row(depth, ai) != self.depth_row(depth, bi)
+            if !index_in_bounds(a, into_row_count)
+                || !index_in_bounds(b, into_row_count)
+                || ai >= from_row_count
+                || bi >= from_row_count
+            {
+                return false;
+            }
+            let a = normalize_index(a, into_row_count);
+            let b = normalize_index(b, into_row_count);
+            a == b && from.depth_row(depth, ai) != from.depth_row(depth, bi)
         }) {
             return Err(env.error(
                 "Cannot undo selection with duplicate \
                 indices but different values",
             ));
         }
-        self.generic_bin_into(
+        // Update indices
+        if reduced {
+            sorted_indices.sort_unstable_by_key(|(i, _)| *i);
+            ind = sorted_indices.into_iter().map(|(_, i)| i).collect();
+        }
+        from.generic_bin_into(
             into,
-            |a, b| a.undo_select_impl(idx_shape, &ind, b, env).map(Into::into),
-            |a, b| a.undo_select_impl(idx_shape, &ind, b, env).map(Into::into),
-            |a, b| a.undo_select_impl(idx_shape, &ind, b, env).map(Into::into),
-            |a, b| a.undo_select_impl(idx_shape, &ind, b, env).map(Into::into),
-            |a, b| a.undo_select_impl(idx_shape, &ind, b, env).map(Into::into),
+            |a, b| a.undo_select(&idx_shape, &ind, b, env).map(Into::into),
+            |a, b| a.undo_select(&idx_shape, &ind, b, env).map(Into::into),
+            |a, b| a.undo_select(&idx_shape, &ind, b, env).map(Into::into),
+            |a, b| a.undo_select(&idx_shape, &ind, b, env).map(Into::into),
+            |a, b| a.undo_select(&idx_shape, &ind, b, env).map(Into::into),
             |a, b| {
                 env.error(format!(
-                    "Cannot untake {} into {}",
+                    "Cannot undo selection of {} into {}",
                     a.type_name(),
                     b.type_name()
                 ))
             },
         )
     }
+    pub(crate) fn anti_select(self, mut from: Self, env: &Uiua) -> UiuaResult<Self> {
+        from.match_fill(env);
+        let (indices_shape, indices_data) = self.as_shaped_indices(false, env)?;
+        Ok(match from {
+            Value::Num(a) => Value::Num(a.anti_select(indices_shape, &indices_data, env)?),
+            Value::Byte(a) => Value::Byte(a.anti_select(indices_shape, &indices_data, env)?),
+            Value::Complex(a) => {
+                Value::Complex(a.anti_select(indices_shape, &indices_data, env)?)
+            }
+            Value::Char(a) => Value::Char(a.anti_select(indices_shape, &indices_data, env)?),
+            Value::Box(a) => Value::Box(a.anti_select(indices_shape, &indices_data, env)?),
+        })
+    }
+    pub(crate) fn anti_pick(self, mut from: Self, env: &Uiua) -> UiuaResult<Self> {
+        from.match_fill(env);
+        let (indices_shape, indices_data) = self.as_shaped_indices(false, env)?;
+        val_as_arr!(from, |a| a
+            .anti_pick(indices_shape, &indices_data, env)
+            .map(Into::into))
+    }
+}
+
+fn index_in_bounds(index: isize, len: usize) -> bool {
+    let ui = index.unsigned_abs();
+    if index >= 0 {
+        ui < len
+    } else {
+        ui <= len
+    }
+}
+
+#[track_caller]
+fn normalize_index(index: isize, len: usize) -> usize {
+    let ui = index.unsigned_abs();
+    if index >= 0 {
+        ui
+    } else {
+        len - ui
+    }
+}
+
+fn indices_are_total(indices: &[isize], row_count: usize) -> bool {
+    let mut max_normal = 0;
+    let mut set = HashSet::new();
+    for &i in indices {
+        let normalized = normalize_index(i, row_count);
+        if set.insert(normalized) {
+            max_normal = max_normal.max(normalized);
+        }
+    }
+    set.len() == row_count && max_normal == row_count.saturating_sub(1)
 }
 
 impl<T: ArrayValue> Array<T> {
     /// `select` from this array
-    fn select(&self, indices_shape: &[usize], indices: &[isize], env: &Uiua) -> UiuaResult<Self> {
+    fn select(
+        &mut self,
+        indices_shape: &[usize],
+        indices: &[isize],
+        env: &Uiua,
+    ) -> UiuaResult<Self> {
         if indices_shape.len() > 1 {
             let row_count = indices_shape[0];
             let row_len = indices_shape[1..].iter().product();
@@ -796,209 +1250,444 @@ impl<T: ArrayValue> Array<T> {
                 rows.push(self.select(&indices_shape[1..], indices_row, env)?);
             }
             let mut arr = Array::from_row_arrays(rows, env)?;
-            if let Some(label) = &self.meta().label {
-                arr.meta_mut().label = Some(label.clone());
+            if let Some(label) = &self.meta.label {
+                arr.meta.label = Some(label.clone());
             }
             Ok(arr)
         } else {
-            let mut res = self.select_impl(indices, env)?;
-            if indices_shape.is_empty() {
-                res.shape.remove(0);
+            let indices_sorted_up = indices_shape.len() == 1 && indices.is_sorted();
+            let indices_sorted_down =
+                indices_shape.len() == 1 && indices.is_sorted_by(|&a, &b| a >= b);
+            let selected_sorted_up = self.meta.is_sorted_up();
+            let selected_sorted_down = self.meta.is_sorted_down();
+
+            let mut selected = CowSlice::with_capacity(self.row_len() * indices.len());
+            let row_len = self.row_len();
+            let row_count = self.row_count();
+            let fill = env.scalar_fill::<T>().map(|fv| fv.value);
+            let map_keys = self
+                .is_map()
+                .then(|| {
+                    let indices_are_total = indices_are_total(indices, row_count);
+                    if !indices_are_total {
+                        return None;
+                    }
+                    let keys = self.meta.take_map_keys().unwrap().normalized();
+                    Some(val_as_arr!(keys, |keys| {
+                        let mut keys = keys;
+                        keys.select(indices_shape, indices, env).unwrap().into()
+                    }))
+                })
+                .flatten();
+            for &i in indices {
+                let i = if i >= 0 {
+                    let ui = i as usize;
+                    if ui >= row_count {
+                        match &fill {
+                            Ok(fill) => {
+                                selected.extend_repeat(fill, row_len);
+                                continue;
+                            }
+                            Err(e) => {
+                                return Err(env
+                                    .error(format!(
+                                        "Index {} is out of bounds of length {}{e}",
+                                        i, row_count
+                                    ))
+                                    .fill());
+                            }
+                        }
+                    }
+                    ui
+                } else {
+                    match &fill {
+                        Ok(fill) => {
+                            selected.extend_repeat(fill, row_len);
+                            continue;
+                        }
+                        Err(e) => {
+                            let pos_i = (row_count as isize + i) as usize;
+                            if pos_i >= row_count {
+                                return Err(env
+                                    .error(format!(
+                                        "Index {} is out of bounds of length {}{e}",
+                                        i, row_count
+                                    ))
+                                    .fill());
+                            }
+                            pos_i
+                        }
+                    }
+                };
+                let start = i * row_len;
+                let end = start + row_len;
+                selected.extend_from_slice(&self.data[start..end]);
             }
-            Ok(res)
-        }
-    }
-    fn undo_select_impl(
-        &self,
-        indices_shape: &[usize],
-        indices: &[isize],
-        into: Self,
-        env: &Uiua,
-    ) -> UiuaResult<Self> {
-        if indices_shape.len() > 1 {
-            Err(env.error("Cannot undo multi-dimensional selection"))
-        } else {
-            self.undo_select(indices_shape, indices, into, env)
-        }
-    }
-    fn select_impl(&self, indices: &[isize], env: &Uiua) -> UiuaResult<Self> {
-        let mut selected = CowSlice::with_capacity(self.row_len() * indices.len());
-        let row_len = self.row_len();
-        let row_count = self.row_count();
-        for &i in indices {
-            let i = if i >= 0 {
-                let ui = i as usize;
-                if ui >= row_count {
-                    match env.scalar_fill::<T>() {
-                        Ok(fill) => {
-                            selected.extend(repeat(fill).take(row_len));
-                            continue;
-                        }
-                        Err(e) => {
-                            return Err(env
-                                .error(format!(
-                                    "Index {} is out of bounds of length {}{e}",
-                                    i, row_count
-                                ))
-                                .fill());
-                        }
-                    }
-                }
-                ui
+            let mut shape = self.shape.clone();
+            if let Some(s) = shape.get_mut(0) {
+                *s = indices.len();
             } else {
-                let pos_i = (row_count as isize + i) as usize;
-                if pos_i >= row_count {
-                    match env.scalar_fill::<T>() {
-                        Ok(fill) => {
-                            selected.extend(repeat(fill).take(row_len));
-                            continue;
-                        }
-                        Err(e) => {
-                            return Err(env
-                                .error(format!(
-                                    "Index {} is out of bounds of length {}{e}",
-                                    i, row_count
-                                ))
-                                .fill());
-                        }
-                    }
-                }
-                pos_i
-            };
-            let start = i * row_len;
-            let end = start + row_len;
-            selected.extend_from_slice(&self.data[start..end]);
+                shape.push(indices.len());
+            }
+            if indices_shape.is_empty() {
+                shape.remove(0);
+            }
+            let mut array = Array::new(shape, selected);
+            if let Some(map_keys) = map_keys {
+                array.map(map_keys, &()).unwrap();
+            }
+            array.meta.mark_sorted_up(
+                indices_sorted_up && selected_sorted_up
+                    || indices_sorted_down && selected_sorted_down,
+            );
+            array.meta.mark_sorted_down(
+                indices_sorted_up && selected_sorted_down
+                    || indices_sorted_down && selected_sorted_up,
+            );
+            array.validate();
+            Ok(array)
         }
-        let mut shape = self.shape.clone();
-        if let Some(s) = shape.get_mut(0) {
-            *s = indices.len();
-        } else {
-            shape.push(indices.len());
-        }
-        Ok(Array::new(shape, selected))
     }
     fn undo_select(
-        &self,
+        self,
         indices_shape: &[usize],
         indices: &[isize],
         mut into: Self,
         env: &Uiua,
     ) -> UiuaResult<Self> {
-        let shape_is_valid = self.row_count() == indices.len() || indices_shape.is_empty();
-        if !shape_is_valid {
-            return Err(env.error(
-                "Attempted to undo selection, but \
-                the shape of the selected array changed",
-            ));
+        if indices_shape.len() > 1 {
+            return Err(env.error("Cannot undo multi-dimensional selection"));
         }
-        if indices_shape.is_empty() {
-            if self.shape == into.shape[1.min(into.shape.len())..] {
-                undo_select_same_size(once(self.data.as_slice()), indices, &mut into, env)?;
-            } else {
-                let mut from = self.clone();
-                from.shape.insert(0, 1);
-                into = under_select_different_size(&from, indices, &into, env)?;
+        let from = self;
+        let indices_row_count = indices_shape.first().copied().unwrap_or(1);
+        let into_rank = into.rank();
+        let into_row_count = into.row_count();
+        match from.rank().cmp(&into.rank()) {
+            Ordering::Equal => {
+                if !from.shape.iter().skip(1).eq(into.shape.iter().skip(1)) {
+                    let mut original_shape = into.shape.row();
+                    original_shape.insert(0, indices_row_count);
+                    return Err(env.error(format!(
+                        "Attempted to undo selection, but \
+                        the shape of the selected array changed \
+                        from {} to {}",
+                        original_shape, from.shape
+                    )));
+                }
+                if from.row_count() != indices_row_count {
+                    if indices_shape.is_empty() {
+                        // Replacing a row with multiple rows
+                        let i = indices[0];
+                        let i = normalize_index(i, into_row_count);
+                        let into_row_len = into.row_len();
+                        let from_row_count = from.row_count();
+                        let from_element_count = from.element_count();
+                        into.data.as_mut_slice()[i * into_row_len..].rotate_left(into_row_len);
+                        into.data.truncate(into.data.len() - into_row_len);
+                        into.data.extend_from_cowslice(from.data);
+                        into.data.as_mut_slice()[i * into_row_len..]
+                            .rotate_right(from_element_count);
+                        into.shape[0] += from_row_count;
+                        into.shape[0] -= 1;
+                        into.meta.take_sorted_flags();
+                        into.validate();
+                        return Ok(into);
+                    }
+                    if from.row_count() < indices_row_count {
+                        return Err(env.error(format!(
+                            "Attempted to undo selection, but \
+                            the length of the selected array changed \
+                            from {indices_row_count} to {}",
+                            from.row_count()
+                        )));
+                    }
+                }
+                // Replacing multiple rows with multiple rows
+                let row_len = from.row_len();
+                let data = into.data.as_mut_slice();
+                for (&i, row) in indices.iter().zip(from.row_slices()) {
+                    let i = normalize_index(i, into_row_count);
+                    data[i * row_len..][..row_len].clone_from_slice(row);
+                }
             }
-        } else if self.shape[1..] == into.shape[1..] {
-            undo_select_same_size(self.row_slices(), indices, &mut into, env)?;
-        } else {
-            into = under_select_different_size(self, indices, &into, env)?;
+            Ordering::Less => {
+                // Replacing multiple rows with a repeated row
+                if !into.shape.ends_with(&from.shape) {
+                    return Err(env.error(format!(
+                        "Cannot undo select of array with shape {} \
+                        into array with shape {}",
+                        from.shape, into.shape
+                    )));
+                }
+                let n: usize = into.shape[1..into.rank() - from.rank()].iter().product();
+                let row_len = from.element_count();
+                let data = into.data.as_mut_slice();
+                for &i in indices {
+                    let i = normalize_index(i, into_row_count);
+                    for j in 0..n {
+                        data[i * n * row_len + j * row_len..][..row_len]
+                            .clone_from_slice(&from.data);
+                    }
+                }
+            }
+            Ordering::Greater => {
+                // Replacing each of multiple rows with multiple rows
+                if from.row_count() != indices_row_count {
+                    return Err(env.error(format!(
+                        "Attempted to undo selection, but \
+                        the length of the selected array changed \
+                        from {indices_row_count} to {}",
+                        from.row_count()
+                    )));
+                }
+                if from.rank() - into.rank() > 1
+                    || !from.shape.iter().skip(2).eq(into.shape.iter().skip(1))
+                {
+                    return Err(env.error(format!(
+                        "Cannot undo select of array with shape {} \
+                        into array with shape {}",
+                        from.shape, into.shape
+                    )));
+                }
+                let mut index_row_pairs: Vec<_> = indices
+                    .iter()
+                    .zip(from.into_rows())
+                    .map(|(i, row)| (normalize_index(*i, into_row_count), row))
+                    .collect();
+                index_row_pairs.sort_unstable_by_key(|(i, _)| *i);
+                let mut index_row_pairs = index_row_pairs.into_iter();
+                let mut rows = Vec::with_capacity(into_row_count);
+                let mut curr = None;
+                for (i, into_row) in into.into_rows().enumerate() {
+                    curr = curr.or_else(|| index_row_pairs.next());
+                    if curr.as_ref().is_some_and(|(j, _)| i == *j) {
+                        let (_, from_row) = curr.take().unwrap();
+                        rows.extend(from_row.into_rows());
+                    } else {
+                        rows.push(into_row);
+                    }
+                }
+                into = Array::from_row_arrays_infallible(rows);
+                if into_rank == 0 {
+                    into.shape = Shape::SCALAR;
+                }
+            }
         }
+        into.meta.take_sorted_flags();
         Ok(into)
     }
-}
-
-fn undo_select_same_size<'a, T: ArrayValue>(
-    row_slices: impl Iterator<Item = &'a [T]>,
-    indices: &[isize],
-    into: &mut Array<T>,
-    env: &Uiua,
-) -> UiuaResult {
-    let into_row_len = into.row_len();
-    let into_row_count = into.row_count();
-    let into_data = into.data.as_mut_slice();
-    for (&index, row) in indices.iter().zip(row_slices) {
-        let i = if index >= 0 {
-            let uns_index = index as usize;
-            if uns_index >= into_row_count {
-                return Err(env
-                    .error(format!(
-                        "Index {} is out of bounds of length {}",
-                        index, into_row_count
-                    ))
-                    .fill());
+    fn anti_select(
+        self,
+        indices_shape: &[usize],
+        indices: &[isize],
+        env: &Uiua,
+    ) -> UiuaResult<Self> {
+        // Validate shape
+        if !self.shape.starts_with(indices_shape) {
+            return Err(env.error(format!(
+                "Cannot invert selection of shape {} array with shape {} indices",
+                self.shape,
+                FormatShape(indices_shape)
+            )));
+        }
+        let row_shape: Shape = self.shape[indices_shape.len()..].into();
+        // Normalize indices
+        if let Some(i) = indices
+            .iter()
+            .find(|&&i| i < 0 && i.unsigned_abs() > indices.len())
+        {
+            return Err(env.error(format!(
+                "Cannot invert selection with negative index {i}, \
+                which is greater than the number of indices {}",
+                indices.len()
+            )));
+        }
+        let normalized_indices: Vec<usize> = indices
+            .iter()
+            .map(|&i| normalize_index(i, indices.len()))
+            .collect();
+        let row_count = normalized_indices
+            .iter()
+            .max()
+            .map(|&max| max + 1)
+            .unwrap_or(0);
+        // Check indices totality
+        let indices_are_total = indices_are_total(indices, row_count);
+        // Get fill if not total
+        let mut fill = None;
+        let mut fill_rep = 0;
+        if !indices_are_total {
+            let fill_arr = env.array_fill::<T>().map(|fv| fv.value).map_err(|e| {
+                env.error(format!(
+                    "Cannot invert selection of non-total indices without a fill{e}"
+                ))
+                .fill()
+            })?;
+            if !row_shape.ends_with(&fill_arr.shape) {
+                return Err(env.error(format!(
+                    "Cannot invert selection of shape {} array with shape {} fill",
+                    self.shape, fill_arr.shape
+                )));
             }
-            uns_index
+            fill_rep = row_shape[..row_shape.len() - fill_arr.shape.len()]
+                .iter()
+                .product();
+            fill = Some(fill_arr);
+        }
+        // Rise indices
+        let mut indices_rise: Vec<usize> = (0..normalized_indices.len()).collect();
+        indices_rise.sort_unstable_by_key(|&i| normalized_indices[i]);
+        let row_elems = row_shape.elements();
+        // Init buffer
+        let mut data = EcoVec::<T>::with_capacity(row_count * row_shape.elements());
+        let mut next = 0;
+        // Unselect
+        for rise in indices_rise {
+            let i = normalized_indices[rise];
+            match i.cmp(&next) {
+                Ordering::Greater => {
+                    for _ in next..i {
+                        for _ in 0..fill_rep {
+                            data.extend_from_slice(&fill.as_ref().unwrap().data);
+                        }
+                    }
+                }
+                Ordering::Less
+                    if !(data[data.len() - row_elems..].iter())
+                        .zip(&self.data[rise * row_elems..][..row_elems])
+                        .all(|(a, b)| a.array_eq(b)) =>
+                {
+                    return Err(env.error(
+                        "Cannot invert selection with duplicate indices but different values",
+                    ));
+                }
+                Ordering::Less => continue,
+                Ordering::Equal => {}
+            }
+            data.extend_from_slice(&self.data[rise * row_elems..][..row_elems]);
+            next = i + 1;
+        }
+        let mut shape = row_shape;
+        shape.insert(0, row_count);
+        Ok(Array::new(shape, data))
+    }
+    fn anti_pick(self, indices_shape: &[usize], indices: &[isize], env: &Uiua) -> UiuaResult<Self> {
+        // Validate shape
+        let cell_shape = if let [init @ .., _] = indices_shape {
+            // if self.shape.len() < init.len() {
+            if !self.shape.starts_with(init) {
+                return Err(env.error(format!(
+                    "Cannot invert pick of shape {} array with shape {} indices",
+                    self.shape,
+                    FormatShape(indices_shape)
+                )));
+            }
+            Shape::from(&self.shape[init.len()..])
         } else {
-            let pos_i = (into_row_count as isize + index) as usize;
-            if pos_i >= into_row_count {
-                return Err(env
-                    .error(format!(
-                        "Index {} is out of bounds of length {}",
-                        index, into_row_count
-                    ))
-                    .fill());
-            }
-            pos_i
+            self.shape.clone()
         };
-        let start = i * into_row_len;
-        let end = start + into_row_len;
-        for (i, x) in (start..end).zip(row) {
-            into_data[i] = x.clone();
+        let cell_size: usize = cell_shape.iter().product();
+        let index_size = indices_shape.last().copied().unwrap_or(1);
+        if indices.iter().any(|&i| i < 0) {
+            return Err(env.error("Cannot invert pick with negative indices"));
         }
-    }
-    Ok(())
-}
-
-fn under_select_different_size<T: ArrayValue>(
-    from: &Array<T>,
-    indices: &[isize],
-    into: &Array<T>,
-    env: &Uiua,
-) -> UiuaResult<Array<T>> {
-    let mut abs_indices: Vec<usize> = Vec::with_capacity(indices.len());
-    for &index in indices {
-        if index >= 0 {
-            let index = index as usize;
-            if index >= into.row_count() {
-                return Err(env
-                    .error(format!(
-                        "Index {} is out of bounds of length {}",
-                        index,
-                        into.row_count()
-                    ))
-                    .fill());
+        // Normalize indices
+        let normalized_indices: Vec<usize> = indices
+            .iter()
+            .map(|&i| normalize_index(i, indices.len()))
+            .collect();
+        let outer_rank = indices_shape.last().copied().unwrap_or(1);
+        let mut outer_shape = Shape::from_iter(repeat_n(0, outer_rank));
+        if !normalized_indices.is_empty() {
+            for index in normalized_indices.chunks_exact(index_size) {
+                for (d, &i) in outer_shape.iter_mut().zip(index) {
+                    *d = i.max(*d);
+                }
             }
-            abs_indices.push(index);
-        } else {
-            let pos_i = (into.row_count() as isize + index) as usize;
-            if pos_i >= into.row_count() {
-                return Err(env
-                    .error(format!(
-                        "Index {} is out of bounds of length {}",
-                        index,
-                        into.row_count()
-                    ))
-                    .fill());
+            for d in outer_shape.iter_mut() {
+                *d += 1;
             }
-            abs_indices.push(pos_i);
         }
-    }
-    abs_indices.sort_unstable();
-    let mut new_rows = Vec::new();
-    let mut i = 0;
-    let mut from_rows = from.rows();
-    for index in abs_indices {
-        while i < index {
-            new_rows.push(into.row(i));
-            i += 1;
+        let outer_size: usize = outer_shape.iter().product();
+        if indices.is_empty() {
+            return Ok(if indices_shape == [0] {
+                self
+            } else {
+                let mut shape = outer_shape;
+                shape.extend(cell_shape);
+                Array::new(shape, [])
+            });
         }
-        new_rows.extend(from_rows.next().into_iter().flat_map(Array::into_rows));
-        i += 1;
+        // Check indices totality
+        let mut set = HashSet::new();
+        let indices_are_total = indices.len() / index_size == outer_size
+            && normalized_indices
+                .chunks_exact(index_size)
+                .all(|i| set.insert(i));
+        let mut fill = None;
+        let mut fill_rep = 0;
+        // Get fill if not total
+        if !indices_are_total {
+            let fill_arr = env.array_fill::<T>().map(|fv| fv.value).map_err(|e| {
+                env.error(format!(
+                    "Cannot invert pick of non-total indices without a fill{e}"
+                ))
+                .fill()
+            })?;
+            if !cell_shape.ends_with(&fill_arr.shape) {
+                return Err(env.error(format!(
+                    "Cannot invert pick of shape {} array with shape {} fill",
+                    self.shape, fill_arr.shape
+                )));
+            }
+            fill_rep = cell_shape[..cell_shape.len() - fill_arr.shape.len()]
+                .iter()
+                .product();
+            fill = Some(fill_arr);
+        }
+        // Rise indices
+        let mut indices_rise: Vec<usize> = (0..normalized_indices.len() / index_size).collect();
+        indices_rise.sort_unstable_by_key(|&i| &normalized_indices[i * index_size..][..index_size]);
+        // Init buffer
+        let mut data = EcoVec::<T>::with_capacity(outer_size * cell_size);
+        let mut next = 0;
+        // Unpick
+        for rise in indices_rise {
+            let mut i = 0;
+            let mut stride = 1;
+            let index = &normalized_indices[rise * index_size..];
+            for (&d, &j) in outer_shape.iter().zip(index).rev() {
+                i += stride * j;
+                stride *= d;
+            }
+            if i > next {
+                for _ in next..i {
+                    for _ in 0..fill_rep {
+                        data.extend_from_slice(&fill.as_ref().unwrap().data);
+                    }
+                }
+            } else if i < next
+                && !(data[data.len() - cell_size..].iter())
+                    .zip(&self.data[rise * cell_size..][..cell_size])
+                    .all(|(a, b)| a.array_eq(b))
+            {
+                return Err(env.error(
+                    "Cannot invert pick with duplicate \
+                    indices but different values",
+                ));
+            }
+            data.extend_from_slice(&self.data[rise * cell_size..][..cell_size]);
+            next = i + 1;
+        }
+        if outer_size > next {
+            for _ in next..outer_size {
+                for _ in 0..fill_rep {
+                    data.extend_from_slice(&fill.as_ref().unwrap().data);
+                }
+            }
+        }
+        let mut shape = outer_shape;
+        shape.extend(cell_shape);
+        Ok(Array::new(shape, data))
     }
-    while i < into.row_count() {
-        new_rows.push(into.row(i));
-        i += 1;
-    }
-    Array::from_row_arrays(new_rows, env)
 }

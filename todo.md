@@ -1,25 +1,68 @@
 # Uiua Todo
 
-- 0.10
-  - Release it!
-- 0.11
-  - Non-`|2.1` `reduce`
-  - `un insert` pattern
-  - Allow warnings to be disabled
-  - List-filled `keep`
-  - `duplicate` and `over` patterns
-  - Spatial thinking tutorial/blog
-  - Full HTTPS support
-  - System functions
-    - Excel
-- Change how functions are compiled so that compiled-out functions don't end up in the assembly
-- Multimedia
-  - Sound input
-  - Webcam input
+# 0.16
+- Mixed subscripts
+  - `bracket`
+  - `rows`/`inventory`
+  - `each`
+- Streaming gif and audio encoding
+- Bottom subscripts
+- Stabilize inline macros
+- Prevent `&gifs` from exceding execution time
+- See if pad mem limit can be increased
+- Optional arguments
+- Line number signatures in pad
+- Rewrite parts of tutorial to use `backward` instead of `flip`
+- Compile-time code string evaluation?
+- Reserved modifier glyphs?
+- Implement some `under` inverses in terms of `un by`, rather than the other way around?
+- `un`/`anti` `stencil`
+
+## Planned Features
+Features that are planned to be implemented in the future.
+
+- Stackless execution trees?
+- Step debugging
+- Better compiler IR sytem
+  - Make the stack only exist at compile time?
+- Dead code elimination
+  - Eliminate unused anonymous functions
+- Dynamic modules
+  - A system by which the public interface of a module can be specified
+  - Instances of a dynamic module can be loaded at runtime
+  - Enabled things from simple config files to game mods
 - System APIs
   - UDP Sockets
-- Documentation
-  - System functions
+    - `&udpb` to bind a socket
+    - `&udpc` to connect a socket?
+    - `&udpr` to receive data from a socket
+      - Returns both data and source address
+    - `&udps` to send data to a socket
+      - Takes both data and destination address
+    - Change `&tcpsnb`, `&tcpsrt`, `&tcpswt` to work for UDP sockets as well
+      - Rename them
+  - File metadata
+    - `&fmeta` to get metadata about a file
+    - Should somehow provide:
+      - size
+      - kind (file, directory, symlink)
+      - create/modify/access times
+      - permissions
+    - It's possible this should be multiple functions
+      - `&fsize`
+      - `&fkind`
+      - `&ftime`
+      - `&fperm`
+
+## Potential Features
+Features that could be implemented, but are not currently planned.
+
+- Channels
+- Multimedia
+  - Sound input
+    - Something akin to `&ast` but for input
+    - `&arec` to record audio for some duration
+      - Maybe it should be a modifier that records until its function returns false?
 
 ## Open to Implementation
 
@@ -30,7 +73,5 @@ Feel free to make PRs to the list itself as well.
 - Better complex `⌈`/`⌊`/`⁅`/`◿`, `<`/`>`/`≤`/`≥`, `↥`/`↧`
 - Pad link from Gist
 - Additional optimizations
-  - `≡F◫`
-  - `/F◫`
   - `/F⇌`
   - `⍜⇌/F`

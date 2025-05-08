@@ -1,34 +1,63 @@
 //! Algorithms for performing operations on arrays
 
 use std::{
+    cell::RefCell,
     cmp::Ordering,
     convert::Infallible,
-    fmt,
+    env, fmt,
     hash::{Hash, Hasher},
     iter,
     mem::size_of,
+    ops::Deref,
     option,
 };
 
+use ecow::{EcoString, EcoVec};
 use tinyvec::TinyVec;
 
 use crate::{
-    Array, ArrayValue, CodeSpan, ExactDoubleIterator, Function, Inputs, PersistentMeta, Shape,
-    Signature, Span, TempStack, Uiua, UiuaError, UiuaResult, Value,
+    cowslice::ecovec_extend_cowslice, fill::FillValue, grid_fmt::GridFmt, Array, ArrayValue, Boxed,
+    CodeSpan, Complex, ExactDoubleIterator, Inputs, Ops, PersistentMeta, Shape, SigNode, Signature,
+    Span, Uiua, UiuaError, UiuaErrorKind, UiuaResult, Value,
 };
 
 mod dyadic;
-pub(crate) mod invert;
+pub mod encode;
+pub mod groups;
 pub mod loops;
-pub(crate) mod map;
+pub mod map;
+pub mod media;
 mod monadic;
+pub mod path;
 pub mod pervade;
 pub mod reduce;
+pub mod stencil;
 pub mod table;
+pub mod tuples;
 pub mod zip;
 
+pub(crate) fn get_ops<const N: usize>(
+    ops: EcoVec<SigNode>,
+    env: &Uiua,
+) -> UiuaResult<[SigNode; N]> {
+    ops.try_into().map_err(|ops: EcoVec<SigNode>| {
+        env.error(if ops.len() < N {
+            #[cfg(debug_assertions)]
+            panic!("Not enough operands");
+            #[cfg(not(debug_assertions))]
+            "Not enough operands. This is a bug in the interpreter."
+        } else {
+            "Too many operands.  This is a bug in the interpreter."
+        })
+    })
+}
+
+pub trait Indexable: IntoIterator + Deref<Target = [Self::Item]> {}
+
+impl<T> Indexable for T where T: IntoIterator + Deref<Target = [T::Item]> {}
+
 type MultiOutput<T> = TinyVec<[T; 1]>;
-fn multi_output<T: Clone + Default>(n: usize, val: T) -> MultiOutput<T> {
+pub(crate) fn multi_output<T: Clone + Default>(n: usize, val: T) -> MultiOutput<T> {
     let mut vec = TinyVec::with_capacity(n);
     if n == 0 {
         return vec;
@@ -58,18 +87,97 @@ fn max_shape(a: &[usize], b: &[usize]) -> Shape {
     new_shape
 }
 
-pub fn validate_size<T>(elements: usize, env: &Uiua) -> UiuaResult {
-    let elem_size = size_of::<T>();
-    let size = elements * elem_size;
-    let max_mega = if cfg!(target_arch = "wasm32") {
-        256
-    } else {
-        4096
-    };
-    if size > max_mega * 1024usize.pow(2) {
-        return Err(env.error(format!("Array of {} elements would be too large", elements)));
+#[derive(Debug)]
+pub struct SizeError(f64);
+
+impl fmt::Display for SizeError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "Array of {} elements would be too large",
+            self.0.grid_string(false)
+        )
     }
-    Ok(())
+}
+
+impl std::error::Error for SizeError {}
+
+#[derive(Debug)]
+pub enum FillShapeError {
+    Size(SizeError),
+    Shape(&'static str),
+}
+
+impl From<SizeError> for FillShapeError {
+    fn from(e: SizeError) -> Self {
+        Self::Size(e)
+    }
+}
+
+impl fmt::Display for FillShapeError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Size(e) => e.fmt(f),
+            Self::Shape(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+pub fn validate_size<T>(sizes: impl IntoIterator<Item = usize>, env: &Uiua) -> UiuaResult<usize> {
+    validate_size_of::<T>(sizes).map_err(|e| env.error(e))
+}
+
+pub fn validate_size_of<T>(sizes: impl IntoIterator<Item = usize>) -> Result<usize, SizeError> {
+    validate_size_impl(size_of::<T>(), sizes)
+}
+
+pub(crate) fn validate_size_impl(
+    elem_size: usize,
+    sizes: impl IntoIterator<Item = usize>,
+) -> Result<usize, SizeError> {
+    let mut elements = 1.0;
+    for size in sizes {
+        if size == 0 {
+            return Ok(0);
+        }
+        elements *= size as f64;
+    }
+    let size = elements * elem_size as f64;
+
+    thread_local! {
+        static MAX_MB: RefCell<Option<f64>> = const { RefCell::new(None) };
+    }
+
+    let max_mb = MAX_MB.with(|max_mega| {
+        *max_mega.borrow_mut().get_or_insert_with(|| {
+            env::var("UIUA_MAX_MB")
+                .ok()
+                .and_then(|s| {
+                    s.parse::<f64>()
+                        .inspect_err(|e| {
+                            eprintln!("Failed to parse UIUA_MAX_MB={s}: {e}");
+                        })
+                        .ok()
+                        .and_then(|f| {
+                            if f <= 0.0 {
+                                eprintln!("UIUA_MAX_MB must be positive, but it is {f}");
+                                None
+                            } else {
+                                Some(f)
+                            }
+                        })
+                })
+                .unwrap_or(if cfg!(target_pointer_width = "32") {
+                    256.0
+                } else {
+                    4096.0
+                })
+        })
+    });
+    if size > max_mb * 1024f64.powi(2) {
+        return Err(SizeError(elements));
+    }
+    Ok(elements as usize)
 }
 
 pub trait ErrorContext {
@@ -87,10 +195,12 @@ impl ErrorContext for Uiua {
 impl ErrorContext for (&CodeSpan, &Inputs) {
     type Error = UiuaError;
     fn error(&self, msg: impl ToString) -> Self::Error {
-        UiuaError::Run(
-            Span::Code(self.0.clone()).sp(msg.to_string()),
-            self.1.clone().into(),
-        )
+        UiuaErrorKind::Run {
+            message: Span::Code(self.0.clone()).sp(msg.to_string()),
+            info: Vec::new(),
+            inputs: self.1.clone().into(),
+        }
+        .into()
     }
 }
 
@@ -101,13 +211,25 @@ impl ErrorContext for () {
     }
 }
 
-pub trait FillError {
+pub struct IgnoreError;
+impl ErrorContext for IgnoreError {
+    type Error = ();
+    fn error(&self, _: impl ToString) -> Self::Error {}
+}
+
+pub trait FillError: fmt::Debug {
     fn is_fill(&self) -> bool;
+}
+
+impl FillError for () {
+    fn is_fill(&self) -> bool {
+        false
+    }
 }
 
 impl FillError for UiuaError {
     fn is_fill(&self) -> bool {
-        UiuaError::is_fill(self)
+        self.is_fill
     }
 }
 
@@ -118,14 +240,42 @@ impl FillError for Infallible {
 }
 
 pub trait FillContext: ErrorContext {
-    fn scalar_fill<T: ArrayValue>(&self) -> Result<T, &'static str>;
+    fn scalar_fill<T: ArrayValue>(&self) -> Result<FillValue<T>, &'static str>;
+    fn array_fill<T: ArrayValue>(&self) -> Result<FillValue<Array<T>>, &'static str>;
+    fn scalar_unfill<T: ArrayValue>(&self) -> Result<FillValue<T>, &'static str>;
+    fn array_unfill<T: ArrayValue>(&self) -> Result<FillValue<Array<T>>, &'static str>;
+    fn either_array_fill<T: ArrayValue>(&self) -> Result<FillValue<Array<T>>, &'static str> {
+        self.array_fill::<T>().or_else(|_| self.array_unfill::<T>())
+    }
     fn fill_error(error: Self::Error) -> Self::Error;
     fn is_fill_error(error: &Self::Error) -> bool;
+    /// There is a number fill but not a byte fill
+    fn number_only_fill(&self) -> bool {
+        self.array_fill::<f64>().is_ok() && self.array_fill::<u8>().is_err()
+    }
+    fn is_scalar_filled(&self, val: &Value) -> bool {
+        match val {
+            Value::Num(_) => self.scalar_fill::<f64>().is_ok(),
+            Value::Byte(_) => self.scalar_fill::<u8>().is_ok(),
+            Value::Complex(_) => self.scalar_fill::<Complex>().is_ok(),
+            Value::Char(_) => self.scalar_fill::<char>().is_ok(),
+            Value::Box(_) => self.scalar_fill::<Boxed>().is_ok(),
+        }
+    }
 }
 
 impl FillContext for Uiua {
-    fn scalar_fill<T: ArrayValue>(&self) -> Result<T, &'static str> {
-        T::get_fill(self)
+    fn scalar_fill<T: ArrayValue>(&self) -> Result<FillValue<T>, &'static str> {
+        T::get_scalar_fill(&self.fill())
+    }
+    fn array_fill<T: ArrayValue>(&self) -> Result<FillValue<Array<T>>, &'static str> {
+        T::get_array_fill(&self.fill())
+    }
+    fn scalar_unfill<T: ArrayValue>(&self) -> Result<FillValue<T>, &'static str> {
+        T::get_scalar_fill(&self.unfill())
+    }
+    fn array_unfill<T: ArrayValue>(&self) -> Result<FillValue<Array<T>>, &'static str> {
+        T::get_array_fill(&self.unfill())
     }
     fn fill_error(error: Self::Error) -> Self::Error {
         error.fill()
@@ -136,8 +286,17 @@ impl FillContext for Uiua {
 }
 
 impl FillContext for () {
-    fn scalar_fill<T: ArrayValue>(&self) -> Result<T, &'static str> {
+    fn scalar_fill<T: ArrayValue>(&self) -> Result<FillValue<T>, &'static str> {
         Err(". No fill is set.")
+    }
+    fn array_fill<T: ArrayValue>(&self) -> Result<FillValue<Array<T>>, &'static str> {
+        Err(". No fill is set.")
+    }
+    fn scalar_unfill<T: ArrayValue>(&self) -> Result<FillValue<T>, &'static str> {
+        Err(". No unfill is set.")
+    }
+    fn array_unfill<T: ArrayValue>(&self) -> Result<FillValue<Array<T>>, &'static str> {
+        Err(". No unfill is set.")
     }
     fn fill_error(error: Self::Error) -> Self::Error {
         error
@@ -148,14 +307,23 @@ impl FillContext for () {
 }
 
 impl FillContext for (&CodeSpan, &Inputs) {
-    fn scalar_fill<T: ArrayValue>(&self) -> Result<T, &'static str> {
+    fn scalar_fill<T: ArrayValue>(&self) -> Result<FillValue<T>, &'static str> {
         Err(". No fill is set.")
+    }
+    fn array_fill<T: ArrayValue>(&self) -> Result<FillValue<Array<T>>, &'static str> {
+        Err(". No fill is set.")
+    }
+    fn scalar_unfill<T: ArrayValue>(&self) -> Result<FillValue<T>, &'static str> {
+        Err(". No unfill is set.")
+    }
+    fn array_unfill<T: ArrayValue>(&self) -> Result<FillValue<Array<T>>, &'static str> {
+        Err(". No unfill is set.")
     }
     fn fill_error(error: Self::Error) -> Self::Error {
         error.fill()
     }
     fn is_fill_error(error: &Self::Error) -> bool {
-        error.is_fill()
+        error.is_fill
     }
 }
 
@@ -168,38 +336,27 @@ fn fill_value_shape<C>(
     target: &Shape,
     expand_fixed: bool,
     ctx: &C,
-) -> Result<(), C::Error>
+) -> Result<(), FillShapeError>
 where
     C: FillContext,
 {
+    val.match_fill(ctx);
     match val {
         Value::Num(arr) => fill_array_shape(arr, target, expand_fixed, ctx),
-        Value::Byte(arr) => {
-            *val = op_bytes_retry_fill(
-                arr.clone(),
-                |mut arr| {
-                    fill_array_shape(&mut arr, target, expand_fixed, ctx)?;
-                    Ok(arr.into())
-                },
-                |mut arr| {
-                    fill_array_shape(&mut arr, target, expand_fixed, ctx)?;
-                    Ok(arr.into())
-                },
-            )?;
-            Ok(())
-        }
+        Value::Byte(arr) => fill_array_shape(arr, target, expand_fixed, ctx),
         Value::Complex(arr) => fill_array_shape(arr, target, expand_fixed, ctx),
         Value::Char(arr) => fill_array_shape(arr, target, expand_fixed, ctx),
         Value::Box(arr) => fill_array_shape(arr, target, expand_fixed, ctx),
     }
 }
 
+/// The error is a tuple of the size of an array that would be too large and the error message
 fn fill_array_shape<T, C>(
     arr: &mut Array<T>,
     target: &Shape,
     expand_fixed: bool,
     ctx: &C,
-) -> Result<(), C::Error>
+) -> Result<(), FillShapeError>
 where
     T: ArrayValue,
     C: FillContext,
@@ -208,22 +365,22 @@ where
         return Ok(());
     }
     if expand_fixed && arr.row_count() == 1 && ctx.scalar_fill::<T>().is_err() {
-        let fixes = (arr.shape.iter())
-            .take_while(|&&dim| dim == 1)
-            .count()
-            .min(arr.shape.len());
-        let same_under_fixes = (target.iter().rev())
-            .zip(arr.shape[fixes..].iter().rev())
+        let mut fixes = (arr.shape.iter()).take_while(|&&dim| dim == 1).count();
+        if fixes == arr.rank() {
+            fixes = (fixes - 1).max(1)
+        }
+        let same_under_fixes = (target.iter().skip(fixes))
+            .zip(arr.shape[fixes..].iter())
             .all(|(b, a)| b == a);
         if same_under_fixes {
             arr.shape.drain(..fixes);
             if target.len() >= fixes {
                 for &dim in target.iter().take(fixes).rev() {
-                    arr.reshape_scalar(Ok(dim as isize));
+                    arr.reshape_scalar_integer(dim, None)?;
                 }
-            } else if arr.shape() == target {
+            } else if arr.shape == *target {
                 for &dim in target.iter().cycle().take(fixes) {
-                    arr.reshape_scalar(Ok(dim as isize));
+                    arr.reshape_scalar_integer(dim, None)?;
                 }
             }
         }
@@ -233,18 +390,18 @@ where
     }
     // Fill in missing rows
     let target_row_count = target.first().copied().unwrap_or(1);
-    let mut fill_error = None;
+    let mut res = Ok(());
     match arr.row_count().cmp(&target_row_count) {
         Ordering::Less => match ctx.scalar_fill() {
             Ok(fill) => {
-                let mut target_shape = arr.shape().to_vec();
+                let mut target_shape = arr.shape.to_vec();
                 target_shape[0] = target_row_count;
                 arr.fill_to_shape(&target_shape, fill);
             }
-            Err(e) => fill_error = Some(e),
+            Err(e) => res = Err(FillShapeError::Shape(e)),
         },
         Ordering::Greater => {}
-        Ordering::Equal => fill_error = Some(""),
+        Ordering::Equal => res = Err(FillShapeError::Shape("")),
     }
     if shape_prefixes_match(&arr.shape, target) {
         return Ok(());
@@ -256,36 +413,28 @@ where
                 let mut target_shape = arr.shape.clone();
                 target_shape.insert(0, target_row_count);
                 arr.fill_to_shape(&target_shape, fill);
-                fill_error = None;
+                res = Ok(());
             }
-            Err(e) => fill_error = Some(e),
+            Err(e) => res = Err(FillShapeError::Shape(e)),
         },
         Ordering::Greater => {}
         Ordering::Equal => {
-            let target_shape = max_shape(arr.shape(), target);
-            if arr.shape() != *target_shape {
+            let target_shape = max_shape(&arr.shape, target);
+            if arr.shape != *target_shape {
                 match ctx.scalar_fill() {
                     Ok(fill) => {
                         arr.fill_to_shape(&target_shape, fill);
-                        fill_error = None;
+                        res = Ok(());
                     }
-                    Err(e) => fill_error = Some(e),
+                    Err(e) => res = Err(FillShapeError::Shape(e)),
                 }
             }
         }
     }
-    if !shape_prefixes_match(&arr.shape, target) && fill_error.is_none() {
-        fill_error = Some("");
+    if !shape_prefixes_match(&arr.shape, target) && res.is_ok() {
+        res = Err(FillShapeError::Shape(""));
     }
-    if let Some(e) = fill_error {
-        return Err(C::fill_error(ctx.error(format!(
-            "Shapes {} and {} do not match{e}",
-            arr.shape(),
-            target,
-        ))));
-    }
-
-    Ok(())
+    res
 }
 
 pub(crate) fn fill_value_shapes<C>(
@@ -297,209 +446,30 @@ pub(crate) fn fill_value_shapes<C>(
 where
     C: FillContext,
 {
-    let a_err = fill_value_shape(a, b.shape(), expand_fixed, ctx).err();
-    let b_err = fill_value_shape(b, a.shape(), expand_fixed, ctx).err();
+    let a_err = fill_value_shape(a, &b.shape, expand_fixed, ctx).err();
+    let b_err = fill_value_shape(b, &a.shape, expand_fixed, ctx).err();
 
-    if shape_prefixes_match(a.shape(), b.shape())
-        || !expand_fixed && (a.shape().starts_with(&[1]) || b.shape().starts_with(&[1]))
+    if shape_prefixes_match(&a.shape, &b.shape)
+        || !expand_fixed && (a.shape.starts_with(&[1]) || b.shape.starts_with(&[1]))
     {
         Ok(())
-    } else if let Some(e) = a_err.or(b_err) {
-        Err(e)
     } else {
-        Err(C::fill_error(ctx.error(format!(
-            "Shapes {} and {} do not match",
-            a.shape(),
-            b.shape(),
-        ))))
+        Err(C::fill_error(ctx.error(match (a_err, b_err) {
+            (Some(FillShapeError::Size(e)), _) | (_, Some(FillShapeError::Size(e))) => {
+                e.to_string()
+            }
+            (Some(e), _) | (_, Some(e)) => {
+                format!("Shapes {} and {} do not match{e}", a.shape, b.shape)
+            }
+            (None, None) => {
+                format!("Shapes {} and {} do not match", a.shape, b.shape)
+            }
+        })))
     }
-}
-
-pub(crate) fn fill_array_shapes<A, B, C>(
-    a: &mut Array<A>,
-    b: &mut Array<B>,
-    ctx: &C,
-) -> Result<(), C::Error>
-where
-    A: ArrayValue,
-    B: ArrayValue,
-    C: FillContext,
-{
-    let a_err = fill_array_shape(a, b.shape(), true, ctx).err();
-    let b_err = fill_array_shape(b, a.shape(), true, ctx).err();
-
-    if shape_prefixes_match(&a.shape, &b.shape) {
-        Ok(())
-    } else if let Some(e) = a_err.or(b_err) {
-        Err(e)
-    } else {
-        Err(C::fill_error(ctx.error(format!(
-            "Shapes {} and {} do not match",
-            a.shape(),
-            b.shape(),
-        ))))
-    }
-}
-
-// pub(crate) fn fill_array_shapes<A, B, C>(
-//     a: &mut Array<A>,
-//     b: &mut Array<B>,
-//     ctx: &C,
-// ) -> Result<(), C::Error>
-// where
-//     A: ArrayValue,
-//     B: ArrayValue,
-//     C: FillContext,
-// {
-//     if shape_prefixes_match(&a.shape, &b.shape) {
-//         return Ok(());
-//     }
-//     if a.row_count() == 1 && ctx.scalar_fill::<A>().is_err() {
-//         let fixes = (a.shape.iter())
-//             .take_while(|&&dim| dim == 1)
-//             .count()
-//             .min(a.shape.len());
-//         if (b.shape.iter().rev())
-//             .zip(a.shape[fixes..].iter().rev())
-//             .all(|(b, a)| b == a)
-//         {
-//             a.shape.drain(..fixes);
-//             for &dim in b.shape.iter().take(fixes).rev() {
-//                 a.reshape_scalar(Ok(dim as isize));
-//             }
-//         }
-//     }
-//     if b.row_count() == 1 && ctx.scalar_fill::<B>().is_err() {
-//         let fixes = (b.shape.iter())
-//             .take_while(|&&dim| dim == 1)
-//             .count()
-//             .min(b.shape.len());
-//         if (a.shape.iter().rev())
-//             .zip(b.shape[fixes..].iter().rev())
-//             .all(|(a, b)| a == b)
-//         {
-//             b.shape.drain(..fixes);
-//             for &dim in a.shape.iter().take(fixes).rev() {
-//                 b.reshape_scalar(Ok(dim as isize));
-//             }
-//         }
-//     }
-//     if shape_prefixes_match(&a.shape, &b.shape) {
-//         return Ok(());
-//     }
-//     let mut fill_error = None;
-//     // Fill in missing rows
-//     match a.row_count().cmp(&b.row_count()) {
-//         Ordering::Less => match ctx.scalar_fill() {
-//             Ok(fill) => {
-//                 let mut target_shape = a.shape().to_vec();
-//                 target_shape[0] = b.row_count();
-//                 a.fill_to_shape(&target_shape, fill);
-//             }
-//             Err(e) => fill_error = Some(e),
-//         },
-//         Ordering::Greater => match ctx.scalar_fill() {
-//             Ok(fill) => {
-//                 let mut target_shape = b.shape().to_vec();
-//                 target_shape[0] = a.row_count();
-//                 b.fill_to_shape(&target_shape, fill);
-//             }
-//             Err(e) => fill_error = Some(e),
-//         },
-//         Ordering::Equal => fill_error = Some(""),
-//     }
-//     if shape_prefixes_match(&a.shape, &b.shape) {
-//         return Ok(());
-//     }
-//     // Fill in missing dimensions
-//     match a.rank().cmp(&b.rank()) {
-//         Ordering::Less => match ctx.scalar_fill() {
-//             Ok(fill) => {
-//                 let mut target_shape = a.shape.clone();
-//                 target_shape.insert(0, b.row_count());
-//                 a.fill_to_shape(&target_shape, fill);
-//                 fill_error = None;
-//             }
-//             Err(e) => fill_error = Some(e),
-//         },
-//         Ordering::Greater => match ctx.scalar_fill() {
-//             Ok(fill) => {
-//                 let mut target_shape = b.shape.clone();
-//                 target_shape.insert(0, a.row_count());
-//                 b.fill_to_shape(&target_shape, fill);
-//                 fill_error = None;
-//             }
-//             Err(e) => fill_error = Some(e),
-//         },
-//         Ordering::Equal => {
-//             let target_shape = max_shape(a.shape(), b.shape());
-//             if a.shape() != *target_shape {
-//                 match ctx.scalar_fill() {
-//                     Ok(fill) => {
-//                         a.fill_to_shape(&target_shape, fill);
-//                         fill_error = None;
-//                     }
-//                     Err(e) => fill_error = Some(e),
-//                 }
-//             }
-//             if b.shape() != *target_shape {
-//                 match ctx.scalar_fill() {
-//                     Ok(fill) => {
-//                         b.fill_to_shape(&target_shape, fill);
-//                         fill_error = None;
-//                     }
-//                     Err(e) => fill_error = Some(e),
-//                 }
-//             }
-//         }
-//     }
-//     if !shape_prefixes_match(&a.shape, &b.shape) && fill_error.is_none() {
-//         fill_error = Some(". A ⬚ fill attempt failed.");
-//     }
-//     if let Some(e) = fill_error {
-//         return Err(C::fill_error(ctx.error(format!(
-//             "Shapes {} and {} do not match{e}",
-//             a.shape(),
-//             b.shape(),
-//         ))));
-//     }
-
-//     Ok(())
-// }
-
-pub fn all(env: &mut Uiua) -> UiuaResult {
-    let f = env.pop_function()?;
-    let g = env.pop_function()?;
-    let f_sig = f.signature();
-    let g_sig = g.signature();
-    // Call g
-    env.call(g)?;
-    // Determine arg counts
-    let lower_arg_count = g_sig.outputs / f_sig.args.saturating_sub(1).max(1);
-    let upper_arg_count = f_sig.args.saturating_sub(1) * lower_arg_count;
-    let mut lower_args = Vec::with_capacity(lower_arg_count);
-    let mut upper_args = Vec::with_capacity(upper_arg_count);
-    for i in 0..upper_arg_count {
-        upper_args.push(env.pop(i + 1)?);
-    }
-    for i in 0..lower_arg_count {
-        lower_args.push(env.pop(upper_arg_count + i + 1)?);
-    }
-    let mut lower_args = lower_args.into_iter().rev();
-    let mut upper_args = upper_args.into_iter().rev();
-    // Call f
-    for _ in 0..lower_arg_count {
-        env.push(lower_args.next().unwrap());
-        for _ in 0..f_sig.args.saturating_sub(1) {
-            env.push(upper_args.next().unwrap());
-        }
-        env.call(f.clone())?;
-    }
-    Ok(())
 }
 
 pub fn switch(
-    count: usize,
+    branches: Ops,
     sig: Signature,
     copy_condition_under: bool,
     env: &mut Uiua,
@@ -511,206 +481,228 @@ pub fn switch(
     } else {
         None
     };
-    let selector = selector.as_natural_array(env, "Switch index must be an array of naturals")?;
-    if let Some(i) = selector.data.iter().find(|&&i| i >= count) {
-        return Err(env.error(format!(
-            "Switch index {i} is out of bounds for switch of size {count}"
-        )));
-    }
     // Switch
     if selector.rank() == 0 {
         // Scalar
+        let selector =
+            selector.as_natural_array(env, "Switch index must be an array of naturals")?;
+        if let Some(i) = selector.data.iter().find(|&&i| i >= branches.len()) {
+            return Err(env.error(format!(
+                "Switch index {i} is out of bounds for switch of size {}",
+                branches.len()
+            )));
+        }
         let i = selector.data[0];
         // Get function
-        let Some(f) = env
-            .rt
-            .function_stack
-            .drain(env.rt.function_stack.len() - count..)
-            .nth(i)
-        else {
+        let Some(f) = branches.into_iter().nth(i) else {
             return Err(env.error(
                 "Function stack was empty when getting switch function. \
                 This is a bug in the interpreter.",
             ));
         };
         // Discard unused arguments
-        let discard_start = env.rt.stack.len().saturating_sub(sig.args);
+        let discard_start = env.rt.stack.len().saturating_sub(sig.args());
         if discard_start > env.rt.stack.len() {
             return Err(env.error("Stack was empty when discarding excess switch arguments."));
         }
         // `saturating_sub` and `max` handle incorrect explicit signatures
-        let discard_end = (discard_start + sig.args + f.signature().outputs)
-            .saturating_sub(f.signature().args + sig.outputs)
+        let discard_end = (discard_start + sig.args() + f.sig.outputs())
+            .saturating_sub(f.sig.args() + sig.outputs())
             .max(discard_start);
         if discard_end > env.rt.stack.len() {
             return Err(env.error("Stack was empty when discarding excess switch arguments."));
         }
         env.rt.stack.drain(discard_start..discard_end);
-        env.call(f)?;
+        env.exec(f)?;
     } else {
         // Array
         // Collect arguments
-        let mut args_rows: Vec<_> = Vec::with_capacity(sig.args);
-        for i in 0..sig.args {
+        let mut args = Vec::with_capacity(sig.args() + 1);
+        let mut new_shape = selector.shape.clone();
+        args.push(selector);
+        for i in 0..sig.args() {
             let arg = env.pop(i + 1)?;
-            if !arg.shape().starts_with(selector.shape()) {
-                return Err(env.error(format!(
-                    "The selector's shape {} is not compatible \
-                    with the argument {}'s shape {}",
-                    selector.shape(),
-                    i + 1,
-                    arg.shape(),
-                )));
-            }
-            let row_shape = Shape::from(&arg.shape()[selector.rank()..]);
-            args_rows.push(arg.into_row_shaped_slices(row_shape));
+            args.push(arg);
         }
-        args_rows.reverse();
+        args[1..].reverse();
+        let FixedRowsData {
+            mut rows,
+            row_count,
+            is_empty,
+            all_scalar,
+            ..
+        } = fixed_rows("switch", sig.outputs(), args, env)?;
         // Collect functions
-        let functions: Vec<(Function, usize)> = env
-            .rt
-            .function_stack
-            .drain(env.rt.function_stack.len() - count..)
-            .map(|f| {
-                let args = if f.signature().outputs < sig.outputs {
-                    f.signature().args + sig.outputs - f.signature().outputs
+        let args: Vec<usize> = branches
+            .iter()
+            .map(|sn| {
+                if sn.sig.outputs() < sig.outputs() {
+                    sn.sig.args() + sig.outputs() - sn.sig.outputs()
                 } else {
-                    f.signature().args
-                };
-                (f, args)
+                    sn.sig.args()
+                }
             })
             .collect();
-        let mut outputs = multi_output(sig.outputs, Vec::new());
+
         // Switch with each selector element
-        for elem in selector.data {
-            let (f, args) = &functions[elem];
-            for (i, arg) in args_rows.iter_mut().rev().enumerate().rev() {
-                let arg = arg.next().unwrap();
-                if i < *args {
-                    env.push(arg);
+        let mut outputs = multi_output(sig.outputs(), Vec::new());
+        let mut rows_to_sel = Vec::with_capacity(sig.args());
+        for _ in 0..row_count {
+            let selector = match &mut rows[0] {
+                Ok(selector) => selector.next().unwrap(),
+                Err(selector) => selector.clone(),
+            }
+            .as_natural_array(env, "Switch index must be an array of naturals")?;
+            if let Some(i) = selector.data.iter().find(|&&i| i >= branches.len()) {
+                return Err(env.error(format!(
+                    "Switch index {i} is out of bounds for switch of size {}",
+                    branches.len()
+                )));
+            }
+            // println!("selector: {} {:?}", selector.shape, selector.data);
+            rows_to_sel.clear();
+            for row in rows[1..].iter_mut() {
+                let row = match row {
+                    Ok(row) => row.next().unwrap(),
+                    Err(row) => row.clone(),
+                };
+                // println!("row: {:?}", row);
+                if selector.rank() > row.rank() || selector.rank() == 0 || is_empty {
+                    // println!(" (repeated)");
+                    rows_to_sel.push(Err(row));
+                } else {
+                    // println!(" (iterated)");
+                    let row_shape = row.shape[selector.rank()..].into();
+                    rows_to_sel.push(Ok(row.into_row_shaped_slices(row_shape)));
                 }
             }
-            env.call(f.clone())?;
-            for i in 0..sig.outputs {
-                outputs[i].push(env.pop("switch output")?);
+            for sel_row_slice in selector.row_slices() {
+                for &sel_elem in sel_row_slice {
+                    // println!("  sel_elem: {}", sel_elem);
+                    let node = &branches[sel_elem];
+                    let arg_count = args[sel_elem];
+                    for (i, row) in rows_to_sel.iter_mut().rev().enumerate().rev() {
+                        let row = match row {
+                            Ok(row) => row.next().unwrap(),
+                            Err(row) => row.clone(),
+                        };
+                        // println!("  row: {:?}", row);
+                        if i < arg_count {
+                            env.push(row);
+                        }
+                    }
+                    env.exec(node.clone())?;
+                    for i in 0..sig.outputs() {
+                        outputs[i].push(env.pop("switch output")?);
+                    }
+                }
             }
         }
         // Collect output
+        if is_empty {
+            new_shape[0] = 0;
+        }
         for output in outputs.into_iter().rev() {
+            let mut new_shape = new_shape.clone();
             let mut new_value = Value::from_row_values(output, env)?;
-            let mut new_shape = selector.shape.clone();
-            new_shape.extend_from_slice(&new_value.shape()[1..]);
-            *new_value.shape_mut() = new_shape;
+            if all_scalar {
+                new_value.undo_fix();
+            } else if is_empty {
+                new_value.pop_row();
+            }
+            new_shape.extend_from_slice(&new_value.shape[1..]);
+            new_value.shape = new_shape;
+            new_value.validate();
             env.push(new_value);
         }
     }
     if let Some(selector) = copied_selector {
-        env.push_temp(TempStack::Under, selector);
+        env.push_under(selector);
     }
     Ok(())
 }
 
-pub fn try_(env: &mut Uiua) -> UiuaResult {
-    let f = env.pop_function()?;
-    let handler = env.pop_function()?;
-    let f_sig = f.signature();
-    let handler_sig = handler.signature();
-    if f_sig.outputs != handler_sig.outputs {
-        return Err(env.error(format!(
-            "Tried function and handler function must have the same number of outputs, \
-            but their signatures are {f_sig} and {handler_sig} respectively."
-        )));
-    }
-    if handler_sig.args > f_sig.args + 1 {
-        return Err(env.error(format!(
-            "Handler function must have at most one more argument than the tried function, \
-            but their signatures are {handler_sig} and {f_sig} respectively."
-        )));
-    }
-    if env.stack_height() < f_sig.args {
-        for i in 0..f_sig.args {
+pub fn try_(ops: Ops, env: &mut Uiua) -> UiuaResult {
+    let [f, handler] = get_ops(ops, env)?;
+    let f_sig = f.sig;
+    let handler_sig = handler.sig;
+    if env.stack_height() < f_sig.args() {
+        for i in 0..f_sig.args() {
             env.pop(i + 1)?;
         }
     }
-    let backup = env.clone_stack_top(f_sig.args.min(handler_sig.args))?;
-    if let Err(e) = env.call_clean_stack(f) {
-        if handler_sig.args > f_sig.args {
-            (env.rt.backend).save_error_color(e.message(), e.report().to_string());
-            env.push(e.value());
+    let backup = env.clone_stack_top(f_sig.args().min(handler_sig.args()))?;
+    if let Err(mut err) = env.exec_clean_stack(f) {
+        if err.is_case {
+            err.is_case = false;
+            return Err(err);
+        }
+        if handler_sig.args() > f_sig.args() {
+            (env.rt.backend).save_error_color(err.to_string(), err.report().to_string());
+            env.push(err.value());
         }
         for val in backup {
             env.push(val);
         }
-        env.call(handler)?;
+        env.exec(handler)?;
     }
     Ok(())
 }
 
-/// If a function fails on a byte array because no fill byte is defined,
-/// convert the byte array to a number array and try again.
-fn op_bytes_retry_fill<T, E: FillError>(
-    bytes: Array<u8>,
-    on_bytes: impl FnOnce(Array<u8>) -> Result<T, E>,
-    on_nums: impl FnOnce(Array<f64>) -> Result<T, E>,
-) -> Result<T, E> {
-    match on_bytes(bytes.clone()) {
-        Ok(res) => Ok(res),
-        Err(err) if err.is_fill() => on_nums(bytes.convert()),
-        Err(err) => Err(err),
-    }
-}
-
-/// If a function fails on a byte array because no fill byte is defined,
-/// convert the byte array to a number array and try again.
-fn op_bytes_ref_retry_fill<T>(
-    bytes: &Array<u8>,
-    on_bytes: impl FnOnce(&Array<u8>) -> UiuaResult<T>,
-    on_nums: impl FnOnce(&Array<f64>) -> UiuaResult<T>,
-) -> UiuaResult<T> {
-    match on_bytes(bytes) {
-        Ok(res) => Ok(res),
-        Err(err) if err.is_fill() => on_nums(&bytes.clone().convert()),
-        Err(err) => Err(err),
-    }
-}
-
-/// If a function fails on 2 byte arrays because no fill byte is defined,
-/// convert the byte arrays to number arrays and try again.
-fn op2_bytes_retry_fill<T, C: FillContext>(
-    a: Array<u8>,
-    b: Array<u8>,
-    ctx: &C,
-    on_bytes: impl FnOnce(Array<u8>, Array<u8>) -> Result<T, C::Error>,
-    on_nums: impl FnOnce(Array<f64>, Array<f64>) -> Result<T, C::Error>,
-) -> Result<T, C::Error> {
-    if ctx.scalar_fill::<f64>().is_ok() {
-        match on_bytes(a.clone(), b.clone()) {
-            Ok(res) => Ok(res),
-            Err(err) if C::is_fill_error(&err) => on_nums(a.convert(), b.convert()),
-            Err(err) => Err(err),
+pub fn format(parts: &[EcoString], env: &mut Uiua) -> UiuaResult {
+    fn format_val(chars: &mut EcoVec<char>, val: Value) {
+        match val {
+            Value::Char(arr) if arr.rank() <= 1 => {
+                if chars.is_empty() {
+                    *chars = arr.data.into();
+                } else {
+                    ecovec_extend_cowslice(chars, arr.data);
+                }
+            }
+            Value::Box(arr) if arr.rank() == 0 => format_val(chars, arr.into_scalar().unwrap().0),
+            val => chars.extend(val.format().chars()),
         }
-    } else {
-        on_bytes(a, b)
+    }
+
+    let mut chars = EcoVec::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            let value = env.pop(("format argument", i))?;
+            format_val(&mut chars, value);
+        }
+        chars.extend(part.chars());
+    }
+    env.push(chars);
+    Ok(())
+}
+
+#[repr(transparent)]
+#[derive(Debug)]
+pub(crate) struct ArrayCmpSlice<'a, T>(pub &'a [T]);
+
+impl<T> Clone for ArrayCmpSlice<'_, T> {
+    fn clone(&self) -> Self {
+        *self
     }
 }
 
-struct ArrayCmpSlice<'a, T>(&'a [T]);
+impl<T> Copy for ArrayCmpSlice<'_, T> {}
 
-impl<'a, T: ArrayValue> PartialEq for ArrayCmpSlice<'a, T> {
+impl<T: ArrayValue> PartialEq for ArrayCmpSlice<'_, T> {
     fn eq(&self, other: &Self) -> bool {
         self.0.len() == other.0.len() && self.0.iter().zip(other.0).all(|(a, b)| a.array_eq(b))
     }
 }
 
-impl<'a, T: ArrayValue> Eq for ArrayCmpSlice<'a, T> {}
+impl<T: ArrayValue> Eq for ArrayCmpSlice<'_, T> {}
 
-impl<'a, T: ArrayValue> PartialOrd for ArrayCmpSlice<'a, T> {
+impl<T: ArrayValue> PartialOrd for ArrayCmpSlice<'_, T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<'a, T: ArrayValue> Ord for ArrayCmpSlice<'a, T> {
+impl<T: ArrayValue> Ord for ArrayCmpSlice<'_, T> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.0
             .iter()
@@ -721,7 +713,7 @@ impl<'a, T: ArrayValue> Ord for ArrayCmpSlice<'a, T> {
     }
 }
 
-impl<'a, T: ArrayValue> Hash for ArrayCmpSlice<'a, T> {
+impl<T: ArrayValue> Hash for ArrayCmpSlice<'_, T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         for elem in self.0 {
             elem.array_hash(state);
@@ -743,35 +735,18 @@ struct FixedRowsData {
 
 fn fixed_rows(
     prim: impl fmt::Display,
-    sig: Signature,
-    mut args: Vec<Value>,
+    outputs: usize,
+    args: Vec<Value>,
     env: &Uiua,
 ) -> UiuaResult<FixedRowsData> {
     for a in 0..args.len() {
-        let a_can_fill = args[a].length_is_fillable(env);
+        let a_row_count = args[a].row_count();
         for b in a + 1..args.len() {
-            let b_can_fill = args[b].length_is_fillable(env);
-            let mut err = None;
-            if a_can_fill {
-                let b_row_count = args[b].row_count();
-                err = args[a].fill_length_to(b_row_count, env).err();
-            }
-            if err.is_none() && b_can_fill {
-                let a_row_count = args[a].row_count();
-                err = args[b].fill_length_to(a_row_count, env).err();
-            }
-            if err.is_none()
-                && args[a].row_count() != args[b].row_count()
-                && args[a].row_count() != 1
-                && args[b].row_count() != 1
-            {
-                err = Some("");
-            }
-            if let Some(e) = err {
+            let b_row_count = args[b].row_count();
+            if a_row_count != b_row_count && !(a_row_count == 1 || b_row_count == 1) {
                 return Err(env.error(format!(
-                    "Cannot {prim} arrays with different number of rows, shapes {} and {}{e}",
-                    args[a].shape(),
-                    args[b].shape(),
+                    "Cannot {prim} arrays with different number of rows, shapes {} and {}",
+                    args[a].shape, args[b].shape,
                 )));
             }
         }
@@ -779,7 +754,6 @@ fn fixed_rows(
     let mut row_count = 0;
     let mut all_scalar = true;
     let mut all_1 = true;
-    let outputs = sig.outputs;
     let is_empty = outputs > 0 && args.iter().any(|v| v.row_count() == 0);
     let mut per_meta = Vec::new();
     let fixed_rows: FixedRows = args
@@ -787,13 +761,13 @@ fn fixed_rows(
         .map(|mut v| {
             all_scalar = all_scalar && v.rank() == 0;
             if v.row_count() == 1 {
-                v.unfix();
+                v.undo_fix();
                 Err(v)
             } else {
                 let proxy = is_empty.then(|| v.proxy_row(env));
                 row_count = row_count.max(v.row_count());
                 all_1 = false;
-                per_meta.push(v.take_per_meta());
+                per_meta.push(v.meta.take_per_meta());
                 Ok(v.into_rows().chain(proxy))
             }
         })
@@ -810,4 +784,74 @@ fn fixed_rows(
         all_scalar,
         per_meta,
     })
+}
+
+#[cfg(not(feature = "fft"))]
+pub fn fft(env: &mut Uiua) -> UiuaResult {
+    Err(env.error("FFT is not available in this environment"))
+}
+
+#[cfg(not(feature = "fft"))]
+pub fn unfft(env: &mut Uiua) -> UiuaResult {
+    Err(env.error("FFT is not available in this environment"))
+}
+
+#[cfg(feature = "fft")]
+pub fn fft(env: &mut Uiua) -> UiuaResult {
+    fft_impl(env, rustfft::FftPlanner::plan_fft_forward)
+}
+
+#[cfg(feature = "fft")]
+pub fn unfft(env: &mut Uiua) -> UiuaResult {
+    fft_impl(env, rustfft::FftPlanner::plan_fft_inverse)
+}
+
+#[cfg(feature = "fft")]
+fn fft_impl(
+    env: &mut Uiua,
+    plan: fn(&mut rustfft::FftPlanner<f64>, usize) -> std::sync::Arc<dyn rustfft::Fft<f64>>,
+) -> UiuaResult {
+    use bytemuck::must_cast_slice_mut;
+
+    use rustfft::{num_complex::Complex64, FftPlanner};
+
+    use crate::Complex;
+
+    let mut arr: Array<Complex> = match env.pop(1)? {
+        Value::Num(arr) => arr.convert(),
+        Value::Byte(arr) => arr.convert(),
+        Value::Complex(arr) => arr,
+        val => {
+            return Err(env.error(format!("Cannot perform FFT on a {} array", val.type_name())));
+        }
+    };
+    if arr.rank() == 0 {
+        env.push(arr);
+        return Ok(());
+    }
+
+    for _ in 0..arr.rank() {
+        arr.transpose();
+
+        let list_row_len: usize = arr.shape[arr.rank() - 1..].iter().product();
+        if list_row_len == 0 {
+            continue;
+        }
+        let mut planner = FftPlanner::new();
+        let scaling_factor = 1.0 / (list_row_len as f64).sqrt();
+        for row in arr.data.as_mut_slice().chunks_exact_mut(list_row_len) {
+            let fft = plan(&mut planner, row.len());
+            // NOTE: This works as long as Uiua's `complex` and `num_complex::Complex64` have
+            // the same layout. the `Complex64` layout should remain stable since they are
+            // maintaining compatibility with C. So we only need to ensure that we keep
+            // the same (real, imaginary) ordering that they do.
+            let slice: &mut [Complex64] = must_cast_slice_mut(row);
+            fft.process(slice);
+            for c in row {
+                *c *= scaling_factor;
+            }
+        }
+    }
+    env.push(arr);
+    Ok(())
 }

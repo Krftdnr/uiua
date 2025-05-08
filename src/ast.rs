@@ -1,43 +1,108 @@
 //! Uiua's abstract syntax tree
 
-use core::mem::discriminant;
-use std::fmt;
+use std::{collections::HashMap, fmt, mem::discriminant};
+
+use ecow::EcoString;
+use serde::*;
 
 use crate::{
-    function::{FunctionId, Signature},
+    function::Signature,
     lex::{CodeSpan, Sp},
     parse::ident_modifier_args,
-    Ident, Primitive, SemanticComment,
+    BindingCounts, Ident, Primitive, SemanticComment, SUBSCRIPT_DIGITS,
 };
 
 /// A top-level item
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", content = "value")]
 pub enum Item {
     /// Just some code
-    Words(Vec<Vec<Sp<Word>>>),
+    Words(Vec<Sp<Word>>),
     /// A binding
     Binding(Binding),
     /// An import
     Import(Import),
-    /// A test scope
-    TestScope(Sp<Vec<Item>>),
+    /// A scope
+    Module(Sp<ScopedModule>),
+    /// A line of data definitions
+    Data(Vec<DataDef>),
+}
+
+impl PartialEq for Item {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Item::Words(a), Item::Words(b)) => words_eq(a, b),
+            (Item::Binding(a), Item::Binding(b)) => a == b,
+            (Item::Import(a), Item::Import(b)) => a == b,
+            (Item::Module(a), Item::Module(b)) => a == b,
+            (Item::Data(a), Item::Data(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+fn words_eq(a: &[Sp<Word>], b: &[Sp<Word>]) -> bool {
+    a.iter().map(|w| &w.value).eq(b.iter().map(|w| &w.value))
+}
+
+impl Item {
+    /// Get the span of this item
+    pub fn span(&self) -> Option<CodeSpan> {
+        match self {
+            Item::Words(words) => (words.first().zip(words.last()))
+                .map(|(first, last)| first.span.clone().merge(last.span.clone())),
+            Item::Binding(binding) => Some(binding.span()),
+            Item::Import(import) => Some(import.span()),
+            Item::Module(module) => Some(module.span.clone()),
+            Item::Data(data) => {
+                (data.first().zip(data.last())).map(|(first, last)| first.span().merge(last.span()))
+            }
+        }
+    }
+    /// Get a string representation of the kind of this item
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Item::Words(_) => "words",
+            Item::Binding(_) => "binding",
+            Item::Import(_) => "import",
+            Item::Module(_) => "module",
+            Item::Data(_) => "data definition",
+        }
+    }
+    /// Operate on words or provide a default
+    pub fn words_or<'a, T>(&'a self, default: T, on_words: impl FnOnce(&'a [Sp<Word>]) -> T) -> T {
+        match self {
+            Item::Words(words) => on_words(words),
+            _ => default,
+        }
+    }
+    /// Whether this item is an empty line
+    pub fn is_empty_line(&self) -> bool {
+        self.words_or(false, |words| {
+            words.iter().all(|w| matches!(w.value, Word::Spaces))
+        })
+    }
 }
 
 /// A binding
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Binding {
+    /// Span of a ~ for a method
+    pub tilde_span: Option<CodeSpan>,
     /// The name of the binding
     pub name: Sp<Ident>,
     /// The span of the arrow
     pub arrow_span: CodeSpan,
     /// Whether the binding is public
     pub public: bool,
-    /// Whether the binding is an array macro
-    pub array_macro: bool,
+    /// Whether the binding is a code macro
+    pub code_macro: bool,
     /// The signature
     pub signature: Option<Sp<Signature>>,
     /// The code
     pub words: Vec<Sp<Word>>,
+    /// Character counts for golfing
+    pub counts: BindingCounts,
 }
 
 impl Binding {
@@ -51,8 +116,32 @@ impl Binding {
     }
 }
 
+/// A scoped module
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ScopedModule {
+    /// The span of the opening delimiter
+    pub open_span: CodeSpan,
+    /// The module kind
+    pub kind: ModuleKind,
+    /// The items
+    pub items: Vec<Item>,
+    /// The imports
+    pub imports: Option<ImportLine>,
+    /// The span of the closing delimiter
+    pub close_span: Option<CodeSpan>,
+}
+
+/// The kind of a module
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum ModuleKind {
+    /// A named module
+    Named(Sp<Ident>),
+    /// A test scope
+    Test,
+}
+
 /// An import
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Import {
     /// The name given to the imported module
     pub name: Option<Sp<Ident>>,
@@ -64,8 +153,8 @@ pub struct Import {
     pub lines: Vec<Option<ImportLine>>,
 }
 
-#[derive(Debug, Clone)]
 /// A line of imported items
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ImportLine {
     /// The span of the ~
     pub tilde_span: CodeSpan,
@@ -90,14 +179,159 @@ impl Import {
     }
 }
 
+/// A data definition
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DataDef {
+    /// The span of the ~ or |
+    pub init_span: CodeSpan,
+    /// Whether this is a variant
+    pub variant: bool,
+    /// The name of the module
+    pub name: Option<Sp<Ident>>,
+    /// The fields of the data definition
+    pub fields: Option<DataFields>,
+    /// The function
+    pub func: Option<Vec<Sp<Word>>>,
+}
+
+/// The fields of a data definition
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DataFields {
+    /// Whether the array is boxed
+    pub boxed: bool,
+    /// The open delimiter span
+    pub open_span: CodeSpan,
+    /// The data fields
+    pub fields: Vec<DataField>,
+    /// A trailing newline
+    pub trailing_newline: bool,
+    /// The close delimiter span
+    pub close_span: Option<CodeSpan>,
+}
+
+/// A data field
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DataField {
+    /// Leading comments
+    pub comments: Option<Comments>,
+    /// The name of the field
+    pub name: Sp<Ident>,
+    /// The validator of the field
+    pub validator: Option<FieldValidator>,
+    /// The default value of the field
+    pub init: Option<FieldInit>,
+    /// The span of a trailing bar
+    pub bar_span: Option<CodeSpan>,
+}
+
+/// A data field validator
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FieldValidator {
+    /// The span of the colon (may be an open paren)
+    pub open_span: CodeSpan,
+    /// The validator function
+    pub words: Vec<Sp<Word>>,
+    /// The closing paren span (if a paren was used to open)
+    pub close_span: Option<CodeSpan>,
+}
+
+/// A data field initializer
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FieldInit {
+    /// The span of the assignment arrow
+    pub arrow_span: CodeSpan,
+    /// The initializing words
+    pub words: Vec<Sp<Word>>,
+}
+
+impl DataDef {
+    /// Get the span of this data definition
+    pub fn span(&self) -> CodeSpan {
+        let end = self
+            .fields
+            .as_ref()
+            .map(|fields| fields.span())
+            .unwrap_or_else(|| {
+                self.name
+                    .as_ref()
+                    .map(|name| name.span.clone())
+                    .unwrap_or_else(|| self.init_span.clone())
+            });
+        let mut span = (self.init_span.clone()).merge(end);
+        if let Some(words) = &self.func {
+            if let Some(word) = words.last() {
+                span = span.merge(word.span.clone());
+            }
+        }
+        span
+    }
+}
+
+impl DataFields {
+    /// Get the span of these fields
+    pub fn span(&self) -> CodeSpan {
+        let end = self
+            .close_span
+            .clone()
+            .or_else(|| {
+                self.fields.last().map(|field| {
+                    field
+                        .bar_span
+                        .clone()
+                        .unwrap_or_else(|| field.name.span.clone())
+                })
+            })
+            .unwrap_or_else(|| self.open_span.clone());
+        self.open_span.clone().merge(end)
+    }
+}
+
+impl DataField {
+    /// Get the span of the field
+    pub fn span(&self) -> CodeSpan {
+        let Some(end) = self.bar_span.clone().or_else(|| {
+            self.init.as_ref().map(|d| {
+                d.words
+                    .last()
+                    .map(|w| w.span.clone())
+                    .unwrap_or_else(|| d.arrow_span.clone())
+            })
+        }) else {
+            return self.name.span.clone();
+        };
+        self.name.span.clone().merge(end)
+    }
+}
+
+/// A cluster of comments
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Comments {
+    /// The normal comment lines
+    pub lines: Vec<Sp<EcoString>>,
+    /// The semantic comments
+    pub semantic: HashMap<SemanticComment, CodeSpan>,
+}
+
+/// An inline macro
+#[derive(Clone, PartialEq, Serialize)]
+pub struct InlineMacro {
+    /// The function
+    pub func: Sp<Func>,
+    /// The span of a `^` that makes this an array macro
+    pub caret_span: Option<CodeSpan>,
+    /// The identifier, which consists of only exclamation marks
+    pub ident: Sp<Ident>,
+}
+
 /// A word
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 #[allow(missing_docs)]
+#[serde(tag = "type", content = "value")]
 pub enum Word {
-    Number(String, f64),
+    Number(Result<f64, String>),
     Char(String),
     String(String),
-    MultilineString(String),
+    MultilineString(Vec<Sp<String>>),
     FormatString(Vec<String>),
     MultilineFormatString(Vec<Sp<Vec<String>>>),
     Label(String),
@@ -107,59 +341,40 @@ pub enum Word {
         in_macro_arg: bool,
     },
     Strand(Vec<Sp<Word>>),
-    Undertied(Vec<Sp<Word>>),
     Array(Arr),
     Func(Func),
-    Switch(Switch),
+    Pack(FunctionPack),
     Primitive(Primitive),
-    SemicolonPop,
     Modified(Box<Modified>),
-    Placeholder(PlaceholderOp),
+    Placeholder(usize),
     Comment(String),
     Spaces,
     BreakLine,
-    UnbreakLine,
+    FlipLine,
     SemanticComment(SemanticComment),
     OutputComment {
         i: usize,
         n: usize,
     },
+    Subscripted(Box<Subscripted>),
+    InlineMacro(InlineMacro),
 }
 
 impl PartialEq for Word {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Number(_, a), Self::Number(_, b)) => a == b,
+            (Self::Number(a), Self::Number(b)) => a == b,
             (Self::Char(a), Self::Char(b)) => a == b,
             (Self::String(a), Self::String(b)) => a == b,
             (Self::Label(a), Self::Label(b)) => a == b,
             (Self::FormatString(a), Self::FormatString(b)) => a == b,
             (Self::MultilineFormatString(a), Self::MultilineFormatString(b)) => a == b,
             (Self::Ref(a), Self::Ref(b)) => a == b,
-            (Self::Strand(a), Self::Strand(b)) => {
-                a.iter().map(|w| &w.value).eq(b.iter().map(|w| &w.value))
-            }
-            (Self::Undertied(a), Self::Undertied(b)) => {
-                a.iter().map(|w| &w.value).eq(b.iter().map(|w| &w.value))
-            }
-            (Self::Array(a), Self::Array(b)) => a.lines.iter().flatten().map(|w| &w.value).eq(b
-                .lines
-                .iter()
-                .flatten()
-                .map(|w| &w.value)),
-            (Self::Func(a), Self::Func(b)) => a.lines.iter().flatten().map(|w| &w.value).eq(b
-                .lines
-                .iter()
-                .flatten()
-                .map(|w| &w.value)),
-            (Self::Switch(a), Self::Switch(b)) => (a.branches.iter())
-                .flat_map(|br| &br.value.lines)
-                .flatten()
-                .map(|w| &w.value)
-                .eq((b.branches.iter())
-                    .flat_map(|br| &br.value.lines)
-                    .flatten()
-                    .map(|w| &w.value)),
+            (Self::Strand(a), Self::Strand(b)) => words_eq(a, b),
+            (Self::Array(a), Self::Array(b)) => a.lines == b.lines,
+            (Self::Func(a), Self::Func(b)) => a.lines == b.lines,
+            (Self::Pack(a), Self::Pack(b)) => (a.branches.iter().flat_map(|br| &br.value.lines))
+                .eq(b.branches.iter().flat_map(|br| &br.value.lines)),
             (Self::Primitive(a), Self::Primitive(b)) => a == b,
             (Self::Modified(a), Self::Modified(b)) => {
                 a.modifier == b.modifier
@@ -179,14 +394,35 @@ impl Word {
     pub fn is_code(&self) -> bool {
         !matches!(
             self,
-            Word::Comment(_) | Word::Spaces | Word::BreakLine | Word::UnbreakLine
+            Word::Comment(_) | Word::Spaces | Word::BreakLine | Word::FlipLine
         )
     }
     /// Whether this word is a literal
     pub fn is_literal(&self) -> bool {
-        matches!(self, Word::Number(..) | Word::Char(_) | Word::String(_))
-            || matches!(self, Word::Array(arr) if arr.lines.iter().flatten().filter(|w| w.value.is_code()).all(|w| w.value.is_literal()))
-            || matches!(self, Word::Strand(items) if items.iter().all(|w| w.value.is_literal()))
+        match self {
+            Word::Number(..) | Word::Char(_) | Word::String(_) => true,
+            Word::Array(arr) => arr.lines.iter().all(|item| {
+                item.words_or(false, |words| {
+                    (words.iter())
+                        .filter(|w| w.value.is_code())
+                        .all(|w| w.value.is_literal())
+                })
+            }),
+            Word::Strand(items) => items.iter().all(|w| w.value.is_literal()),
+            _ => false,
+        }
+    }
+    /// Whether this word must come at the end of a line
+    pub fn is_end_of_line(&self) -> bool {
+        match self {
+            Word::Comment(_)
+            | Word::SemanticComment(_)
+            | Word::OutputComment { .. }
+            | Word::MultilineString(_)
+            | Word::MultilineFormatString(_) => true,
+            Word::Modified(m) => m.operands.last().is_some_and(|w| w.value.is_end_of_line()),
+            _ => false,
+        }
     }
 }
 
@@ -224,61 +460,27 @@ impl fmt::Debug for Word {
             }
             Word::Array(arr) => arr.fmt(f),
             Word::Strand(items) => write!(f, "strand({items:?})"),
-            Word::Undertied(items) => write!(f, "undertie({items:?})"),
             Word::Func(func) => func.fmt(f),
-            Word::Switch(sw) => sw.fmt(f),
+            Word::Pack(pack) => pack.fmt(f),
             Word::Primitive(prim) => prim.fmt(f),
-            Word::SemicolonPop => write!(f, ";"),
             Word::Modified(modified) => modified.fmt(f),
             Word::Spaces => write!(f, "' '"),
             Word::Comment(comment) => write!(f, "# {comment}"),
-            Word::Placeholder(op) => write!(f, "{op}"),
-            Word::BreakLine => write!(f, "'"),
-            Word::UnbreakLine => write!(f, "''"),
+            Word::Placeholder(op) => write!(f, "^{op}"),
+            Word::BreakLine => write!(f, "break_line"),
+            Word::FlipLine => write!(f, "unbreak_line"),
             Word::SemanticComment(comment) => write!(f, "{comment}"),
             Word::OutputComment { i, n, .. } => write!(f, "output_comment({i}/{n})"),
-        }
-    }
-}
-
-/// A placeholder operation
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PlaceholderOp {
-    /// Pop and inline the top expression
-    Call,
-    /// Duplicate the top expression
-    Dup,
-    /// Swap the top two expressions
-    Flip,
-    /// Copy the 2nd-to-top expression to the top
-    Over,
-}
-
-impl PlaceholderOp {
-    /// Get the name of this placeholder operation
-    pub fn name(&self) -> &'static str {
-        match self {
-            PlaceholderOp::Call => "call",
-            PlaceholderOp::Dup => "dup",
-            PlaceholderOp::Flip => "flip",
-            PlaceholderOp::Over => "over",
-        }
-    }
-}
-
-impl fmt::Display for PlaceholderOp {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PlaceholderOp::Call => write!(f, "^!"),
-            PlaceholderOp::Dup => write!(f, "^."),
-            PlaceholderOp::Flip => write!(f, "^:"),
-            PlaceholderOp::Over => write!(f, "^,"),
+            Word::Subscripted(sub) => sub.fmt(f),
+            Word::InlineMacro(InlineMacro { ident, func, .. }) => {
+                write!(f, "func_macro({:?}{}))", func.value, ident.value)
+            }
         }
     }
 }
 
 /// A refered-to item
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 pub struct Ref {
     /// The module path of the item
     pub path: Vec<RefComponent>,
@@ -291,7 +493,7 @@ pub struct Ref {
 }
 
 /// A component of a reference
-#[derive(Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RefComponent {
     /// The name of the module
     pub module: Sp<Ident>,
@@ -341,22 +543,54 @@ impl fmt::Display for Ref {
 }
 
 /// A stack array notation term
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 pub struct Arr {
+    /// The span of preceding `↓`
+    pub down_span: Option<CodeSpan>,
     /// The words in the array
-    pub lines: Vec<Vec<Sp<Word>>>,
+    pub lines: Vec<Item>,
     /// Whether this is a box array
     pub boxes: bool,
     /// Whether a closing bracket was found
     pub closed: bool,
 }
 
+impl Arr {
+    /// Get the lines that contain words
+    pub fn word_lines(&self) -> impl DoubleEndedIterator<Item = &[Sp<Word>]> {
+        self.lines
+            .iter()
+            .filter_map(|line| match line {
+                Item::Words(words) => Some(words),
+                _ => None,
+            })
+            .map(|v| v.as_slice())
+    }
+    /// Get the mutable lines that contain words
+    pub fn word_lines_mut(&mut self) -> impl Iterator<Item = &mut Vec<Sp<Word>>> {
+        self.lines.iter_mut().filter_map(|line| match line {
+            Item::Words(words) => Some(words),
+            _ => None,
+        })
+    }
+}
+
 impl fmt::Debug for Arr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut d = f.debug_tuple("arr");
         for line in &self.lines {
-            for word in line {
-                d.field(&word.value);
+            match line {
+                Item::Words(line) => {
+                    for word in line {
+                        d.field(&word.value);
+                    }
+                    if line.is_empty() {
+                        d.field(&"newline");
+                    }
+                }
+                item => {
+                    d.field(item);
+                }
             }
         }
         d.finish()
@@ -364,16 +598,49 @@ impl fmt::Debug for Arr {
 }
 
 /// An inline function
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Serialize)]
 pub struct Func {
-    /// The function's id
-    pub id: FunctionId,
     /// The function's signature
     pub signature: Option<Sp<Signature>>,
     /// The function's code
-    pub lines: Vec<Vec<Sp<Word>>>,
+    pub lines: Vec<Item>,
     /// Whether a closing parenthesis was found
     pub closed: bool,
+}
+
+impl Func {
+    /// Get the lines of the function without leading or trailing empty lines
+    pub fn trimmed_lines(&self) -> &[Item] {
+        let mut lines = self.lines.as_slice();
+        while lines.first().is_some_and(Item::is_empty_line) {
+            lines = &lines[1..];
+        }
+        while lines.last().is_some_and(Item::is_empty_line) {
+            lines = &lines[..lines.len() - 1];
+        }
+        lines
+    }
+    /// Whether the function visibly has multiple lines
+    pub fn is_multiline(&self) -> bool {
+        self.trimmed_lines().len() > 1
+    }
+    /// Get the lines that contain words
+    pub fn word_lines(&self) -> impl Iterator<Item = &[Sp<Word>]> {
+        self.lines
+            .iter()
+            .filter_map(|line| match line {
+                Item::Words(words) => Some(words),
+                _ => None,
+            })
+            .map(|v| v.as_slice())
+    }
+    /// Get the mutable lines that contain words
+    pub fn word_lines_mut(&mut self) -> impl Iterator<Item = &mut Vec<Sp<Word>>> {
+        self.lines.iter_mut().filter_map(|line| match line {
+            Item::Words(words) => Some(words),
+            _ => None,
+        })
+    }
 }
 
 impl fmt::Debug for Func {
@@ -381,32 +648,69 @@ impl fmt::Debug for Func {
         let mut d = f.debug_tuple("func");
         // d.field(&self.id);
         for line in &self.lines {
-            for word in line {
-                d.field(&word.value);
+            match line {
+                Item::Words(line) => {
+                    for word in line {
+                        d.field(&word.value);
+                    }
+                    if line.is_empty() {
+                        d.field(&"newline");
+                    }
+                }
+                item => {
+                    d.field(item);
+                }
             }
         }
         d.finish()
     }
 }
 
-/// A switch function
-#[derive(Debug, Clone)]
-pub struct Switch {
-    /// The branches of the switch
+/// A function pack
+#[derive(Debug, Clone, Serialize)]
+pub struct FunctionPack {
+    /// The span of preceding `↓`
+    pub down_span: Option<CodeSpan>,
+    /// The branches of the pack
     pub branches: Vec<Sp<Func>>,
     /// Whether a closing parenthesis was found
     pub closed: bool,
-    /// Whether the switch uses angle brackets
-    pub angled: bool,
+}
+
+impl FunctionPack {
+    /// Iterate over the branches in lexical order
+    pub fn lexical_order(&self) -> impl DoubleEndedIterator<Item = &Sp<Func>> {
+        let mut branches: Vec<_> = self.branches.iter().collect();
+        branches.sort_by_key(|func| func.span.start.col);
+        if self.down_span.is_some() {
+            branches.sort_by_key(|func| -(func.span.start.line as i32));
+        } else {
+            branches.sort_by_key(|func| func.span.start.line);
+        }
+        branches.into_iter()
+    }
+    /// Iterate over the branches in lexical order
+    pub fn into_lexical_order(self) -> impl DoubleEndedIterator<Item = Sp<Func>> {
+        let mut branches = self.branches;
+        branches.sort_by_key(|func| func.span.start.col);
+        if self.down_span.is_some() {
+            branches.sort_by_key(|func| -(func.span.start.line as i32));
+        } else {
+            branches.sort_by_key(|func| func.span.start.line);
+        }
+        branches.into_iter()
+    }
 }
 
 /// A modifier with operands
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 pub struct Modified {
     /// The modifier itself
     pub modifier: Sp<Modifier>,
     /// The operands
     pub operands: Vec<Sp<Word>>,
+    /// Whether this was generated with a function pack
+    pub pack_expansion: bool,
 }
 
 impl Modified {
@@ -427,12 +731,15 @@ impl fmt::Debug for Modified {
 }
 
 /// A modifier
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Serialize)]
+#[serde(tag = "type", content = "value")]
 pub enum Modifier {
     /// A primitive modifier
     Primitive(Primitive),
     /// A user-defined modifier
     Ref(Ref),
+    /// An inline macro
+    Macro(InlineMacro),
 }
 
 impl fmt::Debug for Modifier {
@@ -440,6 +747,7 @@ impl fmt::Debug for Modifier {
         match self {
             Modifier::Primitive(prim) => prim.fmt(f),
             Modifier::Ref(refer) => write!(f, "ref({refer:?})"),
+            Modifier::Macro(mac) => write!(f, "macro({:?}{})", mac.func, mac.ident),
         }
     }
 }
@@ -449,6 +757,13 @@ impl fmt::Display for Modifier {
         match self {
             Modifier::Primitive(prim) => prim.format().fmt(f),
             Modifier::Ref(refer) => write!(f, "{refer}"),
+            Modifier::Macro(mac) => match ident_modifier_args(&mac.ident.value) {
+                0 | 1 => write!(f, "monadic inline macro"),
+                2 => write!(f, "dyadic inline macro"),
+                3 => write!(f, "triadic inline macro"),
+                4 => write!(f, "tetradic inline macro"),
+                _ => write!(f, "inline macro"),
+            },
         }
     }
 }
@@ -458,7 +773,154 @@ impl Modifier {
     pub fn args(&self) -> usize {
         match self {
             Modifier::Primitive(prim) => prim.modifier_args().unwrap_or(0),
-            Modifier::Ref(refer) => refer.modifier_args(),
+            Modifier::Ref(r) => r.modifier_args(),
+            Modifier::Macro(mac) => ident_modifier_args(&mac.ident.value),
         }
+    }
+}
+
+/// A subscripted word
+#[derive(Clone, Serialize)]
+pub struct Subscripted {
+    /// The subscript
+    pub script: Sp<Subscript>,
+    /// The modified word
+    pub word: Sp<Word>,
+}
+
+/// A subscripts
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
+#[serde(default)]
+pub struct Subscript<N = NumericSubscript> {
+    /// The numeric part of the subscript
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num: Option<N>,
+    /// The sided part of the subscript
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub side: Option<SidedSubscript>,
+}
+
+/// The numeric part of a subscript
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum NumericSubscript {
+    /// Only a negative sign
+    NegOnly,
+    /// The number is too large to be represented
+    TooLarge,
+    /// A valid number
+    #[serde(untagged)]
+    N(i32),
+}
+
+/// The sided part of a subscript
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SidedSubscript {
+    /// The side
+    pub side: SubSide,
+    /// An additional quantifying number
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<usize>,
+}
+
+/// A sided subscript
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[allow(missing_docs)]
+pub enum SubSide {
+    Left,
+    Right,
+}
+
+impl Subscript {
+    /// Make a pure numeric subscript
+    pub fn numeric(i: i32) -> Self {
+        Self {
+            num: Some(NumericSubscript::N(i)),
+            side: None,
+        }
+    }
+    /// Check if the subscript is useable
+    pub fn is_useable(&self) -> bool {
+        matches!(self.num, Some(NumericSubscript::N(_))) || self.side.is_some()
+    }
+    /// Get the numeric part of the subscript as an integer, if it exists
+    pub fn n(&self) -> Option<i32> {
+        self.num.and_then(|n| match n {
+            NumericSubscript::N(n) => Some(n),
+            _ => None,
+        })
+    }
+}
+
+impl<N> Subscript<N> {
+    /// Map the numeric part of the subscript
+    pub fn map_num<M>(self, f: impl FnOnce(N) -> M) -> Subscript<M> {
+        Subscript {
+            num: self.num.map(f),
+            side: self.side,
+        }
+    }
+}
+
+impl fmt::Display for SubSide {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SubSide::Left => write!(f, "⌞"),
+            SubSide::Right => write!(f, "⌟"),
+        }
+    }
+}
+
+impl fmt::Display for NumericSubscript {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NumericSubscript::NegOnly => write!(f, "₋"),
+            NumericSubscript::N(n) => {
+                if *n < 0 {
+                    write!(f, "₋")?;
+                }
+                for c in n.abs().to_string().chars() {
+                    write!(f, "{}", SUBSCRIPT_DIGITS[(c as u32 as u8 - b'0') as usize])?;
+                }
+                Ok(())
+            }
+            NumericSubscript::TooLarge => write!(f, "…"),
+        }
+    }
+}
+
+impl fmt::Display for SidedSubscript {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.side.fmt(f)?;
+        if let Some(n) = self.n {
+            for c in n.to_string().chars() {
+                write!(f, "{}", SUBSCRIPT_DIGITS[(c as u32 as u8 - b'0') as usize])?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<N: fmt::Display> fmt::Display for Subscript<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.num.is_none() && self.side.is_none() {
+            return write!(f, "__");
+        };
+        if let Some(num) = &self.num {
+            num.fmt(f)?;
+        }
+        if let Some(side) = self.side {
+            side.fmt(f)?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for Subscripted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.word.value.fmt(f)?;
+        write!(f, "{}", self.script.value)
     }
 }

@@ -1,14 +1,16 @@
-✅ ← ⍤⟜≍:0
+✅ ← ⍤⤙≍ 0 &runi
 
-¬∊ □"resume" &args
-⍥(
-  ✅&runi {"git" "checkout" "site"}
-  ✅&runi {"git" "reset" "--hard" "origin/site"}
-  ✅&runi {"git" "rebase" "main"}
+$Branch ⍣(°□⊡+1)"main"⊸(↧⊃(⊗□"-b"|⊗□"--branch")) &args
+$Resume ¬∊ &args □"resume"
+⊸⍥(
+  ✅ {"git" "checkout" "site" "--"}
+  ✅ {"git" "reset" "--hard" "origin/site"}
+  ✅ {"git" "rebase" ∘}
 )
 &cd "site"
-✅&runi {"trunk" "build" "--release"}
-✅&runi {"git" "add" "--all"}
-✅&runi {"git" "commit" "--amend" "--no-edit"}
-✅&runi {"git" "push" "-f"}
-✅&runi {"git" "checkout" "main"}
+✅ {"cargo" "test" "-p" "site" "gen_blog_html"}
+✅ {"trunk" "build" "--release" "-d" "../docs"}
+✅ {"git" "add" "--all"}
+✅ {"git" "commit" "--amend" "--no-edit"}
+✅ {"git" "push" "-f"}
+✅ {"git" "checkout" ∘}

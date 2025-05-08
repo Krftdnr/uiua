@@ -2,6 +2,8 @@
 
 2024-01-19
 
+---
+
 The [Uiua pad](https://uiua.org/pad) page prominently displays the words "Uiua is not yet stable". And so it has been asked: when will Uiua be stable? What features will it have? Is there a roadmap?
 
 This post is to organize and present my thoughts on the future of Uiua.
@@ -16,7 +18,7 @@ The following language features will need to be nailed down before Uiua can ever
 
 I think working with the stack, at least for up to 3 values, has become mostly pretty nice. However, things start to get complicated when working with more values, as is often necessary. There is some design work to be done here, and it's not out of the question that a very small amount of non-tacitness could be introduced to improve this.
 
-The experimental [`bind`](https://uiua.org/docs/bind) modifier is a potential solution to this problem.
+The experimental [`bind`](https://uiua.org/docs/experimental#swizzles) modifier is a potential solution to this problem.
 
 There is a balance to be struc between Uiua's goal of tacitness and its goal of being ergonomic. While the beauty of fully tacit code is a worthy goal, some problems involve data flows that are inherently complex, and so some kind of labeling system may be necessary to make such problems workable.
 

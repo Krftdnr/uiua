@@ -1,79 +1,17 @@
 //! Algorithms for pervasive array operations
 
+use std::iter::repeat_n;
 use std::{
-    cmp::{self, Ordering},
-    convert::Infallible,
-    fmt::Display,
-    marker::PhantomData,
-    slice::{self, ChunksExact},
+    cmp::Ordering, convert::Infallible, fmt::Display, iter::repeat, marker::PhantomData, mem::swap,
 };
 
-use crate::{array::*, cowslice::CowSlice, Uiua, UiuaError, UiuaResult};
+use ecow::eco_vec;
+
+use crate::fill::FillValue;
+use crate::{algorithm::loops::flip, array::*, Uiua, UiuaError, UiuaResult, Value};
 use crate::{Complex, Shape};
 
-use super::fill_array_shapes;
-
-#[allow(clippy::len_without_is_empty)]
-pub trait Arrayish {
-    type Value: ArrayValue;
-    fn shape(&self) -> &[usize];
-    fn data(&self) -> &[Self::Value];
-    fn rank(&self) -> usize {
-        self.shape().len()
-    }
-    fn flat_len(&self) -> usize {
-        self.data().len()
-    }
-    fn row_len(&self) -> usize {
-        self.shape().iter().skip(1).product()
-    }
-    fn rows(&self) -> ChunksExact<Self::Value> {
-        self.data().chunks_exact(self.row_len().max(1))
-    }
-}
-
-impl<'a, T> Arrayish for &'a T
-where
-    T: Arrayish,
-{
-    type Value = T::Value;
-    fn shape(&self) -> &[usize] {
-        T::shape(self)
-    }
-    fn data(&self) -> &[Self::Value] {
-        T::data(self)
-    }
-}
-
-impl<T: ArrayValue> Arrayish for Array<T> {
-    type Value = T;
-    fn shape(&self) -> &[usize] {
-        &self.shape
-    }
-    fn data(&self) -> &[Self::Value] {
-        &self.data
-    }
-}
-
-impl<T: ArrayValue> Arrayish for (&[usize], &[T]) {
-    type Value = T;
-    fn shape(&self) -> &[usize] {
-        self.0
-    }
-    fn data(&self) -> &[Self::Value] {
-        self.1
-    }
-}
-
-impl<T: ArrayValue> Arrayish for (&[usize], &mut [T]) {
-    type Value = T;
-    fn shape(&self) -> &[usize] {
-        self.0
-    }
-    fn data(&self) -> &[Self::Value] {
-        self.1
-    }
-}
+use super::{multi_output, FillContext, MultiOutput};
 
 pub trait PervasiveFn<A, B> {
     type Output;
@@ -121,36 +59,72 @@ where
     }
 }
 
-fn reshape_depths<A, B>(a: &mut Array<A>, b: &mut Array<B>, mut a_depth: usize, mut b_depth: usize)
-where
-    A: ArrayValue,
-    B: ArrayValue,
-{
-    a_depth = a_depth.min(a.rank());
-    b_depth = b_depth.min(b.rank());
-    match a_depth.cmp(&b_depth) {
-        Ordering::Equal => {}
-        Ordering::Less => {
-            for b_dim in b.shape[..b_depth - a_depth].iter().rev() {
-                a.reshape_scalar(Ok(*b_dim as isize));
-            }
-        }
-        Ordering::Greater => {
-            for a_dim in a.shape[..a_depth - b_depth].iter().rev() {
-                b.reshape_scalar(Ok(*a_dim as isize));
-            }
-        }
+pub(crate) fn pervade_dim(a: usize, b: usize) -> usize {
+    if a == b {
+        a
+    } else if a == 1 {
+        b
+    } else if b == 1 {
+        a
+    } else {
+        a.max(b)
     }
 }
 
-pub fn bin_pervade<A, B, C, F>(
-    mut a: Array<A>,
-    mut b: Array<B>,
-    a_depth: usize,
-    b_depth: usize,
+fn derive_new_shape(
+    ash: &Shape,
+    bsh: &Shape,
+    a_fill_sh: Result<&Shape, &'static str>,
+    b_fill_sh: Result<&Shape, &'static str>,
     env: &Uiua,
-    f: F,
-) -> UiuaResult<Array<C>>
+) -> UiuaResult<Shape> {
+    let new_rank = ash.len().max(bsh.len());
+    let mut new_shape = Shape::with_capacity(new_rank);
+    for i in 0..new_rank {
+        let c = match (ash.get(i).copied(), bsh.get(i).copied()) {
+            (None, None) => unreachable!(),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (Some(ad), Some(bd)) => {
+                if ad == bd || (ad == 1 && a_fill_sh.is_err()) || (bd == 1 && b_fill_sh.is_err()) {
+                    pervade_dim(ad, bd)
+                } else if ad < bd {
+                    match a_fill_sh {
+                        Ok(sh) if !ash.row_slice().ends_with(sh) => {
+                            return Err(env.error(format!(
+                                "Fill shape {sh} cannot be used to fill array with shape {ash}"
+                            )));
+                        }
+                        Ok(_) => ad.max(bd),
+                        Err(e) => {
+                            return Err(
+                                env.error(format!("Shapes {ash} and {bsh} are not compatible{e}"))
+                            )
+                        }
+                    }
+                } else {
+                    match b_fill_sh {
+                        Ok(sh) if !bsh.row_slice().ends_with(sh) => {
+                            return Err(env.error(format!(
+                                "Fill shape {sh} cannot be used to fill array with shape {bsh}"
+                            )));
+                        }
+                        Ok(_) => ad.max(bd),
+                        Err(e) => {
+                            return Err(
+                                env.error(format!("Shapes {ash} and {bsh} are not compatible{e}"))
+                            )
+                        }
+                    }
+                }
+            }
+        };
+        new_shape.push(c);
+    }
+    Ok(new_shape)
+}
+
+pub fn bin_pervade<A, B, C, F>(a: Array<A>, b: Array<B>, env: &Uiua, f: F) -> UiuaResult<Array<C>>
 where
     A: ArrayValue,
     B: ArrayValue,
@@ -158,226 +132,690 @@ where
     F: PervasiveFn<A, B, Output = C> + Clone,
     F::Error: Into<UiuaError>,
 {
-    // Account for depths
-    reshape_depths(&mut a, &mut b, a_depth, b_depth);
-    // Fill
-    fill_array_shapes(&mut a, &mut b, env)?;
-    // Pervade
-    let shape = a.shape().max(b.shape()).clone();
-    let mut data = CowSlice::with_capacity(a.element_count().max(b.element_count()));
-    bin_pervade_recursive(&a, &b, &mut data, env, f).map_err(Into::into)?;
-    Ok(Array::new(shape, data))
+    let a_fill = env.scalar_fill::<A>();
+    let b_fill = env.scalar_fill::<B>();
+    let new_shape = derive_new_shape(
+        &a.shape,
+        &b.shape,
+        a_fill.as_ref().map(|_| &Shape::SCALAR).map_err(|&e| e),
+        b_fill.as_ref().map(|_| &Shape::SCALAR).map_err(|&e| e),
+        env,
+    )?;
+
+    // dbg!(&a.shape, &b.shape, &new_shape);
+
+    let mut new_data = eco_vec![C::default(); new_shape.elements()];
+    if !new_shape.contains(&0) {
+        let slice = new_data.make_mut();
+        let a_fill = a_fill.as_ref().ok();
+        let b_fill = b_fill.as_ref().ok();
+        bin_pervade_recursive(
+            (&a.data, &a.shape),
+            (&b.data, &b.shape),
+            slice,
+            a_fill,
+            b_fill,
+            f,
+            env,
+        )
+        .map_err(Into::into)?;
+    }
+    Ok(Array::new(new_shape, new_data))
 }
 
-fn bin_pervade_recursive<A, B, C, F>(
-    a: &A,
-    b: &B,
-    c: &mut CowSlice<C>,
-    env: &Uiua,
+pub(crate) fn bin_pervade_recursive<A, B, C, F>(
+    (a, ash): (&[A], &[usize]),
+    (b, bsh): (&[B], &[usize]),
+    c: &mut [C],
+    a_fill: Option<&FillValue<A>>,
+    b_fill: Option<&FillValue<B>>,
     f: F,
+    env: &Uiua,
 ) -> Result<(), F::Error>
 where
-    A: Arrayish,
-    B: Arrayish,
-    C: ArrayValue,
-    F: PervasiveFn<A::Value, B::Value, Output = C> + Clone,
+    A: ArrayValue + Clone,
+    B: ArrayValue + Clone,
+    C: ArrayValue + Clone,
+    F: PervasiveFn<A, B, Output = C> + Clone,
 {
-    match (a.shape(), b.shape()) {
-        ([], []) => c.extend_from_array([f.call(a.data()[0].clone(), b.data()[0].clone(), env)?]),
-        (ash, bsh) if ash == bsh => {
-            c.try_extend(
-                a.data()
-                    .iter()
-                    .zip(b.data())
-                    .map(|(a, b)| f.call(a.clone(), b.clone(), env)),
-            )?;
+    let recur = |a: &[A], ash: &[usize], b: &[B], bsh: &[usize], c: &mut [C]| {
+        bin_pervade_recursive((a, ash), (b, bsh), c, a_fill, b_fill, f.clone(), env)
+    };
+    match (ash, bsh) {
+        ([], []) => {
+            let (a, b) = (a[0].clone(), b[0].clone());
+            c[0] = f.call(a, b, env)?;
         }
-        ([], bsh) => {
-            for brow in b.rows() {
-                bin_pervade_recursive(a, &(&bsh[1..], brow), c, env, f.clone())?;
+        // Scalar A
+        ([], [_, ..]) => {
+            let a = &a[0];
+            for (b, c) in b.iter().zip(c) {
+                *c = f.call(a.clone(), b.clone(), env)?;
             }
         }
-        (ash, []) => {
-            for arow in a.rows() {
-                bin_pervade_recursive(&(&ash[1..], arow), b, c, env, f.clone())?;
+        // Scalar B
+        ([_, ..], []) => {
+            let b = &b[0];
+            for (a, c) in a.iter().zip(c) {
+                *c = f.call(a.clone(), b.clone(), env)?;
             }
         }
-        (ash, bsh) => {
-            for (arow, brow) in a.rows().zip(b.rows()) {
-                bin_pervade_recursive(&(&ash[1..], arow), &(&bsh[1..], brow), c, env, f.clone())?;
+        ([al, ash @ ..], [bl, bsh @ ..]) => {
+            let a_row_len: usize = ash.iter().product();
+            let b_row_len: usize = bsh.iter().product();
+            let c_row_len = c.len() / al.max(bl);
+            if al == bl {
+                if ash == bsh {
+                    for ((a, b), c) in a.iter().zip(b).zip(c) {
+                        *c = f.call(a.clone(), b.clone(), env)?;
+                    }
+                } else {
+                    match (a_row_len, b_row_len) {
+                        (0, 0) => {}
+                        (0, _) => {
+                            let a = vec![a_fill.unwrap().value.clone(); b_row_len];
+                            for (b, c) in
+                                b.chunks_exact(b_row_len).zip(c.chunks_exact_mut(c_row_len))
+                            {
+                                recur(&a, ash, b, bsh, c)?;
+                            }
+                        }
+                        (_, 0) => {
+                            let b = vec![b_fill.unwrap().value.clone(); a_row_len];
+                            for (a, c) in
+                                a.chunks_exact(a_row_len).zip(c.chunks_exact_mut(c_row_len))
+                            {
+                                recur(a, ash, &b, bsh, c)?;
+                            }
+                        }
+                        _ => {
+                            for ((a, b), c) in a
+                                .chunks_exact(a_row_len)
+                                .zip(b.chunks_exact(b_row_len))
+                                .zip(c.chunks_exact_mut(c_row_len))
+                            {
+                                recur(a, ash, b, bsh, c)?;
+                            }
+                        }
+                    }
+                }
+            } else if al < bl {
+                if let Some(a_fill) = a_fill {
+                    let a_fill_row = vec![a_fill.value.clone(); a_row_len];
+                    if a_fill.is_left() {
+                        let a_iter = repeat_n(a_fill_row.as_slice(), *bl - *al)
+                            .chain(a.chunks_exact(a_row_len.max(1)));
+                        for ((a, b), c) in a_iter
+                            .zip(b.chunks_exact(b_row_len))
+                            .zip(c.chunks_exact_mut(c_row_len))
+                        {
+                            recur(a, ash, b, bsh, c)?;
+                        }
+                    } else {
+                        let a_iter = a
+                            .chunks_exact(a_row_len.max(1))
+                            .chain(repeat(a_fill_row.as_slice()));
+                        for ((a, b), c) in a_iter
+                            .zip(b.chunks_exact(b_row_len))
+                            .zip(c.chunks_exact_mut(c_row_len))
+                        {
+                            recur(a, ash, b, bsh, c)?;
+                        }
+                    }
+                } else if ash == bsh {
+                    for (b, c) in b.chunks_exact(b_row_len).zip(c.chunks_exact_mut(c_row_len)) {
+                        for ((a, b), c) in a.iter().zip(b).zip(c) {
+                            *c = f.call(a.clone(), b.clone(), env)?;
+                        }
+                    }
+                } else {
+                    for (b, c) in b.chunks_exact(b_row_len).zip(c.chunks_exact_mut(c_row_len)) {
+                        recur(a, ash, b, bsh, c)?;
+                    }
+                }
+            } else if let Some(b_fill) = b_fill {
+                let b_fill_row = vec![b_fill.value.clone(); b_row_len];
+                if b_fill.is_left() {
+                    let b_iter = repeat_n(b_fill_row.as_slice(), *al - *bl)
+                        .chain(b.chunks_exact(b_row_len.max(1)));
+                    for ((a, b), c) in a
+                        .chunks_exact(a_row_len)
+                        .zip(b_iter)
+                        .zip(c.chunks_exact_mut(c_row_len))
+                    {
+                        recur(a, ash, b, bsh, c)?;
+                    }
+                } else {
+                    let b_iter = b
+                        .chunks_exact(b_row_len.max(1))
+                        .chain(repeat(b_fill_row.as_slice()));
+                    for ((a, b), c) in a
+                        .chunks_exact(a_row_len)
+                        .zip(b_iter)
+                        .zip(c.chunks_exact_mut(c_row_len))
+                    {
+                        recur(a, ash, b, bsh, c)?;
+                    }
+                }
+            } else if ash == bsh {
+                for (a, c) in a.chunks_exact(a_row_len).zip(c.chunks_exact_mut(c_row_len)) {
+                    for ((a, b), c) in a.iter().zip(b).zip(c) {
+                        *c = f.call(a.clone(), b.clone(), env)?;
+                    }
+                }
+            } else {
+                for (a, c) in a.chunks_exact(a_row_len).zip(c.chunks_exact_mut(c_row_len)) {
+                    recur(a, ash, b, bsh, c)?;
+                }
             }
         }
     }
     Ok(())
 }
 
+/// Pervade an operation where both input types and the output type are all the same
 pub fn bin_pervade_mut<T>(
-    a: &mut Array<T>,
-    mut b: Array<T>,
-    a_depth: usize,
-    b_depth: usize,
+    mut a: Array<T>,
+    b: &mut Array<T>,
     env: &Uiua,
     f: impl Fn(T, T) -> T + Copy,
 ) -> UiuaResult
 where
     T: ArrayValue + Copy,
 {
-    // Account for depths
-    reshape_depths(a, &mut b, a_depth, b_depth);
-    // Fill
-    fill_array_shapes(a, &mut b, env)?;
-    // Pervade
-    let ash = a.shape.dims();
-    let bsh = b.shape.dims();
-    // Try to avoid copying when possible
-    if ash == bsh {
-        if a.data.is_copy_of(&b.data) {
-            drop(b);
-            let a_data = a.data.as_mut_slice();
-            for a in a_data {
-                *a = f(*a, *a);
-            }
-        } else if b.data.is_unique() {
-            let a_data = a.data.as_slice();
-            let b_data = b.data.as_mut_slice();
-            for (a, b) in a_data.iter().zip(b_data) {
-                *b = f(*a, *b);
-            }
-            *a = b;
-        } else {
-            let a_data = a.data.as_mut_slice();
-            let b_data = b.data.as_slice();
-            for (a, b) in a_data.iter_mut().zip(b_data) {
-                *a = f(*a, *b);
-            }
+    fn derive_new_shape(
+        ash: &Shape,
+        bsh: &Shape,
+        fill_err: Option<&str>,
+        env: &Uiua,
+    ) -> UiuaResult<(Shape, bool)> {
+        let new_rank = ash.len().max(bsh.len());
+        let mut new_shape = Shape::with_capacity(new_rank);
+        let mut requires_fill = false;
+        for i in 0..new_rank {
+            let c = match (ash.get(i).copied(), bsh.get(i).copied()) {
+                (None, None) => unreachable!(),
+                (Some(a), None) => a,
+                (None, Some(b)) => b,
+                (Some(ad), Some(bd)) => {
+                    if ad == bd || ad == 1 || bd == 1 {
+                        match fill_err {
+                            None => {
+                                requires_fill |= ad != bd;
+                                ad.max(bd)
+                            }
+                            Some(_) => pervade_dim(ad, bd),
+                        }
+                    } else {
+                        match &fill_err {
+                            None => {
+                                requires_fill = true;
+                                pervade_dim(ad, bd)
+                            }
+                            Some(e) => {
+                                return Err(env.error(format!(
+                                    "Shapes {ash} and {bsh} are not compatible{e}"
+                                )))
+                            }
+                        }
+                    }
+                }
+            };
+            new_shape.push(c);
         }
-    } else if ash.contains(&0) || bsh.contains(&0) {
-        if ash.len() < bsh.len() {
-            *a = b;
+        Ok((new_shape, requires_fill))
+    }
+
+    let fill = env.scalar_fill::<T>();
+    let (new_shape, requires_fill) =
+        derive_new_shape(&a.shape, &b.shape, fill.as_ref().err().copied(), env)?;
+    let fill = if requires_fill { fill.ok() } else { None };
+
+    // dbg!(a.shape, b.shape, &new_shape, &fill);
+
+    fn reuse_no_fill<T: ArrayValue + Copy>(
+        a: &[T],
+        b: &mut [T],
+        ash: &[usize],
+        bsh: &[usize],
+        f: impl Fn(T, T) -> T + Copy,
+    ) {
+        match (ash, bsh) {
+            ([], _) => {
+                for b in b {
+                    *b = f(a[0], *b);
+                }
+            }
+            ([1, ash @ ..], [bl, bsh @ ..]) => {
+                let b_row_len = b.len() / bl;
+                if ash == bsh {
+                    for b in b.chunks_exact_mut(b_row_len) {
+                        for (a, b) in a.iter().zip(b) {
+                            *b = f(*a, *b);
+                        }
+                    }
+                } else {
+                    for b in b.chunks_exact_mut(b_row_len) {
+                        reuse_no_fill(a, b, ash, bsh, f);
+                    }
+                }
+            }
+            ([al, ash @ ..], [bl, bsh @ ..]) => {
+                debug_assert_eq!(al, bl);
+                if ash == bsh {
+                    for (a, b) in a.iter().zip(b) {
+                        *b = f(*a, *b);
+                    }
+                } else {
+                    let a_row_len = a.len() / al;
+                    let b_row_len = b.len() / bl;
+                    for (a, b) in a.chunks_exact(a_row_len).zip(b.chunks_exact_mut(b_row_len)) {
+                        reuse_no_fill(a, b, ash, bsh, f);
+                    }
+                }
+            }
+            _ => unreachable!(),
         }
-    } else {
-        match ash.len().cmp(&bsh.len()) {
-            Ordering::Greater => {
-                let a_data = a.data.as_mut_slice();
-                let b_data = b.data.as_slice();
-                bin_pervade_recursive_mut_left(a_data, ash, b_data, bsh, f);
+    }
+    fn reuse_fill<T: ArrayValue + Copy>(
+        a: &[T],
+        b: &mut [T],
+        ash: &[usize],
+        bsh: &[usize],
+        fill: FillValue<T>,
+        f: impl Fn(T, T) -> T + Copy,
+    ) {
+        match (ash, bsh) {
+            ([], _) => {
+                for b in b {
+                    *b = f(a[0], *b);
+                }
             }
-            Ordering::Less => {
-                let a_data = a.data.as_slice();
-                let b_data = b.data.as_mut_slice();
-                bin_pervade_recursive_mut_right(a_data, ash, b_data, bsh, f);
-                *a = b;
+            ([al, ash @ ..], [bl, bsh @ ..]) => {
+                let a_row_len: usize = ash.iter().product();
+                let b_row_len = b.len() / bl;
+                if al == bl {
+                    if a_row_len == 0 {
+                        let a = vec![fill.value; b_row_len];
+                        for b in b.chunks_exact_mut(b_row_len) {
+                            reuse_fill(&a, b, ash, bsh, fill, f);
+                        }
+                    } else {
+                        for (a, b) in a.chunks_exact(a_row_len).zip(b.chunks_exact_mut(b_row_len)) {
+                            reuse_fill(a, b, ash, bsh, fill, f);
+                        }
+                    }
+                } else if a_row_len == 0 {
+                    for b in b.chunks_exact_mut(b_row_len) {
+                        reuse_fill(&[], b, ash, bsh, fill, f);
+                    }
+                } else {
+                    let fill_row = vec![fill.value; a_row_len];
+                    if fill.is_left() {
+                        for (a, b) in repeat_n(fill_row.as_slice(), *bl - *al)
+                            .chain(a.chunks_exact(a_row_len))
+                            .zip(b.chunks_exact_mut(b_row_len))
+                        {
+                            reuse_fill(a, b, ash, bsh, fill, f);
+                        }
+                    } else {
+                        for (a, b) in a
+                            .chunks_exact(a_row_len)
+                            .chain(repeat(fill_row.as_slice()))
+                            .zip(b.chunks_exact_mut(b_row_len))
+                        {
+                            reuse_fill(a, b, ash, bsh, fill, f);
+                        }
+                    }
+                }
             }
-            Ordering::Equal => {
-                let a_data = a.data.as_mut_slice();
-                let b_data = b.data.as_mut_slice();
-                bin_pervade_recursive_mut(a_data, ash, b_data, bsh, f);
+            _ => unreachable!(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn use_new_fill<T: ArrayValue + Copy>(
+        a: &[T],
+        b: &[T],
+        c: &mut [T],
+        ash: &[usize],
+        bsh: &[usize],
+        fill: FillValue<T>,
+        f: impl Fn(T, T) -> T + Copy,
+    ) {
+        match (ash, bsh) {
+            ([], []) => c[0] = f(a[0], b[0]),
+            ([], [_, ..]) => {
+                let a = a[0];
+                for (b, c) in b.iter().zip(c) {
+                    *c = f(a, *b);
+                }
+            }
+            ([_, ..], []) => {
+                let b = b[0];
+                for (a, c) in a.iter().zip(c) {
+                    *c = f(*a, b);
+                }
+            }
+            ([al, ash @ ..], [bl, bsh @ ..]) => {
+                let a_row_len = a.len() / al;
+                let b_row_len = b.len() / bl;
+                let c_row_len = c.len() / al.max(bl);
+                match al.cmp(bl) {
+                    Ordering::Equal => {
+                        if ash == bsh {
+                            for ((a, b), c) in a.iter().zip(b).zip(c) {
+                                *c = f(*a, *b);
+                            }
+                        } else {
+                            for ((a, b), c) in a
+                                .chunks_exact(a_row_len)
+                                .zip(b.chunks_exact(b_row_len))
+                                .zip(c.chunks_exact_mut(c_row_len))
+                            {
+                                use_new_fill(a, b, c, ash, bsh, fill, f);
+                            }
+                        }
+                    }
+                    Ordering::Less => {
+                        let a_fill_row = vec![fill.value; a_row_len];
+                        if fill.is_left() {
+                            let a_iter = repeat_n(a_fill_row.as_slice(), *bl - *al)
+                                .chain(a.chunks_exact(a_row_len));
+                            for ((a, b), c) in a_iter
+                                .zip(b.chunks_exact(b_row_len))
+                                .zip(c.chunks_exact_mut(c_row_len))
+                            {
+                                use_new_fill(a, b, c, ash, bsh, fill, f);
+                            }
+                        } else {
+                            let a_iter = a
+                                .chunks_exact(a_row_len)
+                                .chain(repeat(a_fill_row.as_slice()));
+                            for ((a, b), c) in a_iter
+                                .zip(b.chunks_exact(b_row_len))
+                                .zip(c.chunks_exact_mut(c_row_len))
+                            {
+                                use_new_fill(a, b, c, ash, bsh, fill, f);
+                            }
+                        }
+                    }
+                    Ordering::Greater => {
+                        let b_fill_row = vec![fill.value; b_row_len];
+                        if fill.is_left() {
+                            let b_iter = repeat_n(b_fill_row.as_slice(), *al - *bl)
+                                .chain(b.chunks_exact(b_row_len));
+                            for ((a, b), c) in a
+                                .chunks_exact(a_row_len)
+                                .zip(b_iter)
+                                .zip(c.chunks_exact_mut(c_row_len))
+                            {
+                                use_new_fill(a, b, c, ash, bsh, fill, f);
+                            }
+                        } else {
+                            let b_iter = b
+                                .chunks_exact(b_row_len)
+                                .chain(repeat(b_fill_row.as_slice()));
+                            for ((a, b), c) in a
+                                .chunks_exact(a_row_len)
+                                .zip(b_iter)
+                                .zip(c.chunks_exact_mut(c_row_len))
+                            {
+                                use_new_fill(a, b, c, ash, bsh, fill, f);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn use_new_no_fill<T: ArrayValue + Copy>(
+        a: &[T],
+        b: &[T],
+        c: &mut [T],
+        ash: &[usize],
+        bsh: &[usize],
+        f: impl Fn(T, T) -> T + Copy,
+    ) {
+        match (ash, bsh) {
+            ([], []) => c[0] = f(a[0], b[0]),
+            ([], [_, ..]) => {
+                let a = a[0];
+                for (b, c) in b.iter().zip(c) {
+                    *c = f(a, *b);
+                }
+            }
+            ([_, ..], []) => {
+                let b = b[0];
+                for (a, c) in a.iter().zip(c) {
+                    *c = f(*a, b);
+                }
+            }
+            ([al, ash @ ..], [bl, bsh @ ..]) => {
+                let a_row_len = a.len() / al;
+                let b_row_len = b.len() / bl;
+                let c_row_len = c.len() / al.max(bl);
+                match al.cmp(bl) {
+                    Ordering::Equal => {
+                        if ash == bsh {
+                            for ((a, b), c) in a.iter().zip(b).zip(c) {
+                                *c = f(*a, *b);
+                            }
+                        } else {
+                            for ((a, b), c) in a
+                                .chunks_exact(a_row_len)
+                                .zip(b.chunks_exact(b_row_len))
+                                .zip(c.chunks_exact_mut(c_row_len))
+                            {
+                                use_new_no_fill(a, b, c, ash, bsh, f);
+                            }
+                        }
+                    }
+                    Ordering::Less => {
+                        for (b, c) in b.chunks_exact(b_row_len).zip(c.chunks_exact_mut(c_row_len)) {
+                            use_new_no_fill(a, b, c, ash, bsh, f);
+                        }
+                    }
+                    Ordering::Greater => {
+                        for (a, c) in a.chunks_exact(a_row_len).zip(c.chunks_exact_mut(c_row_len)) {
+                            use_new_no_fill(a, b, c, ash, bsh, f);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if new_shape.contains(&0) {
+        b.shape = new_shape;
+        b.data = Default::default();
+    } else if new_shape == b.shape {
+        // The existing array can be used
+        if a.shape == b.shape {
+            // Try to avoid copying when possible
+            if a.data.is_copy_of(&b.data) {
+                drop(a);
+                let b_data = b.data.as_mut_slice();
+                for b in b_data {
+                    *b = f(*b, *b);
+                }
+            } else if a.data.is_unique() {
+                let a_data = a.data.as_mut_slice();
+                let b_data = b.data.as_slice();
+                for (a, b) in a_data.iter_mut().zip(b_data) {
+                    *a = f(*a, *b);
+                }
+                b.data = a.data;
+            } else {
+                let a_data = a.data.as_slice();
+                let b_data = b.data.as_mut_slice();
+                for (a, b) in a_data.iter().zip(b_data) {
+                    *b = f(*a, *b);
+                }
+            }
+        } else if let Some(fill) = fill {
+            reuse_fill(&a.data, b.data.as_mut_slice(), &a.shape, &b.shape, fill, f);
+        } else {
+            reuse_no_fill(&a.data, b.data.as_mut_slice(), &a.shape, &b.shape, f);
+        }
+    } else if new_shape == a.shape {
+        // An existing array can be used, but things need to be flipped
+        if let Some(fill) = fill {
+            reuse_fill(
+                &b.data,
+                a.data.as_mut_slice(),
+                &b.shape,
+                &a.shape,
+                fill,
+                flip(f),
+            );
+        } else {
+            reuse_no_fill(&b.data, a.data.as_mut_slice(), &b.shape, &a.shape, flip(f));
+        }
+        *b = a;
+    } else {
+        // Allocate a new array
+        let mut new_data = eco_vec![T::default(); new_shape.elements()];
+        let slice = new_data.make_mut();
+        if let Some(fill) = fill {
+            use_new_fill(&a.data, &b.data, slice, &a.shape, &b.shape, fill, f);
+        } else {
+            use_new_no_fill(&a.data, &b.data, slice, &a.shape, &b.shape, f);
+        }
+        b.data = new_data.into();
+        b.shape = new_shape;
+    }
+
     Ok(())
 }
 
-fn bin_pervade_recursive_mut<T>(
-    a_data: &mut [T],
-    a_shape: &[usize],
-    b_data: &mut [T],
-    b_shape: &[usize],
-    f: impl Fn(T, T) -> T + Copy,
-) where
-    T: Copy,
-{
-    match (a_shape, b_shape) {
-        ([], []) => {
-            panic!("should never call `bin_pervade_recursive_mut` with scalars")
-        }
-        (_, []) => {
-            let b_scalar = b_data[0];
-            for a in a_data {
-                *a = f(*a, b_scalar);
-            }
-        }
-        ([], _) => {
-            let a_scalar = a_data[0];
-            for b in b_data {
-                *b = f(a_scalar, *b);
-            }
-        }
-        (ash, bsh) => {
-            let a_row_len = a_data.len() / ash[0];
-            let b_row_len = b_data.len() / bsh[0];
-            for (a, b) in a_data
-                .chunks_exact_mut(a_row_len)
-                .zip(b_data.chunks_exact_mut(b_row_len))
-            {
-                bin_pervade_recursive_mut(a, &ash[1..], b, &bsh[1..], f);
-            }
-        }
-    }
-}
+pub(crate) fn bin_pervade_values(
+    a: Value,
+    b: Value,
+    a_fill: Result<Value, &'static str>,
+    b_fill: Result<Value, &'static str>,
+    outputs: usize,
+    env: &mut Uiua,
+    f: impl FnMut(Value, Value, &mut Uiua) -> UiuaResult<MultiOutput<Value>> + Clone,
+) -> UiuaResult<MultiOutput<Value>> {
+    let new_shape = derive_new_shape(
+        &a.shape,
+        &b.shape,
+        a_fill.as_ref().map(|a| &a.shape).map_err(|&e| e),
+        b_fill.as_ref().map(|b| &b.shape).map_err(|&e| e),
+        env,
+    )?;
 
-fn bin_pervade_recursive_mut_left<T>(
-    a_data: &mut [T],
-    a_shape: &[usize],
-    b_data: &[T],
-    b_shape: &[usize],
-    f: impl Fn(T, T) -> T + Copy,
-) where
-    T: Copy,
-{
-    match (a_shape, b_shape) {
-        ([], _) => {
-            panic!("should never call `bin_pervade_recursive_mut_left` with scalar left")
-        }
-        (_, []) => {
-            let b_scalar = b_data[0];
-            for a in a_data {
-                *a = f(*a, b_scalar);
+    #[allow(clippy::too_many_arguments)]
+    fn recur(
+        mut a: Value,
+        mut b: Value,
+        a_fill: Option<&Value>,
+        b_fill: Option<&Value>,
+        outputs: &mut MultiOutput<Vec<Value>>,
+        env: &mut Uiua,
+        mut f: impl FnMut(Value, Value, &mut Uiua) -> UiuaResult<MultiOutput<Value>> + Clone,
+    ) -> UiuaResult
+where {
+        let mut add_outputs = |news: MultiOutput<Value>| {
+            for (output, new) in outputs.iter_mut().zip(news) {
+                output.push(new);
             }
-        }
-        (ash, bsh) => {
-            let a_row_len = a_data.len() / ash[0];
-            let b_row_len = b_data.len() / bsh[0];
-            for (a, b) in a_data
-                .chunks_exact_mut(a_row_len)
-                .zip(b_data.chunks_exact(b_row_len))
-            {
-                bin_pervade_recursive_mut_left(a, &ash[1..], b, &bsh[1..], f);
+        };
+        match (&*a.shape, &*b.shape) {
+            ([], []) => add_outputs(f(a, b, env)?),
+            ([], [_]) => {
+                for b in b.into_rows() {
+                    add_outputs(f(a.clone(), b, env)?);
+                }
             }
+            ([_], []) => {
+                for a in a.into_rows() {
+                    add_outputs(f(a, b.clone(), env)?);
+                }
+            }
+            ([], [_, ..]) => {
+                for b in b.into_rows() {
+                    recur(a.clone(), b, a_fill, b_fill, outputs, env, f.clone())?;
+                }
+            }
+            ([_, ..], []) => {
+                for a in a.into_rows() {
+                    recur(a, b.clone(), a_fill, b_fill, outputs, env, f.clone())?;
+                }
+            }
+            ([al, ash @ ..], [bl, bsh @ ..]) => match (al.cmp(bl), a_fill, b_fill) {
+                (Ordering::Equal, _, _) => {
+                    for (a, b) in a.into_rows().zip(b.into_rows()) {
+                        recur(a, b, a_fill, b_fill, outputs, env, f.clone())?;
+                    }
+                }
+                (Ordering::Less, Some(a_fill), _) => {
+                    let mut a_fill_val = a_fill.clone();
+                    if a_fill_val.rank() + 1 < a.rank() {
+                        for &d in ash[..a.rank() - a_fill_val.rank() - 1].iter().rev() {
+                            a_fill_val.reshape_scalar(Ok(d as isize), true, env)?;
+                        }
+                    }
+                    let a_iter = a.into_rows().chain(repeat(a_fill_val));
+                    for (a, b) in a_iter.zip(b.into_rows()) {
+                        recur(a, b, Some(a_fill), b_fill, outputs, env, f.clone())?;
+                    }
+                }
+                (Ordering::Less, None, _) => {
+                    debug_assert_eq!(a.row_count(), 1);
+                    a.shape.remove(0);
+                    for b in b.into_rows() {
+                        recur(a.clone(), b, a_fill, b_fill, outputs, env, f.clone())?;
+                    }
+                }
+                (Ordering::Greater, _, Some(b_fill)) => {
+                    let mut b_fill_val = b_fill.clone();
+                    if b_fill_val.rank() + 1 < b.rank() {
+                        for &d in bsh[..b.rank() - b_fill_val.rank() - 1].iter().rev() {
+                            b_fill_val.reshape_scalar(Ok(d as isize), true, env)?;
+                        }
+                    }
+                    let b_iter = b.into_rows().chain(repeat(b_fill_val));
+                    for (a, b) in a.into_rows().zip(b_iter) {
+                        recur(a, b, a_fill, Some(b_fill), outputs, env, f.clone())?
+                    }
+                }
+                (Ordering::Greater, _, None) => {
+                    debug_assert_eq!(b.row_count(), 1);
+                    b.shape.remove(0);
+                    for a in a.into_rows() {
+                        recur(a, b.clone(), a_fill, b_fill, outputs, env, f.clone())?;
+                    }
+                }
+            },
         }
+        Ok(())
     }
-}
 
-fn bin_pervade_recursive_mut_right<T>(
-    a_data: &[T],
-    a_shape: &[usize],
-    b_data: &mut [T],
-    b_shape: &[usize],
-    f: impl Fn(T, T) -> T + Copy,
-) where
-    T: Copy,
-{
-    match (a_shape, b_shape) {
-        (_, []) => {
-            panic!("should never call `bin_pervade_recursive_mut_right` with scalar right")
-        }
-        ([], _) => {
-            let a_scalar = a_data[0];
-            for b in b_data {
-                *b = f(a_scalar, *b);
-            }
-        }
-        (ash, bsh) => {
-            let a_row_len = a_data.len() / ash[0];
-            let b_row_len = b_data.len() / bsh[0];
-            for (a, b) in a_data
-                .chunks_exact(a_row_len)
-                .zip(b_data.chunks_exact_mut(b_row_len))
-            {
-                bin_pervade_recursive_mut_right(a, &ash[1..], b, &bsh[1..], f);
-            }
-        }
+    let mut outputs = multi_output(outputs, Vec::new());
+    recur(
+        a,
+        b,
+        a_fill.ok().as_ref(),
+        b_fill.ok().as_ref(),
+        &mut outputs,
+        env,
+        f,
+    )?;
+
+    let mut new_values = MultiOutput::new();
+    for output in outputs {
+        let mut new_val = Value::from_row_values(output, env)?;
+        let mut this_shape = new_shape.clone();
+        this_shape.extend_from_slice(&new_val.shape[1..]);
+        new_val.shape = this_shape;
+        new_val.validate();
+        new_values.push(new_val);
     }
+    Ok(new_values)
 }
 
 pub mod not {
@@ -478,9 +916,7 @@ fn character_sign(a: char) -> f64 {
 pub mod sign {
     use super::*;
     pub fn num(a: f64) -> f64 {
-        if a.is_nan() {
-            f64::NAN
-        } else if a == 0.0 {
+        if a == 0.0 {
             0.0
         } else {
             a.signum()
@@ -515,6 +951,38 @@ pub mod sqrt {
     }
     pub fn error<T: Display>(a: T, env: &Uiua) -> UiuaError {
         env.error(format!("Cannot take the square root of {a}"))
+    }
+}
+pub mod exp {
+    use std::f64::consts::E;
+
+    use super::*;
+    pub fn num(a: f64) -> f64 {
+        a.exp()
+    }
+    pub fn byte(a: u8) -> f64 {
+        f64::from(a).exp()
+    }
+    pub fn com(a: Complex) -> Complex {
+        Complex::new(E, 0.0).powc(a)
+    }
+    pub fn error<T: Display>(a: T, env: &Uiua) -> UiuaError {
+        env.error(format!("Cannot take the exponential of {a}"))
+    }
+}
+pub mod ln {
+    use super::*;
+    pub fn num(a: f64) -> f64 {
+        a.ln()
+    }
+    pub fn byte(a: u8) -> f64 {
+        f64::from(a).ln()
+    }
+    pub fn com(a: Complex) -> Complex {
+        a.ln()
+    }
+    pub fn error<T: Display>(a: T, env: &Uiua) -> UiuaError {
+        env.error(format!("Cannot take the natural logarithm of {a}"))
     }
 }
 pub mod sin {
@@ -557,6 +1025,21 @@ pub mod asin {
     }
     pub fn com(a: Complex) -> Complex {
         a.asin()
+    }
+    pub fn error<T: Display>(a: T, env: &Uiua) -> UiuaError {
+        env.error(format!("Cannot get the arcsine of {a}"))
+    }
+}
+pub mod acos {
+    use super::*;
+    pub fn num(a: f64) -> f64 {
+        a.acos()
+    }
+    pub fn byte(a: u8) -> f64 {
+        f64::from(a).acos()
+    }
+    pub fn com(a: Complex) -> Complex {
+        a.acos()
     }
     pub fn error<T: Display>(a: T, env: &Uiua) -> UiuaError {
         env.error(format!("Cannot get the arcsine of {a}"))
@@ -657,10 +1140,10 @@ macro_rules! eq_impl {
             pub fn x_com(a: impl Into<Complex>, b: Complex) -> u8 {
                 (b.array_cmp(&a.into()) $eq $ordering) as u8
             }
-                        pub fn byte_num(a: u8, b: f64) -> u8 {
+            pub fn byte_num(a: u8, b: f64) -> u8 {
                 (b.array_cmp(&f64::from(a)) $eq $ordering) as u8
             }
-                        pub fn num_byte(a: f64, b: u8) -> u8 {
+            pub fn num_byte(a: f64, b: u8) -> u8 {
                 (f64::from(b).array_cmp(&a) $eq $ordering) as u8
             }
             pub fn generic<T: Ord>(a: T, b: T) -> u8 {
@@ -703,10 +1186,10 @@ macro_rules! cmp_impl {
                     (b.im.array_cmp(&a.im) $eq $ordering) as u8 as f64
                 )
             }
-                        pub fn byte_num(a: u8, b: f64) -> u8 {
+            pub fn byte_num(a: u8, b: f64) -> u8 {
                 (b.array_cmp(&f64::from(a)) $eq $ordering) as u8
             }
-                        pub fn num_byte(a: f64, b: u8) -> u8 {
+            pub fn num_byte(a: f64, b: u8) -> u8 {
                 (f64::from(b).array_cmp(&a) $eq $ordering) as u8
             }
             pub fn generic<T: Ord>(a: T, b: T) -> u8 {
@@ -724,10 +1207,10 @@ macro_rules! cmp_impl {
 
 eq_impl!(is_eq == Ordering::Equal);
 eq_impl!(is_ne != Ordering::Equal);
-cmp_impl!(is_lt == Ordering::Less);
-cmp_impl!(is_le != Ordering::Greater);
-cmp_impl!(is_gt == Ordering::Greater);
-cmp_impl!(is_ge != Ordering::Less);
+cmp_impl!(other_is_lt == Ordering::Less);
+cmp_impl!(other_is_le != Ordering::Greater);
+cmp_impl!(other_is_gt == Ordering::Greater);
+cmp_impl!(other_is_ge != Ordering::Less);
 
 pub mod add {
     use super::*;
@@ -753,10 +1236,12 @@ pub mod add {
         b + a.into()
     }
     pub fn num_char(a: f64, b: char) -> char {
-        char::from_u32((b as i64 + a as i64) as u32).unwrap_or('\0')
+        char::from_u32(((b as i64).saturating_add(a as i64)).clamp(0, char::MAX as i64) as u32)
+            .unwrap_or('\0')
     }
     pub fn char_num(a: char, b: f64) -> char {
-        char::from_u32((b as i64 + a as i64) as u32).unwrap_or('\0')
+        char::from_u32(((b as i64).saturating_add(a as i64)).clamp(0, char::MAX as i64) as u32)
+            .unwrap_or('\0')
     }
     pub fn byte_char(a: u8, b: char) -> char {
         char::from_u32((b as i64 + a as i64) as u32).unwrap_or('\0')
@@ -790,7 +1275,8 @@ pub mod sub {
         b - a.into()
     }
     pub fn num_char(a: f64, b: char) -> char {
-        char::from_u32(((b as i64) - (a as i64)) as u32).unwrap_or('\0')
+        char::from_u32(((b as i64).saturating_sub(a as i64)).clamp(0, char::MAX as i64) as u32)
+            .unwrap_or('\0')
     }
     pub fn char_char(a: char, b: char) -> f64 {
         ((b as i64) - (a as i64)) as f64
@@ -888,6 +1374,54 @@ pub mod mul {
     }
 }
 
+pub mod set_sign {
+    use super::*;
+
+    pub fn num_num(a: f64, b: f64) -> f64 {
+        mul::num_num(a, b.abs())
+    }
+    pub fn byte_byte(a: u8, b: u8) -> f64 {
+        num_num(a as f64, b as f64)
+    }
+    pub fn byte_num(a: u8, b: f64) -> f64 {
+        num_num(a as f64, b)
+    }
+    pub fn num_byte(a: f64, b: u8) -> f64 {
+        num_num(a, b as f64)
+    }
+    pub fn num_char(a: f64, b: char) -> char {
+        if a > 0.0 {
+            scalar_abs::char(b)
+        } else if a < 0.0 {
+            scalar_neg::char(scalar_abs::char(b))
+        } else {
+            b
+        }
+    }
+    pub fn char_num(a: char, b: f64) -> char {
+        num_char(b, a)
+    }
+    pub fn byte_char(a: u8, b: char) -> char {
+        if a > 0 {
+            scalar_abs::char(b)
+        } else {
+            b
+        }
+    }
+    pub fn char_byte(a: char, b: u8) -> char {
+        byte_char(b, a)
+    }
+    pub fn com_x(a: Complex, b: impl Into<Complex>) -> Complex {
+        a * b.into().abs()
+    }
+    pub fn x_com(a: impl Into<Complex>, b: Complex) -> Complex {
+        a.into() * b.abs()
+    }
+    pub fn error<T: Display>(a: T, b: T, env: &Uiua) -> UiuaError {
+        env.error(format!("Cannot set sign of {b} to {a}"))
+    }
+}
+
 pub mod div {
     use super::*;
     pub fn num_num(a: f64, b: f64) -> f64 {
@@ -926,7 +1460,7 @@ pub mod div {
 pub mod modulus {
     use super::*;
     pub fn num_num(a: f64, b: f64) -> f64 {
-        b.rem_euclid(a)
+        b.rem_euclid(a).abs()
     }
     pub fn byte_byte(a: u8, b: u8) -> f64 {
         num_num(a.into(), b.into())
@@ -950,6 +1484,88 @@ pub mod modulus {
         env.error(format!("Cannot modulo {a} and {b}"))
     }
 }
+
+pub mod or {
+
+    use super::*;
+
+    pub fn num_num(a: f64, b: f64) -> f64 {
+        if (1.0..=u128::MAX as f64).contains(&a)
+            && (1.0..=u128::MAX as f64).contains(&b)
+            && a.fract() == 0.0
+            && b.fract() == 0.0
+        {
+            let mut a = a as u128;
+            let mut b = b as u128;
+            let shift = (a | b).trailing_zeros();
+            a >>= shift;
+            b >>= shift;
+            a >>= a.trailing_zeros();
+            loop {
+                b >>= b.trailing_zeros();
+                if a > b {
+                    swap(&mut a, &mut b);
+                }
+                b -= a;
+                if b == 0 {
+                    break;
+                }
+            }
+            return (a << shift) as f64;
+        }
+        fn recurse(a: f64, b: f64) -> f64 {
+            if b <= 8.0 * f64::EPSILON {
+                return a;
+            }
+            recurse(b, a.rem_euclid(b))
+        }
+        a.signum() * b.signum() * recurse(a.abs(), b.abs())
+    }
+    pub fn num_byte(a: f64, b: u8) -> f64 {
+        num_num(b.into(), a)
+    }
+    pub fn byte_num(a: u8, b: f64) -> f64 {
+        num_num(a.into(), b)
+    }
+    pub fn byte_byte(mut a: u8, mut b: u8) -> u8 {
+        if a == 0 {
+            return b;
+        }
+        if b == 0 {
+            return a;
+        }
+        let shift = (a | b).trailing_zeros();
+        a >>= shift;
+        b >>= shift;
+        a >>= a.trailing_zeros();
+        loop {
+            b >>= b.trailing_zeros();
+            if a > b {
+                swap(&mut a, &mut b);
+            }
+            b -= a;
+            if b == 0 {
+                break;
+            }
+        }
+        a << shift
+    }
+    pub fn bool_bool(a: u8, b: u8) -> u8 {
+        a | b
+    }
+    pub fn com_x(a: Complex, b: impl Into<Complex>) -> Complex {
+        let b = b.into();
+        Complex::new(num_num(a.re, b.re), num_num(a.im, b.im))
+    }
+    pub fn x_com(a: impl Into<Complex>, b: Complex) -> Complex {
+        let a = a.into();
+        Complex::new(num_num(a.re, b.re), num_num(a.im, b.im))
+    }
+    pub fn error<T: Display>(a: T, b: T, env: &Uiua) -> UiuaError {
+        env.error(format!("Cannot or {a} and {b}"))
+    }
+}
+
 bin_op_mod!(
     atan2,
     a,
@@ -959,7 +1575,7 @@ bin_op_mod!(
     a.atan2(b),
     "Cannot get the atan2 of {a} and {b}"
 );
-pub mod pow {
+pub mod scalar_pow {
     use super::*;
     pub fn num_num(a: f64, b: f64) -> f64 {
         b.powf(a)
@@ -983,6 +1599,30 @@ pub mod pow {
         env.error(format!("Cannot get the power of {a} to {b}"))
     }
 }
+pub mod root {
+    use super::*;
+    pub fn num_num(a: f64, b: f64) -> f64 {
+        b.powf(1.0 / a)
+    }
+    pub fn byte_byte(a: u8, b: u8) -> f64 {
+        f64::from(b).powf(1.0 / f64::from(a))
+    }
+    pub fn byte_num(a: u8, b: f64) -> f64 {
+        b.powf(1.0 / a as f64)
+    }
+    pub fn num_byte(a: f64, b: u8) -> f64 {
+        f64::from(b).powf(1.0 / a)
+    }
+    pub fn com_x(a: Complex, b: impl Into<Complex>) -> Complex {
+        b.into().powc(1.0 / a)
+    }
+    pub fn x_com(a: impl Into<Complex>, b: Complex) -> Complex {
+        b.powc(1.0 / a.into())
+    }
+    pub fn error<T: Display>(a: T, b: T, env: &Uiua) -> UiuaError {
+        env.error(format!("Cannot get the {a} root of {b}"))
+    }
+}
 bin_op_mod!(
     log,
     a,
@@ -990,7 +1630,7 @@ bin_op_mod!(
     f64::from,
     f64,
     b.log(a),
-    "Cannot get the log base {b} of {a}"
+    "Cannot get the log base {a} of {b}"
 );
 pub mod complex {
     use super::*;
@@ -1014,7 +1654,23 @@ pub mod complex {
         b + a.into() * Complex::I
     }
     pub fn error<T: Display>(a: T, b: T, env: &Uiua) -> UiuaError {
-        env.error(format!("Cannot get the form a complex number with {b} as the real part and {a} as the imaginary part"))
+        env.error(format!(
+            "Cannot make a complex number with {b} as the real part and {a} as the imaginary part"
+        ))
+    }
+}
+
+pub mod abs_complex {
+    use super::*;
+
+    pub fn num(a: impl Into<f64>, b: impl Into<f64>) -> f64 {
+        complex::num_num(a.into(), b.into()).abs()
+    }
+    pub fn com(a: impl Into<Complex>, b: impl Into<Complex>) -> f64 {
+        complex::com_x(a.into(), b).abs()
+    }
+    pub fn error<T: Display>(a: T, b: T, env: &Uiua) -> UiuaError {
+        complex::error(a, b, env)
     }
 }
 
@@ -1029,9 +1685,6 @@ pub mod max {
     pub fn bool_bool(a: u8, b: u8) -> u8 {
         a | b
     }
-    pub fn char_char(a: char, b: char) -> char {
-        a.max(b)
-    }
     pub fn num_byte(a: f64, b: u8) -> f64 {
         num_num(a, b.into())
     }
@@ -1043,6 +1696,9 @@ pub mod max {
     }
     pub fn x_com(a: impl Into<Complex>, b: Complex) -> Complex {
         a.into().max(b)
+    }
+    pub fn generic<T: Ord>(a: T, b: T) -> T {
+        a.max(b)
     }
     pub fn error<T: Display>(a: T, b: T, env: &Uiua) -> UiuaError {
         env.error(format!("Cannot get the max of {a} and {b}"))
@@ -1060,9 +1716,6 @@ pub mod min {
     pub fn bool_bool(a: u8, b: u8) -> u8 {
         a & b
     }
-    pub fn char_char(a: char, b: char) -> char {
-        a.min(b)
-    }
     pub fn num_byte(a: f64, b: u8) -> f64 {
         num_num(a, b.into())
     }
@@ -1075,189 +1728,10 @@ pub mod min {
     pub fn x_com(a: impl Into<Complex>, b: Complex) -> Complex {
         a.into().min(b)
     }
+    pub fn generic<T: Ord>(a: T, b: T) -> T {
+        a.min(b)
+    }
     pub fn error<T: Display>(a: T, b: T, env: &Uiua) -> UiuaError {
         env.error(format!("Cannot get the min of {a} and {b}"))
     }
-}
-
-pub trait PervasiveInput: IntoIterator + Sized {
-    type OwnedItem: Clone;
-    fn len(&self) -> usize;
-    fn only(&self) -> Self::OwnedItem;
-    fn item(item: <Self as IntoIterator>::Item) -> Self::OwnedItem;
-    fn as_slice(&self) -> &[Self::OwnedItem];
-    fn into_only(self) -> Self::OwnedItem {
-        Self::item(self.into_iter().next().unwrap())
-    }
-}
-
-impl<T: Clone> PervasiveInput for Vec<T> {
-    type OwnedItem = T;
-    fn len(&self) -> usize {
-        Vec::len(self)
-    }
-    fn only(&self) -> T {
-        self.first().unwrap().clone()
-    }
-    fn item(item: <Self as IntoIterator>::Item) -> T {
-        item
-    }
-    fn as_slice(&self) -> &[T] {
-        self.as_slice()
-    }
-}
-
-impl<'a, T: Clone> PervasiveInput for &'a [T] {
-    type OwnedItem = T;
-    fn len(&self) -> usize {
-        <[T]>::len(self)
-    }
-    fn only(&self) -> T {
-        self.first().unwrap().clone()
-    }
-    fn item(item: <Self as IntoIterator>::Item) -> T {
-        item.clone()
-    }
-    fn as_slice(&self) -> &[T] {
-        self
-    }
-}
-
-impl<T: Clone> PervasiveInput for Option<T> {
-    type OwnedItem = T;
-    fn len(&self) -> usize {
-        self.is_some() as usize
-    }
-    fn only(&self) -> T {
-        self.as_ref().unwrap().clone()
-    }
-    fn item(item: <Self as IntoIterator>::Item) -> T {
-        item
-    }
-    fn as_slice(&self) -> &[T] {
-        slice::from_ref(self.as_ref().unwrap())
-    }
-}
-
-pub fn bin_pervade_generic<A: PervasiveInput, B: PervasiveInput, C: Default>(
-    a_shape: &[usize],
-    a: A,
-    b_shape: &[usize],
-    b: B,
-    env: &mut Uiua,
-    f: impl FnMut(A::OwnedItem, B::OwnedItem, &mut Uiua) -> UiuaResult<C> + Copy,
-) -> UiuaResult<(Shape, Vec<C>)> {
-    let c_shape = Shape::from(cmp::max(a_shape, b_shape));
-    let c_len: usize = c_shape.iter().product();
-    let mut c: Vec<C> = Vec::with_capacity(c_len);
-    for _ in 0..c_len {
-        c.push(C::default());
-    }
-    bin_pervade_recursive_generic(a_shape, a, b_shape, b, &mut c, env, f)?;
-    Ok((c_shape, c))
-}
-
-#[allow(unused_mut)] // for a rust-analyzer false-positive
-fn bin_pervade_recursive_generic<A: PervasiveInput, B: PervasiveInput, C>(
-    a_shape: &[usize],
-    a: A,
-    b_shape: &[usize],
-    b: B,
-    c: &mut [C],
-    env: &mut Uiua,
-    mut f: impl FnMut(A::OwnedItem, B::OwnedItem, &mut Uiua) -> UiuaResult<C> + Copy,
-) -> UiuaResult {
-    if a_shape == b_shape {
-        for ((a, b), mut c) in a.into_iter().zip(b).zip(c) {
-            *c = f(A::item(a), B::item(b), env)?;
-        }
-        return Ok(());
-    }
-    match (a_shape.is_empty(), b_shape.is_empty()) {
-        (true, true) => c[0] = f(a.into_only(), b.into_only(), env)?,
-        (false, true) => {
-            for (a, mut c) in a.into_iter().zip(c) {
-                *c = f(A::item(a), b.only(), env)?;
-            }
-        }
-        (true, false) => {
-            for (b, mut c) in b.into_iter().zip(c) {
-                *c = f(a.only(), B::item(b), env)?;
-            }
-        }
-        (false, false) => {
-            let a_cells = a_shape[0];
-            let b_cells = b_shape[0];
-            if a_cells != b_cells {
-                return Err(env.error(format!(
-                    "Shapes {} and {} do not match",
-                    FormatShape(a_shape),
-                    FormatShape(b_shape)
-                )));
-            }
-            let a_chunk_size = a.len() / a_cells;
-            let b_chunk_size = b.len() / b_cells;
-            match (a_shape.len() == 1, b_shape.len() == 1) {
-                (true, true) => {
-                    for ((a, b), mut c) in a.into_iter().zip(b).zip(c) {
-                        *c = f(A::item(a), B::item(b), env)?;
-                    }
-                }
-                (true, false) => {
-                    for ((a, b), c) in a
-                        .into_iter()
-                        .zip(b.as_slice().chunks_exact(b_chunk_size))
-                        .zip(c.chunks_exact_mut(b_chunk_size))
-                    {
-                        bin_pervade_recursive_generic(
-                            &a_shape[1..],
-                            Some(A::item(a)),
-                            &b_shape[1..],
-                            b,
-                            c,
-                            env,
-                            f,
-                        )?;
-                    }
-                }
-                (false, true) => {
-                    for ((a, b), c) in a
-                        .as_slice()
-                        .chunks_exact(a_chunk_size)
-                        .zip(b.into_iter())
-                        .zip(c.chunks_exact_mut(a_chunk_size))
-                    {
-                        bin_pervade_recursive_generic(
-                            &a_shape[1..],
-                            a,
-                            &b_shape[1..],
-                            Some(B::item(b)),
-                            c,
-                            env,
-                            f,
-                        )?;
-                    }
-                }
-                (false, false) => {
-                    for ((a, b), c) in a
-                        .as_slice()
-                        .chunks_exact(a_chunk_size)
-                        .zip(b.as_slice().chunks_exact(b_chunk_size))
-                        .zip(c.chunks_exact_mut(cmp::max(a_chunk_size, b_chunk_size)))
-                    {
-                        bin_pervade_recursive_generic(
-                            &a_shape[1..],
-                            a,
-                            &b_shape[1..],
-                            b,
-                            c,
-                            env,
-                            f,
-                        )?;
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
 }

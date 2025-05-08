@@ -1,30 +1,37 @@
-#![allow(non_snake_case)]
+#![allow(non_snake_case, clippy::empty_docs, clippy::mutable_key_type)]
 
-mod backend;
 mod blog;
 mod docs;
-mod editor;
 mod examples;
+mod idioms;
 mod markdown;
 mod other;
 mod other_tutorial;
 mod primitive;
-mod tour;
 mod tutorial;
 mod uiuisms;
 
+use std::{cell::Cell, sync::OnceLock, time::Duration};
+
 use base64::engine::{general_purpose::URL_SAFE, Engine};
+use js_sys::Date;
 use leptos::*;
 use leptos_meta::*;
 use leptos_router::*;
-use uiua::{
-    lsp::{BindingDocs, BindingDocsKind},
-    ConstantDef, PrimClass, Primitive, SysOp,
+use rand::prelude::*;
+use uiua::{now, ConstantDef, Primitive, SysOp};
+use uiua_editor::{
+    binding_name_class, lang,
+    utils::{
+        get_april_fools_setting, get_april_fools_time, its_called_weewuh, set_april_fools,
+        ChallengeDef,
+    },
+    Editor, EditorMode, Prim, EDITOR_SHORTCUTS,
 };
 use wasm_bindgen::JsCast;
-use web_sys::HtmlAudioElement;
+use web_sys::{Element, HtmlAudioElement};
 
-use crate::{blog::*, docs::*, editor::*, other::*, tour::*, tutorial::Tutorial, uiuisms::*};
+use crate::{blog::*, docs::*, other::*, tutorial::Tutorial, uiuisms::*};
 
 pub fn main() {
     console_error_panic_hook::set_once();
@@ -38,10 +45,13 @@ pub fn main() {
     mount_to_body(|| view!( <Site/>));
 }
 
+static START_TIME: OnceLock<f64> = OnceLock::new();
+
 #[component]
 pub fn Site() -> impl IntoView {
     use Primitive::*;
     provide_meta_context();
+    START_TIME.get_or_init(|| Date::now() / 1000.0);
 
     // Choose a subtitle
     let subtitles_common = [
@@ -51,11 +61,11 @@ pub fn Site() -> impl IntoView {
         "A programming language for variable dislikers",
     ];
     let subtitles_rare = [
-        view!("Check out "<a href="https://arraycast.com/">"The Array Cast"</a>).into_view(),
+        view!("Check out "<a href="https://arraycast.com/">"The Array Cast"</a>"!").into_view(),
         view!(<a href="https://youtu.be/seVSlKazsNk">"Point-Free or Die"</a>).into_view(),
         view! {
             <div style="font-style: normal">
-                <a href="/tutorial/advancedstack#planet-notation" style="text-decoration: none">"🌍🪐"</a>" "
+                <a href="/tutorial/morestack#planet-notation" style="text-decoration: none">"🌍🪐"</a>" "
                 <code style="font-style: normal">
                     <span class="monadic-modifier">"⋅⋅⊙⋅⋅"</span>
                     <span class="stack-function">"∘"</span>
@@ -63,60 +73,12 @@ pub fn Site() -> impl IntoView {
             </div>
         }
         .into_view(),
-        view! {
-            <div class="long-subtitle">
-                <div style="display: flex; gap: 0.5em;">
-                    <div style="font-style: normal"><Prims prims=[Try, Assert]/></div>
-                    " Dad! Can we go play outside?"
-                </div>
-                <div style="display: flex; gap: 0.5em;">
-                    <div style="font-style: normal"><Prim prim=Repeat glyph_only=true/></div>
-                    " Finish your code challenges first!"
-                </div>
-            </div>
-        }
-        .into_view(),
+        view!("Check out "<a href="https://tacittalk.com/">"Tacit Talk"</a>"!").into_view(),
+        "Abandon nominativity. Embrace relativity.".into_view(),
+        view!(<div style="font-style: normal"><Prim prim=Under glyph_only=true/>"🗄️🍴"</div>).into_view(),
         "It's got um...I um...arrays".into_view(),
-        view! {
-            <div class="long-subtitle">
-                <div>
-                    <div style="font-style: normal"><Prim prim=Try glyph_only=true/></div>
-                    " Hey bro! Throw me the error!"
-                    <div style="font-style: normal"><Prim prim=Assert glyph_only=true/></div>
-                </div>
-                <div>
-                    <div style="font-style: normal"><Prims prims=[Repeat, Do]/></div>
-                    " Kids! Dinner's ready! Who wants "
-                    <div class="spoiler">"control flow"</div>
-                    "?"
-                </div>
-            </div>
-        }
-        .into_view(),
-        view! {
-                <div style="display: flex; gap: 0.5em;">
-                    "A "<div style="font-style: normal"><Prim prim=Fork/></div>
-                    " is worth a thousand "<div style="font-style: normal"><Prim prim=Dip/></div>"s."
-                </div>
-        }.into_view(),
-        view! {
-            <div class="long-subtitle">
-                <div>
-                    <div style="font-style: normal"><Prim prim=Repeat/></div>
-                    " Sometimes I miss the days when I could break"
-                </div>
-                <div>
-                    <div style="font-style: normal"><Prim prim=Do/></div>
-                    " Oh honey, don't be silly. That's why you have me ❤️"
-                </div>
-            </div>
-        }
-        .into_view(),
     ];
-    let local_storage = window().local_storage().unwrap().unwrap();
-    let mut visits: usize = (local_storage.get_item("visits").ok().flatten())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let mut visits = visits();
     let subtitle = if visits % 3 < 2 {
         subtitles_common[(visits as f64 * 2.0 / 3.0).round() as usize % subtitles_common.len()]
             .into_view()
@@ -132,12 +94,28 @@ pub fn Site() -> impl IntoView {
         link.set_attribute("href", "/favicon-crayon.ico").unwrap();
         document().head().unwrap().append_child(&link).unwrap();
     }
-    local_storage
+    (window().local_storage().unwrap().unwrap())
         .set_item("visits", &visits.to_string())
         .unwrap();
 
+    let logo_src = match visits % 9 {
+        _ if its_called_weewuh() => "/assets/weewuh-logo.png",
+        1 => "/assets/uiua-logo.png",
+        3 => "/assets/uiua-logo-pride.png",
+        5 => "/assets/uiua-logo-scrambledine.png",
+        7 => "/assets/uiua-logo-jacob.svg",
+        _ if Date::new_0().get_month() == 5 => "/assets/uiua-logo-pride.png",
+        _ => "/assets/uiua-logo.png",
+    };
+
+    let toggle_april_fools_colors = move |_| {
+        set_april_fools(!get_april_fools_setting());
+        _ = window().location().reload();
+    };
+
     view! {
         <Router>
+            <ScrollToHash/>
             <Routes>
                 <Route path="embedpad" view=EmbedPad/>
                 <Route path="embed" view=Embed/>
@@ -146,11 +124,32 @@ pub fn Site() -> impl IntoView {
                         <div id="top">
                             <div id="header">
                                 <div id="header-left">
-                                    <h1><A id="header-uiua" href="/"><img src="/uiua-logo.png" style="height: 1em" alt="Uiua logo" />" Uiua"</A></h1>
+                                    <h1>
+                                        <A id="header-uiua" href="/">
+                                            <img src=logo_src style="height: 1em" alt={format!("{} logo", lang())} />
+                                            " "{lang}
+                                        </A>
+                                    </h1>
                                     <p id="subtitle">{ subtitle.clone() }</p>
                                 </div>
                                 <div id="nav">
-                                    <a class="pls-no-block" href="https://github.com/sponsors/uiua-lang">"Support Uiua's development"</a>
+                                    {
+                                        if get_april_fools_time() {
+                                            Some(view!(
+                                                <div title="Enable April Fool's colors (refresh after changing)">
+                                                    "April Fool's:"
+                                                    <input
+                                                        type="checkbox"
+                                                        checked=get_april_fools_setting
+                                                        on:change=toggle_april_fools_colors
+                                                    />
+                                                </div>
+                                            ))
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    <a class="pls-no-block" href="https://github.com/sponsors/uiua-lang">"Support "{lang}"'s development"</a>
                                     <a href="/">"Home"</a>
                                 </div>
                             </div>
@@ -162,7 +161,7 @@ pub fn Site() -> impl IntoView {
                     <Route path="tutorial/:page?" view=Tutorial/>
                     <Route path="docs/:page?" view=Docs/>
                     <Route path="isms/:search?" view=Uiuisms/>
-                    <Route path="pad" view=Pad/>
+                    <Route path="pad" view=PadPage/>
                     <Route path="install" view=Install/>
                     <Route path="tour" view=Tour/>
                     <Route path="isms" view=Uiuisms/>
@@ -171,15 +170,27 @@ pub fn Site() -> impl IntoView {
                     <Route path="*" view=NotFound/>
                 </Route>
             </Routes>
-            <br/>
-            <br/>
-            <br/>
         </Router>
     }
 }
 
+fn visits() -> usize {
+    (window().local_storage().unwrap().unwrap())
+        .get_item("visits")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
 fn weewuh() {
-    if let Ok(audio) = HtmlAudioElement::new_with_src("/wee-wuh.mp3") {
+    let i = (now() % 1.0 * 100.0) as u32;
+    let src = match i {
+        0 => "/assets/ooh-ee-ooh-ah.mp3",
+        1..=4 => "/assets/wee-wah.mp3",
+        _ => "/assets/wee-wuh.mp3",
+    };
+    if let Ok(audio) = HtmlAudioElement::new_with_src(src) {
         _ = audio.play();
     }
 }
@@ -188,8 +199,77 @@ fn weewuh() {
 pub fn MainPage() -> impl IntoView {
     use Primitive::*;
 
+    let visits = visits();
+
+    fn rich_prim(prim: Primitive, text: &'static str, example: &'static str) -> impl Fn() -> View {
+        move || {
+            view! {
+                <p><Prim prim=prim/>" "{text}":"</p>
+                <Editor example=example/>
+            }
+            .into_view()
+        }
+    }
+
+    let mut rich_prims = vec![
+        rich_prim(
+            Select,
+            "for re-sequencing array items",
+            r#"⊏ 2_1_3_0_4 "loco!""#,
+        ),
+        rich_prim(
+            Deduplicate,
+            "for removing duplicate items",
+            r#"◴ "hello, world!""#,
+        ),
+        rich_prim(Sort, "for... sorting", "⍆ [2 8 3 2 1 5]"),
+        rich_prim(
+            Keep,
+            "for filtering",
+            r#"▽ [1 1 1 0 0 0 0 1 0] "filter me""#,
+        ),
+        rich_prim(
+            Where,
+            "for finding the indices of things",
+            "⊚≤5 [4 8 3 9 2 7 1]",
+        ),
+        rich_prim(Mask, "for finding subsequences", r#"⦷ "ra" "abracadabra""#),
+        rich_prim(
+            Partition,
+            "for splitting arrays by sequential keys",
+            r#"⬚@ ⊜∘⊸≠@ "Oh boy, neat!""#,
+        ),
+        rich_prim(
+            Un,
+            "for inverting the behavior of a function",
+            "°(÷2+1) [1 2 3 4]",
+        ),
+        rich_prim(
+            Under,
+            "for modifying only part of an array (among other things)",
+            r#"⍜(↙2|×10) 1_2_3_4_5"#,
+        ),
+    ];
+
+    let indices = if visits < 4 {
+        vec![0, rich_prims.len() - 3, rich_prims.len() - 1]
+    } else {
+        let mut rng = SmallRng::seed_from_u64(visits as u64);
+        let mut indices: Vec<usize> = (0..rich_prims.len()).collect();
+        indices.shuffle(&mut rng);
+        indices.truncate(3);
+        indices.sort_unstable();
+        indices
+    };
+    let mut rich_prims: Vec<_> = indices
+        .into_iter()
+        .rev()
+        .map(|i| rich_prims.remove(i)())
+        .collect();
+    rich_prims.reverse();
+
     view! {
-        <Title text="Uiua"/>
+        <Title text=lang()/>
         <div id="links">
             <div>
                 <A href="/install">"Installation"</A>
@@ -205,74 +285,85 @@ pub fn MainPage() -> impl IntoView {
             </div>
         </div>
         <Editor
-            mode=EditorMode::Front
+            mode=EditorMode::Showcase
+            examples=examples::EXAMPLES
+                .iter()
+                .map(|&ex|
+                    if its_called_weewuh() {
+                        match ex {
+                            examples::UIUA => examples::WEEWUH,
+                            examples::LOGO => examples::WEEWUH_LOGO,
+                            examples::PALINDROME => examples::WEEWUH_PALINDROME,
+                            _ => ex,
+                        }
+                    } else{
+                        ex
+                    }
+                )
+                .map(ToString::to_string)
+                .collect()
             help={&[
                 "Type a glyph's name, then run to format the names into glyphs.",
                 "You can run with ctrl/shift + enter.",
             ]}/>
         <br/>
-        <p class="main-text">"Uiua "<span class="wee-wuh-span">"("<i>"wee-wuh "</i><button on:click=|_| weewuh() class="sound-button">"🔉"</button>")"</span>" is a general purpose, stack-based, array-oriented programming language with a focus on simplicity, beauty, and "<a href="https://en.wikipedia.org/wiki/Tacit_programming">"tacit"</a>" code."</p>
-        <p class="main-text">"Uiua lets you write code that is as short as possible while remaining readable, so you can focus on problems rather than ceremony."</p>
+        <p class="main-text">{lang}" "<span class="wee-wuh-span">"("<i>"wee-wuh "</i><button on:click=|_| weewuh() class="sound-button">"🔉"</button>")"</span>" is a general purpose, stack-based, array-oriented programming language with a focus on simplicity, beauty, and "<a href="https://en.wikipedia.org/wiki/Tacit_programming">"tacit"</a>" code."</p>
+        <p class="main-text">{lang}" lets you write code that is as short as possible while remaining readable, so you can focus on problems rather than ceremony."</p>
         <p class="main-text">"The language is not yet stable, as its design space is still being explored. However, it is already quite powerful and fun to use!"</p>
         <div class="features">
             <div>
                 <div>
                     <Hd id="a-loving-union">"A Loving Union"</Hd>
-                    <p>"Uiua combines the stack-based and array-oriented paradigms in a single language. Combining these already terse paradigms results in code with a very high information density and little syntactic noise."</p>
-                    <Editor example="⇌[⍥⊃+⊙∘9 1 1]"/>
+                    <p>{lang}" combines the stack-based and array-oriented paradigms in a single language. Combining these already terse paradigms results in code with a very high information density and little syntactic noise."</p>
+                    <Editor example="⍥◡+9 .1"/>
                     <p>"If this code seems weird and unreadable, that's okay! It's important to remember that "<a href="https://vector-of-bool.github.io/2018/10/31/become-perl.html">"foreign ≠ confusing"</a>"."</p>
                 </div>
                 <div>
                     <Hd id="true-arrays">"True Arrays"</Hd>
-                    <p>"Uiua's one and only composite data type, the array, is based on those of APL, J, and BQN. They are multidimensional and rank-polymorphic, meaning that an operation that applies to one item also applies to many items."</p>
-                    <Editor example="+2 ↯3_4 ⇡5"/>
+                    <p>{lang}"'s one and only composite data type, the array, is based on those of APL, J, and BQN. They are multidimensional and rank-polymorphic, meaning that an operation that applies to one item also applies to many items."</p>
+                    <Editor example="◿5 ↯3_4 ⇡12"/>
                 </div>
                 <div>
                     <Hd id="rich-primitives">"Rich Primitives"</Hd>
-                    <p>"Uiua has lots of built-in functions for all your array manipulation needs. Just a few examples:"</p>
-                    <p><Prim prim=Select/>" for re-sequencing array items:"</p>
-                    <Editor example=r#"⊏ 2_1_3_0_4 "loco!""#/>
-                    <p><Prim prim=Partition/>" for splitting arrays by sequential keys:"</p>
-                    <Editor example=r#"⬚@ ⊜∘≠@ ."Oh boy, neat!""#/>
-                    <p><Prim prim=Under/>" for modifying only part of an array (among other things):"</p>
-                    <Editor example="⍜(↙2|×10) 1_2_3_4_5"/>
+                    <p>{lang}" has lots of built-in functions for all your array manipulation needs. Just a few examples:"</p>
+                    { rich_prims }
                 </div>
                 <div>
                     <Hd id="syntactic-simplicity">"Syntactic Simplicity"</Hd>
-                    <p>"Uiua has a simple, context-free, LL(3) grammar. Code runs from "<A href="/rtl">"right to left"</A>", top to bottom, with only "<A href="/tutorial/functions#modifiers">"one precedence rule"</A>". As operators are to the left of their operands, Uiua code reads a little bit like a Lisp, but with fewer parentheses."</p>
+                    <p>{lang}" has a simple, context-free, LL(3) grammar. Code runs from "<A href="/rtl">"right to left"</A>", top to bottom, with only "<A href="/tutorial/functions#modifiers">"one precedence rule"</A>". As operators are to the left of their operands, "{lang}" code reads a little bit like a Lisp, but with fewer parentheses."</p>
                 </div>
                 <div>
                     <Hd id="system-apis">"System APIs"</Hd>
-                    <p>"Uiua has functions for spawning threads, interacting with the file system, communicating over network sockets, and "<A href="/docs/system">"more"</A>"."</p>
+                    <p>{lang}" has functions for spawning threads, interacting with the file system, communicating over network sockets, and "<A href="/docs/system">"more"</A>"."</p>
                 </div>
                 <div>
                     <Hd id="rust-ingegration">"Rust Integration"</Hd>
-                    <p>"Uiua can be embedded in Rust programs "<a href="https://docs.rs/uiua">"as a library"</a>"."</p>
+                    <p>{lang}" can be embedded in Rust programs "<a href="https://docs.rs/uiua">"as a library"</a>"."</p>
                 </div>
                 <div>
                     <Hd id="ffi">"FFI"</Hd>
-                    <p>"Uiua has experimental support for calling functions from shared libraries through "<Prim prim=Sys(SysOp::FFI)/>"."</p>
+                    <p>{lang}" has experimental support for calling functions from shared libraries through "<Prim prim=Sys(SysOp::Ffi)/>"."</p>
                 </div>
             </div>
             <div>
                 <div>
                     <Hd id="friendly-glyphs">"Friendly Glyphs"</Hd>
-                    <p>"Uiua uses special characters for built-in functions that remind you what they do!"</p>
+                    <p>{lang}" uses special characters for built-in functions that remind you what they do!"</p>
                     <Editor example="⚂ # Random number"/>
                     <Editor example="⇡8 # Range up to"/>
                     <Editor example="⇌ 1_2_3_4 # Reverse"/>
                     <Editor example="⌕ 0_2 [0 2 5 0 2 1] # Find"/>
                     <Editor example="⊟ 1_2_3 4_5_6 # Couple"/>
-                    <p>"Unlike other array languages, Uiua does not have monadic and dyadic versions of each glyph. Every glyph does only one thing, so you don't need to parse an entire expression to know which version it is."</p>
+                    <p>"Unlike other array languages, "{lang}" does not have monadic and dyadic versions of each glyph. Every glyph does only one thing, so you don't need to parse an entire expression to know which version it is."</p>
                 </div>
                 <div>
                     <Hd id="unicode-formatter">"Unicode Formatter"</Hd>
-                    <p>"Uiua has the terseness and expressivity afforded by Unicode glyphs without the need for special keyboard or editor support. Instead, the language comes with a formatter that converts the names of built-in functions into glyphs."</p>
-                    <Editor example="floor*10[repeatrand5]" help={&["", "Click to format ⇡⇡⇡            "]}/>
+                    <p>{lang}" has the terseness and expressivity afforded by Unicode glyphs without the need for special keyboard or editor support. Instead, the language comes with a formatter that converts the names of built-in functions into glyphs."</p>
+                    <Editor example="floor*10repeatrand5" help={&["", "Click to format ⇡⇡⇡            "]}/>
                 </div>
                 <div>
                     <Hd id="multimedia-output">"Multimedia Output"</Hd>
-                    <p>"Uiua has built-in facilities for generating images and audio. Just make arrays of the pixel data or audio samples. You can even make GIFs!"</p>
+                    <p>{lang}" has built-in facilities for generating images and audio. Just make arrays of the pixel data or audio samples. You can even make GIFs!"</p>
                     {
                         if cfg!(debug_assertions) {
                             None
@@ -286,21 +377,20 @@ pub fn MainPage() -> impl IntoView {
                             })
                         }
                     }
-                    <p>"The Uiua logo was made with Uiua! Check example 5 at the top of the page."</p>
+                    <p>"The "{lang}" logo was made with "{lang}"! Check example 5 at the top of the page."</p>
                 </div>
                 <div>
                     <Hd id="language-server">"Language Server"</Hd>
-                    <p>"The Uiua interpreter has a built-in language server that uses the "<a href="https://microsoft.github.io/language-server-protocol/">"Language Server Protocol"</a>", so you can "<A href="/install#editor-support">"use it with your favorite editor"</A>"."</p>
+                    <p>"The "{lang}" interpreter has a built-in language server that uses the "<a href="https://microsoft.github.io/language-server-protocol/">"Language Server Protocol"</a>", so you can "<A href="/install#editor-support">"use it with your favorite editor"</A>"."</p>
                 </div>
             </div>
         </div>
         <div>
             <Hd id="getting-started">"Getting Started"</Hd>
-            <p>"For more examples of what Uiua code looks like and what it can do, see the examples in the editor at the top of this page."</p>
+            <p>"For more examples of what "{lang}" code looks like and what it can do, see the examples in the editor at the top of this page."</p>
             <p>"For a quick overview of how the language works, see the "<A href="/tour">"Language Tour"</A>"."</p>
             <p>"For a full tutorial, see the "<A href="/docs#tutorial">"Tutorial"</A>"."</p>
             <p>"For a reference of all the built-in functions, the documentation has a "<A href="/docs#functions">"full list"</A>"."</p>
-            <p>"For a curated list of Uiua functions for solving common problems, see "<A href="/isms">"Uiuisms"</A>"."</p>
         </div>
     }
 }
@@ -314,13 +404,9 @@ fn NotFound() -> impl IntoView {
     }
 }
 
-#[component]
-pub fn Prim(
-    prim: Primitive,
-    #[prop(optional)] glyph_only: bool,
-    #[prop(optional)] hide_docs: bool,
-) -> impl IntoView {
-    let symbol_class = format!("prim-glyph {}", prim_class(prim));
+#[cfg(test)]
+fn prim_html(prim: Primitive, glyph_only: bool, hide_docs: bool) -> String {
+    let symbol_class = format!("prim-glyph {}", uiua_editor::prim_class(prim));
     let symbol = prim.to_string();
     let name = if !glyph_only && symbol != prim.name() {
         format!(" {}", prim.name())
@@ -351,17 +437,17 @@ pub fn Prim(
         title.push_str(&doc.short_text());
     }
     if title.is_empty() {
-        view! {
-            <a href=href class="prim-code-a">
-                <code><span class=symbol_class>{ symbol }</span>{name}</code>
-            </a>
-        }
+        format!(
+            r#"<a href="{href}"class="prim-code-a">
+                <code><span class="{symbol_class}">{symbol}</span>{name}</code>
+            </a>"#,
+        )
     } else {
-        view! {
-            <a href=href class="prim-code-a">
-                <code class="prim-code" data-title=title><span class=symbol_class>{ symbol }</span>{name}</code>
-            </a>
-        }
+        format!(
+            r#"<a href="{href}" class="prim-code-a">
+                <code class="prim-code" data-title="{title}"><span class="{symbol_class}">{symbol}</span>{name}</code>
+            </a>"#,
+        )
     }
 }
 
@@ -376,87 +462,38 @@ pub fn Prims<const N: usize>(
         .collect::<Vec<_>>()
 }
 
-macro_rules! code_font {
-    ($class:literal) => {
-        concat!("code-font ", $class)
-    };
-}
-
-fn prim_class(prim: Primitive) -> &'static str {
-    match prim {
-        Primitive::Identity => code_font!("stack-function"),
-        Primitive::Transpose => code_font!("monadic-function trans text-gradient"),
-        Primitive::Both => code_font!("monadic-modifier bi text-gradient"),
-        Primitive::All => code_font!("dyadic-modifier pan text-gradient"),
-        prim if prim.class() == PrimClass::Stack && prim.modifier_args().is_none() => {
-            code_font!("stack-function")
-        }
-        prim if prim.class() == PrimClass::Constant => code_font!("number-literal"),
-        prim => {
-            if let Some(m) = prim.modifier_args() {
-                match m {
-                    0 | 1 => code_font!("monadic-modifier"),
-                    2 => code_font!("dyadic-modifier"),
-                    _ => code_font!("triadic-modifier"),
-                }
-            } else {
-                match prim.args() {
-                    Some(0) => code_font!("noadic-function"),
-                    Some(1) => code_font!("monadic-function"),
-                    Some(2) => code_font!("dyadic-function"),
-                    Some(3) => code_font!("triadic-function"),
-                    _ => code_font!("variadic-function"),
-                }
-            }
-        }
-    }
-}
-
-fn binding_class(name: &str, docs: &BindingDocs) -> &'static str {
-    match name {
-        "Trans" | "Transgender" => code_font!("trans text-gradient"),
-        "Bi" | "Bisexual" => code_font!("bi text-gradient"),
-        "Pan" | "Pansexual" => code_font!("pan text-gradient"),
-        "Gay" => code_font!("gay text-gradient"),
-        "Lesbian" => code_font!("lesbian text-gradient"),
-        "Ace" | "Asexual" => code_font!("ace text-gradient"),
-        "Aro" | "Aromantic" => code_font!("aro text-gradient"),
-        "AroAce" => code_font!("aroace text-gradient"),
-        "Nb" | "Enby" | "Nonbinary" | "NonBinary" => code_font!("nb text-gradient"),
-        "Fluid" | "Genderfluid" | "GenderFluid" => code_font!("fluid text-gradient"),
-        "Queer" | "Genderqueer" | "GenderQueer" => code_font!("queer text-gradient"),
-        _ => match docs.kind {
-            BindingDocsKind::Constant(_) => code_font!(""),
-            BindingDocsKind::Function { sig, .. } => match sig.args {
-                0 => code_font!("noadic-function"),
-                1 => code_font!("monadic-function"),
-                2 => code_font!("dyadic-function"),
-                3 => code_font!("triadic-function"),
-                4 => code_font!("tetradic-function"),
-                _ => code_font!(""),
-            },
-            BindingDocsKind::Modifier(margs) => match margs {
-                1 => code_font!("monadic-modifier"),
-                2 => code_font!("dyadic-modifier"),
-                _ => code_font!("triadic-modifier"),
-            },
-            BindingDocsKind::Module => code_font!("module"),
-        },
-    }
-}
-
 #[component]
 #[allow(clippy::needless_lifetimes)]
 fn Const<'a>(con: &'a ConstantDef) -> impl IntoView {
+    let name_class = binding_name_class(con.name);
+    let outer_class = if name_class.is_some() {
+        "prim-code-a code-background"
+    } else {
+        "prim-code-a"
+    };
+    let inner_class = format!(
+        "prim-code stack-function {}",
+        name_class.unwrap_or_default()
+    );
     view! {
-        <code class="prim-code" data-title={ con.doc }>{ con.name }</code>
+        <a href={format!("/docs/constants#{}", con.name)} class=outer_class>
+            <code
+                id={con.name}
+                class=inner_class
+                data-title={ con.doc().lines().next().unwrap_or_default().to_string() }
+            >{ con.name }</code>
+        </a>
     }
 }
 
+#[track_caller]
+#[allow(clippy::manual_map)]
 fn get_element<T: JsCast>(id: &str) -> Option<T> {
-    document()
-        .get_element_by_id(id)
-        .map(|elem| elem.dyn_into().unwrap())
+    if let Some(elem) = document().get_element_by_id(id) {
+        Some(elem.dyn_into().unwrap())
+    } else {
+        None
+    }
 }
 
 #[track_caller]
@@ -469,15 +506,41 @@ fn element<T: JsCast>(id: &str) -> T {
 }
 
 #[component]
-pub fn Pad() -> impl IntoView {
+pub fn Tour() -> impl IntoView {
+    title_markdown("Language Tour", "/text/tour.md", ())
+}
+
+#[component]
+pub fn PadPage() -> impl IntoView {
     let src = pad_src();
-    let version = format!("Uiua {}", uiua::VERSION);
-    let help = &["Note: Uiua is not yet stable", &version];
+    let version = format!("{} {}", lang(), uiua::VERSION);
+    let help = &[
+        match lang() {
+            "Weewuh" => "Note: Weewuh is not yet stable",
+            _ => "Note: Uiua is not yet stable",
+        },
+        &version,
+    ];
     view! {
-        <Title text="Pad - Uiua"/>
+        <Title text=format!("Pad - {}", lang())/>
         <Editor mode=EditorMode::Pad example={ &src } help=help/>
         <br/>
         <br/>
+        {
+            let date = Date::new_0();
+            if date.get_month() == 11 || date.get_month() == 10 && date.get_date() > 15 {
+                let year = date.get_full_year();
+                const CODE: &str = "6680-a10280cf";
+                let copy_code = move |_| {
+                     _ = window().navigator().clipboard().write_text(CODE)
+                };
+                Some(view! {
+                    <p>"Join the official "<a href={format!("https://adventofcode.com/{year}")}>"Advent of Code "{year}</a>" "{lang}" community leaderboard "<a href={format!("https://adventofcode.com/{year}/leaderboard/private")}>"here!"</a>"  "<button on:click=copy_code>"Copy code"</button></p>
+                })
+            } else {
+                None
+            }
+        }
         <br/>
         <p>"You can load files into the pad by dragging and dropping them into the window."</p>
         <p>"Replace "<code>"pad"</code>" in links with "<code>"embed"</code>" or "<code>"embedpad"</code>" to embed the editor."</p>
@@ -485,6 +548,8 @@ pub fn Pad() -> impl IntoView {
         <code class="code-block">
             { EDITOR_SHORTCUTS }
         </code>
+        <p>"Want a pad-like experience in the native interpreter? Try the "<code>"uiua -w"</code>" command to show output in a window."</p>
+        <p>"You can download the newest version of the native interpreter "<a href="https://github.com/uiua-lang/uiua/releases">"here"</a>"."</p>
     }
 }
 
@@ -509,7 +574,7 @@ fn pad_src() -> String {
         .with_untracked(|params| params.get("src").cloned())
         .unwrap_or_default();
     if let Some((_, encoded)) = src.split_once("__") {
-        logging::log!("{:?}", encoded);
+        // logging::log!("{:?}", encoded);
         if let Ok(decoded) = URL_SAFE.decode(encoded.as_bytes()) {
             src = String::from_utf8_lossy(&decoded).to_string();
         }
@@ -532,39 +597,52 @@ fn site() {
             let path = entry.path();
             if entry.file_type()?.is_file() {
                 for line in std::fs::read_to_string(&path)?.lines() {
-                    if let Some(code) = line.trim().strip_prefix(r#"<Editor example=""#) {
-                        let (code, should_fail) = if let Some(code) = code.strip_suffix(r#""/>"#) {
-                            (code, false)
-                        } else if let Some(code) = code.strip_suffix(r#""/> // Should fail"#) {
-                            (code, true)
+                    let (code, should_fail) =
+                        if let Some(code) = line.trim().strip_prefix(r#"<Editor example=""#) {
+                            if let Some(code) = code.strip_suffix(r#""/>"#) {
+                                (code, false)
+                            } else if let Some(code) = code.strip_suffix(r#""/> // Should fail"#) {
+                                (code, true)
+                            } else {
+                                continue;
+                            }
+                        } else if let Some(line) =
+                            line.strip_prefix("            { ").and_then(|line| {
+                                (line.split(", ").nth(2))
+                                    .and_then(|rest| rest.strip_prefix('"'))
+                                    .and_then(|rest| rest.strip_suffix("\") }"))
+                            })
+                        {
+                            (line, false)
                         } else {
                             continue;
                         };
-                        let code = code
-                            .replace("\\\\n", "<escaped-newline>")
-                            .replace("\\n", "\n")
-                            .replace("\\\"", "\"")
-                            .replace("\\\\", "\\")
-                            .replace("<escaped-newline>", "\\n");
-                        if code.contains("\"git:")
-                            || [uiua::SysOp::AudioPlay, uiua::SysOp::GifShow]
-                                .iter()
-                                .any(|p| code.contains(p.name()))
-                        {
-                            continue;
-                        }
-                        threads.push((
-                            path.to_path_buf(),
-                            code.clone(),
-                            std::thread::spawn(move || {
-                                (
-                                    uiua::Uiua::with_backend(crate::backend::WebBackend::default())
-                                        .run_str(&code),
-                                    should_fail,
-                                )
-                            }),
-                        ));
+                    let code = code
+                        .replace("\\\\n", "<escaped-newline>")
+                        .replace("\\n", "\n")
+                        .replace("\\\"", "\"")
+                        .replace("\\\\", "\\")
+                        .replace("<escaped-newline>", "\\n");
+                    if code.contains("\"git:")
+                        || [uiua::SysOp::AudioPlay, uiua::SysOp::GifShow]
+                            .iter()
+                            .any(|p| code.contains(p.name()))
+                    {
+                        continue;
                     }
+                    threads.push((
+                        path.to_path_buf(),
+                        code.clone(),
+                        std::thread::spawn(move || {
+                            (
+                                uiua::Uiua::with_backend(
+                                    uiua_editor::backend::WebBackend::default(),
+                                )
+                                .run_str(&code),
+                                should_fail,
+                            )
+                        }),
+                    ));
                 }
             } else if entry.file_type()?.is_dir() {
                 recurse_dir(&path, threads)?;
@@ -663,4 +741,55 @@ fn gen_primitives_json() {
     }
     let json = serde_json::to_string_pretty(&prims).unwrap();
     fs::write("primitives.json", json).unwrap();
+}
+
+#[component]
+fn ScrollToHash() -> impl IntoView {
+    move || {
+        let location = use_location();
+        create_effect(move |_| {
+            let hash = location.hash.get();
+            if !hash.is_empty() {
+                set_timeout(
+                    move || {
+                        let id = hash.trim_start_matches('#');
+                        if let Some(elem) = get_element::<Element>(id) {
+                            elem.scroll_into_view();
+                        }
+                    },
+                    Duration::from_millis(0),
+                )
+            }
+        });
+    }
+}
+
+#[component]
+pub fn Challenge<'a, P: IntoView + 'static>(
+    number: u8,
+    prompt: P,
+    example: &'a str,
+    answer: &'a str,
+    tests: &'a [&'a str],
+    hidden: &'a str,
+    #[prop(optional)] default: &'a str,
+    #[prop(optional)] flip: bool,
+    #[prop(optional)] best_answer: &'a str,
+) -> impl IntoView {
+    let def = ChallengeDef {
+        example: example.into(),
+        intended_answer: answer.into(),
+        best_answer: (!best_answer.is_empty()).then(|| best_answer.into()),
+        tests: tests.iter().copied().map(Into::into).collect(),
+        hidden: hidden.into(),
+        flip,
+        did_init_run: Cell::new(false),
+    };
+    view! {
+        <div class="challenge">
+            <h3>"Challenge "{number}</h3>
+            <p>"Write a program that "<strong>{prompt}</strong>"."</p>
+            <Editor challenge=def example=default/>
+        </div>
+    }
 }

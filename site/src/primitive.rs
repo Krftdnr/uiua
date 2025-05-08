@@ -2,10 +2,11 @@ use leptos::*;
 use leptos_meta::*;
 use leptos_router::*;
 use uiua::{PrimClass, PrimDocFragment, PrimDocLine, Primitive, SysOp};
+use uiua_editor::{lang, Editor};
 
-use crate::{editor::Editor, Hd, Prim, Prims};
+use crate::{Hd, Prim, Prims};
 
-fn doc_line_fragments_to_view(fragments: &[PrimDocFragment]) -> View {
+pub fn doc_line_fragments_to_view(fragments: &[PrimDocFragment]) -> View {
     if fragments.is_empty() {
         return view!( <br/>).into_view();
     }
@@ -100,10 +101,25 @@ pub fn PrimDocs(prim: Primitive) -> impl IntoView {
         }
     });
 
+    let aliases: Vec<_> = prim
+        .aliases()
+        .iter()
+        .copied()
+        .filter(|&s| s != prim.name())
+        .collect();
+    let aliases = if aliases.is_empty() {
+        None
+    } else {
+        Some(view!(<p style="white-space: pre-wrap">
+                "Aliases: "{aliases.iter().map(|&s| view!(<code>{s}</code>" ")).collect::<Vec<_>>()}
+            </p>))
+    };
+
     view! {
         <div>
             <h1 id=id><Prim prim=prim hide_docs=true/>{ long_name }</h1>
             <p><h3>{ sig }</h3></p>
+            { aliases }
             <p>{ experimental }</p>
             { body }
             { match prim {
@@ -138,9 +154,9 @@ pub fn AllFunctions() -> impl IntoView {
         Default::default(),
     );
     view! {
-        <Title text="All Functions - Uiua Docs"/>
+        <Title text=format!("All Functions - {} Docs", lang())/>
         <h1>"All Functions"</h1>
-        <p>"This is a list of every built-in function in Uiua, provided for your scrolling pleasure."</p>
+        <p>"This is a list of every built-in function in "{lang}", provided for your scrolling pleasure."</p>
         <p>"For a searchable list, see the "<A href="/docs#functions">"main docs page"</A>"."</p>
         { move || list.get() }
     }
@@ -160,6 +176,7 @@ fn all_fills() -> impl IntoView {
             { fill_row_impl("Arrays", "", "⬚0[1 2_3_4 5_6]") }
             { fill_row(First, "Default scalar for empty array", "⬚5⊢ []") }
             { fill_row(Parse, "Default for non-number strings", "⬚10⋕ {\"1\" \"2\" \"dog\"}") }
+            { fill_row(Abs, "Multi-character uppercase", r#"⬚@-⌵ ["a" "ß"]"#) }
             { fill_row(Couple, "Matches shapes", "⬚0⊟ [1 2 3 4] [5 6]") }
             { fill_row(Join, "Makes shapes work", "⬚0⊂ [1_2 3_4] [5 6 7]") }
             { fill_row(Keep, "Fills mask", "⬚0▽ [1 0 1] \"abcdef\"") }
@@ -169,13 +186,12 @@ fn all_fills() -> impl IntoView {
             { fill_row(Reshape, "Fills excess elements", "⬚0↯ 2_4 [1 2 3]") }
             { fill_row(Rotate, "Fills instead of wrapping", "⬚0↻ 2 [1 2 3 4 5]") }
             { fill_row(Reduce, "Sets initial value", "⬚10/+ [1 2 3]") }
-            { fill_row(Scan, "Fills row shapes", "⬚10\\⊂ [1 2 3]") }
+            { fill_row(Scan, "Sets initial value and fills row shapes", "⬚10\\⊂ [1 2 3]") }
             { fill_row(Rows, "Fills row shapes", "⬚0≡⇡ [4 7 3]") }
             { fill_row(Each, "Fills row shapes", "⬚0∵⇡ [3_2 2_4]") }
             { fill_row(Partition, "Fills row shapes", "⬚@ ⊜∘ ≠@ . \"Hey there\"") }
-            { fill_row(Partition, "Sets initial value", "⬚\"- \"⊜⊂ ≠@ . \"Hello world!\"") }
             { fill_row(Group, "Fills row shapes", "⬚0⊕∘ ◿3. [1 8 4 9 3 8 2]") }
-            { fill_row(Group, "Sets initial value", "⬚[]⊕⊂ ◿3. [1 8 4 9 3 8 2]") }
+            { fill_row(Base, "Repeating base", "# Experimental!\n⬚10base[12 20] 999999") }
             { fill_row_impl(view!(<Prims prims=[Un, Pop]/>), "Get fill value", "⬚5°◌") }
         </table>
     }
@@ -224,6 +240,9 @@ fn all_uns() -> impl IntoView {
             </tr>
             { inverse_row([Un], No, "", "°°⊟ 1 2") }
             { inverse_row_impl("Constant", Optional, "Pattern match", "°8 8") }
+            { inverse_row([Dup], No, "Pattern match", "°. 4 4") }
+            { inverse_row([Min], Required, "Pattern match", "°(↧5) 3") }
+            { inverse_row([Max], Required, "Pattern match", "°(↥3) 5") }
             { inverse_row([Identity], No, "Self inverse", "°∘ 5") }
             { inverse_row([Flip], No, "Self inverse", "°: 2 5") }
             { inverse_row([Neg], No, "Self inverse", "°¯ 5") }
@@ -256,29 +275,38 @@ fn all_uns() -> impl IntoView {
             { inverse_row_impl(view!(<code>"[…]"</code>), No, "", "°[⇌] [[1 2 3]]") }
             { inverse_row_impl(view!(<code>"{…}"</code>), No, "", "°{:} {1 2_3}") }
             { inverse_row([Box], No, "No-op on non-scalars and non-boxes", "°□ □[1 2 3]") }
-            { inverse_row([Reverse], No, "", "°⇌ [1 2 3 4]") }
+            { inverse_row([Reverse], No, "Self inverse", "°⇌ [1 2 3 4]") }
+            { inverse_row([Shape], No, "", "°△ [2 2 4]") }
             { inverse_row([Transpose], No, "", "°⍉ ↯2_3_2⇡12") }
             { inverse_row([Bits], No, "", "°⋯ [1 0 1]") }
             { inverse_row([Where], No, "", "°⊚ [1 4]") }
             { inverse_row([Parse], No, "", "°⋕ [8 9 10 11 12]") }
             { inverse_row([Fix], No, "", "°¤ [[1 2 3]]") }
-            { inverse_row([Utf], No, "", "°utf [240 159 145 139 32 72 105 33]") }
+            { inverse_row([Sort], No, "Shuffle", "°⍆ [1 2 3 4]") }
+            { inverse_row([Utf8], No, "", "°utf [240 159 145 139 32 72 105 33]") }
             { inverse_row([Csv], No, "", "°csv \"1,2\\n3,4\"") }
             { inverse_row([Rotate], Required, "", "°(↻1) [1 2 3 4]") }
             { inverse_row([Join], No, "", "°⊂ [1 2 3 4]") }
-            { inverse_row([Join], Required, "Pattern match", "°(⊂1) [1 2 3 4]") }
+            { inverse_row([Join], Required, "Pattern match", "°(⊂1_2) [1 2 3 4]") }
+            { inverse_row([Keep], No, "", "°▽ [1 1 1 2 1 1 3 3]") }
+            { inverse_row([Select], No, "", "°⊏ \"hello\"") }
+            { inverse_row([Pick], No, "", "°⊡ [1_2_3 4_5_6]") }
+            { inverse_row([Orient], No, "", "°⤸ [1_2_3 4_5_6]") }
             { inverse_row([Scan], No, view!("Only works with "<Prims prims=[Add, Mul, Eq, Ne]/>), "°\\+ [1 3 6 10 15]") }
             { inverse_row([Reduce, Mul], No, "Prime factors", "°/× 60") }
-            { inverse_row([Repeat], No, "Inner function must be invertible", "°⍥(×2)5 1024") }
-            { inverse_row([Trace], No, "", "°⸮ 5") }
+            { inverse_row_impl(view!(<code class="string-literal-span">"$\"_…_\""</code>), No, "Pattern match and extract", "{°$\"_ - _(_)_\"} \"a - bc(de) - f\"") }
+            { inverse_row_impl(view!(<Prims prims=[Reduce]/><code class="string-literal-span">"$\"_…_\""</code>), No, "Must have 2 args and only text between", "°/$\"_ - _\" \"a - bc - d\"") }
+            { inverse_row([Partition], No, "Inner function must be invertible", "°⊜□ {\"Hey\" \"there\" \"buddy\"}") }
+            { inverse_row([Group], No, "Inner function must be invertible", "°⊕□ {1 2_3_4 5_6}") }
+            { inverse_row([Repeat], Required, "Inner function must be invertible", "°(⍥(×2)5) 1024") }
             { inverse_row([Stack], No, "", "°? 5") }
             { inverse_row([Dump], No, "", "°dump△ [2 3 4]") }
             { inverse_row([Pop], RequiresFill, "", "⬚5°◌") }
-            { inverse_row([Sys(AudioEncode)], No, "Decodes bytes", None) }
-            { inverse_row([Sys(ImEncode)], No, "Decodes bytes", None) }
-            { inverse_row([Sys(GifEncode)], No, "Decodes bytes", None) }
-            { inverse_row([Sys(ClipboardGet)], No, "", None) }
-            { inverse_row([Sys(ClipboardSet)], No, "", None) }
+            { inverse_row([AudioEncode], Optional, "Decodes bytes", None) }
+            { inverse_row([ImageEncode], Optional, "Decodes bytes", None) }
+            { inverse_row([GifEncode], Optional, "Decodes bytes", None) }
+            { inverse_row([Sys(Clip)], No, "Set the clipboard", None) }
+            { inverse_row([Sys(RawMode)], No, "Terminal raw state", None) }
         </table>
     }
 }
@@ -308,40 +336,48 @@ fn all_unders() -> impl IntoView {
             { inverse_row([Sub], Optional, view!("Optional "<Prim prim=Flip/>), "⍜-(×2) 1 5") }
             { inverse_row([Mul], Optional, view!("Optional "<Prim prim=Flip/>), "⍜×(+1) 2 5") }
             { inverse_row([Div], Optional, view!("Optional "<Prim prim=Flip/>), "⍜÷(+1) 2 5") }
-            { inverse_row([Mod], Optional, view!("Optional "<Prim prim=Flip/>), "⍜◿(×10) 4 9") }
+            { inverse_row([Modulus], Optional, view!("Optional "<Prim prim=Flip/>), "⍜◿(×10) 4 9") }
             { inverse_row([Pow], Optional, view!("Optional "<Prim prim=Flip/>), "⍜ⁿ(-9) 2 5") }
             { inverse_row([Log], Optional, view!("Optional "<Prim prim=Flip/>), "⍜ₙ(+1) 3 8") }
+            { inverse_row([Get], Optional, "", "⍜get(×10) @b map \"abc\" 1_2_3") }
             { inverse_row([Floor], No, "", "⍜⌊(×10) 1.5") }
             { inverse_row([Ceil], No, "", "⍜⌈(×10) 1.5") }
             { inverse_row([Round], No, "", "⍜⁅(×10) 1.5") }
             { inverse_row([Abs], No, "", "⍜⌵(+1) ¯5") }
             { inverse_row([Sign], No, "", "⍜±(×2) ¯5") }
             { inverse_row([First], No, "", "⍜⊢(×10) [1 2 3 4 5]") }
-            { inverse_row([First, Reverse], No, "", "⍜(⊢⇌|×10) [1 2 3 4 5]") }
+            { inverse_row([Last], No, "", "⍜⊣(×10) [1 2 3 4 5]") }
+            { inverse_row([Shape], No, view!(<Prim prim=Reshape/>), "⍜△⇌ [1_2_3 4_5_6]") }
+            { inverse_row([Len], No, view!(<Prim prim=Reshape/>), "⍜⧻(+1) [1_2_3 4_5_6]") }
             { inverse_row([Deshape], No, "", "⍜♭⇌ ↯3_3⇡9") }
             { inverse_row([Rise], No, "", "⍜⍏(↻¯1). [1 4 2 3 5]") }
             { inverse_row([Fall], No, "", "⍜⍖(↻¯1). [1 4 2 3 5]") }
+            { inverse_row([Sort], No, "", "⍜⍆(↻¯1). [1 4 2 3 5]") }
+            { inverse_row([Where], No, "Maintains minumum shape", "⍜⊚⊂ [1 0 0 0 0] 3") }
             { inverse_row([Classify], No, "", "⍜⊛⇌ \"hello\"") }
             { inverse_row([Deduplicate], No, "", "⍜◴⇌ \"hello\"") }
-            { inverse_row([Rerank], Optional, "", "⍜(☇1)⇌ ↯2_2_4⇡16") }
+            { inverse_row([Deshape], No, "Works with subscripts", "⍜♭⇌ ↯2_2_4⇡16") }
             { inverse_row([Reshape], Optional, "", "⍜↯⇌ 2_3 ⇡6") }
             { inverse_row([Take], Optional, "", "⍜↙(×10) 2 [1 2 3 4 5]") }
             { inverse_row([Drop], Optional, "", "⍜↘(×10) 2 [1 2 3 4 5]") }
             { inverse_row([Keep], Optional, "", "⍜▽(×10) ◿2. [1 2 3 4 5]") }
             { inverse_row([Rotate], Optional, "", "⍜(↻2|⊂π) [1 2 3 4 5]") }
-            { inverse_row([Pick], Optional, "Duplicate indices must have the same value", "⍜(⊡1_1|×10) [1_2_3 4_5_6]") }
             { inverse_row([Select], Optional, "Duplicate indices must have the same value", "⍜(⊏1_4|×10) [1 2 3 4 5]") }
+            { inverse_row([Pick], Optional, "Duplicate indices must have the same value", "⍜(⊡1_1|×10) [1_2_3 4_5_6]") }
             { inverse_row([Join], No, view!(<Prim prim=Len/>" may not change"), "⍜⊂\\+ 1_2_3 4_5_6") }
+            { inverse_row([Stencil, Identity], Optional, "Chunking only", "⍜⧈∘≡⇌ ¤¤3 ⇡9") }
             { inverse_row([Dip], No, "Inner function must be invertible", "⍜⊙⊂× 10 2 3") }
             { inverse_row([Both], No, "Inner function must be invertible", "⍜∩⊡: 1 [1 2 3] 2 [4 5 6]") }
             { inverse_row([Pop], No, "", "⍜◌(×2) 1 2") }
             { inverse_row([Rows], No, "Inner function must be invertible", "⍜≡⊢(×10) [1_2_3 4_5_6]") }
+            { inverse_row([Inventory], No, "Inner function must be invertible", "⍜⍚△⇌ {1 2_3 4_5_6}") }
             { inverse_row([Each], No, "Inner function must be invertible", "⍜∵⇌⍚\\+ {1_2_3 4_5}") }
             { inverse_row([Group], No, "Inner function must be invertible", "⍜⊕□≡⇌ ≠@ . \"I love arrays\"") }
             { inverse_row([Partition], No, "Inner function must be invertible", "⍜⊜□≡⇌ ≠@ . \"Hello World\"") }
             { inverse_row([Fold], No, "Inner function must be invertible", "⍜∧⊏(×10) [0 2] ↯2_3⇡6") }
-            { inverse_row([Repeat], Optional, "Inner function must be invertible", "⍜⍥(×2). 5 1") }
-            { inverse_row_impl(view!(<code>"⟨…|…|…⟩"</code>), No, "Switch function", "⍜⟨⊢|⊢⇌⟩(×10) 1 [1 2 3 4]") }
+            { inverse_row([Repeat], Required, "Inner function must be invertible", "⍜⍥(×2). 5 1") }
+            { inverse_row([Repeat], No, "Inner function must be invertible", "°⍥°(↧1000×2) 5") }
+            { inverse_row([Switch], No, "", "⍜(⨬⊢⊣|×10) 1 [1 2 3 4]") }
             { inverse_row([Now], No, "Times execution", "⍜now(&sl 0.005)") }
             { inverse_row([Sys(FOpen)], Optional, view!("Calls "<Prim prim=Sys(Close)/>" on handle"), None) }
             { inverse_row([Sys(FCreate)], Optional, view!("Calls "<Prim prim=Sys(Close)/>" on handle"), None) }
@@ -350,6 +386,7 @@ fn all_unders() -> impl IntoView {
             { inverse_row([Sys(TcpAccept)], Optional, view!("Calls "<Prim prim=Sys(Close)/>" on handle"), None) }
             { inverse_row([Sys(FReadAllStr)], Optional, view!("Calls "<Prim prim=Sys(FWriteAll)/>), None) }
             { inverse_row([Sys(FReadAllBytes)], Optional, view!("Calls "<Prim prim=Sys(FWriteAll)/>), None) }
+            { inverse_row([Sys(RawMode)], Optional, "Resets raw state", None) }
         </table>
     }
 }
@@ -393,5 +430,81 @@ fn inverse_row_impl(
             <td>{notes}</td>
             <td>{ example.into().map(|ex| view!(<Editor example=ex/>)) }</td>
         </tr>
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn prim_docs() {
+    use uiua::{PrimDocLine, Uiua};
+    use uiua_editor::backend::WebBackend;
+
+    for prim in Primitive::non_deprecated() {
+        for line in &prim.doc().lines {
+            if let PrimDocLine::Example(ex) = line {
+                if [
+                    "&sl", "&tcpc", "&tlsc", "&ast", "&clip", "&frab", "&fmd", "&b",
+                ]
+                .iter()
+                .any(|prim| ex.input().contains(prim))
+                {
+                    continue;
+                }
+                eprintln!("{prim} example:\n{}", ex.input());
+                match Uiua::with_backend(WebBackend::default()).run_str(ex.input()) {
+                    Ok(mut comp) => {
+                        if let Some(diag) = comp.take_diagnostics().into_iter().next() {
+                            if !ex.should_error() {
+                                panic!("\nExample failed:\n{}\n{}", ex.input(), diag.report());
+                            }
+                        } else if ex.should_error() {
+                            panic!("Example should have failed: {}", ex.input());
+                        }
+                    }
+                    Err(e) => {
+                        if !ex.should_error() {
+                            panic!("\nExample failed:\n{}\n{}", ex.input(), e.report());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn listed_examples() {
+    use uiua::Uiua;
+    use uiua_editor::backend::WebBackend;
+
+    let text = std::fs::read_to_string("src/primitive.rs").unwrap();
+    for mut line in text.lines() {
+        line = line.trim();
+        if !line.starts_with("{ ") {
+            continue;
+        }
+        if line.ends_with(", None) }") {
+            continue;
+        }
+        let line = line.replace("\\\"", "<double quote>");
+        let Some(end) = line.rfind("\"") else {
+            continue;
+        };
+        eprintln!("{line}");
+        let Some(start) = line[..end]
+            .rfind("r#\"")
+            .map(|i| i + 3)
+            .or_else(|| line[..end].rfind('"').map(|i| i + 1))
+        else {
+            panic!("No start quote in line: {line}");
+        };
+        let example = line[start..end]
+            .replace("<double quote>", "\"")
+            .replace("\\\\", "\\");
+        let mut env = Uiua::with_backend(WebBackend::default());
+        if let Err(e) = env.run_str(&example) {
+            panic!("Example failed: {example}\n{e}");
+        }
     }
 }

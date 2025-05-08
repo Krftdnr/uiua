@@ -4,9 +4,13 @@ use enum_iterator::{all, Sequence};
 use leptos::*;
 use leptos_meta::*;
 use leptos_router::*;
-use uiua::{example_ua, Primitive, SysOp};
+use uiua::{Primitive, SysOp, EXAMPLE_UA};
+use uiua_editor::*;
 
-use crate::{editor::*, other_tutorial::OtherTutorialParams, Hd, Prim, Prims};
+use crate::{
+    markdown::Markdown, other_tutorial::OtherTutorialParams, title_markdown, Challenge, Hd, Prim,
+    Prims,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Sequence)]
 pub enum TutorialPage {
@@ -17,14 +21,16 @@ pub enum TutorialPage {
     Types,
     Bindings,
     Functions,
-    AdvancedStack,
+    MoreStack,
     Inverses,
     ControlFlow,
     PatternMatching,
-    AdvancedArray,
+    MoreArray,
     ThinkingWithArrays,
     Macros,
+    TacitCode,
     Modules,
+    DataDefs,
     Testing,
 }
 
@@ -41,14 +47,16 @@ impl TutorialPage {
             Self::Types => "Types",
             Self::Bindings => "Bindings",
             Self::Functions => "Modifiers and Functions",
-            Self::AdvancedStack => "Advanced Stack Manipulation",
+            Self::MoreStack => "More Stack Manipulation",
             Self::Inverses => "Inverses",
             Self::ControlFlow => "Control Flow",
             Self::PatternMatching => "Pattern Matching",
-            Self::AdvancedArray => "Advanced Array Manipulation",
+            Self::MoreArray => "More Array Manipulation",
             Self::ThinkingWithArrays => "Thinking With Arrays",
             Self::Macros => "Macros",
+            Self::TacitCode => "Tacit Code",
             Self::Modules => "Modules",
+            Self::DataDefs => "Data Definitions",
             Self::Testing => "Testing",
         }
     }
@@ -61,42 +69,43 @@ pub struct TutorialParams {
 
 #[component]
 pub fn Tutorial() -> impl IntoView {
-    move || match use_params::<TutorialParams>().get() {
-        Ok(params) => {
-            let page = params.page;
-            let tut_view = match page {
-                TutorialPage::Introduction => TutorialIntroduction().into_view(),
-                TutorialPage::Basic => TutorialBasic().into_view(),
-                TutorialPage::Math => TutorialMath().into_view(),
-                TutorialPage::Arrays => TutorialArrays().into_view(),
-                TutorialPage::Types => TutorialTypes().into_view(),
-                TutorialPage::Bindings => TutorialBindings().into_view(),
-                TutorialPage::Functions => TutorialFunctions().into_view(),
-                TutorialPage::ControlFlow => TutorialControlFlow().into_view(),
-                TutorialPage::AdvancedStack => TutorialAdvancedStack().into_view(),
-                TutorialPage::Inverses => TutorialInverses().into_view(),
-                TutorialPage::PatternMatching => TutorialPatternMatching().into_view(),
-                TutorialPage::AdvancedArray => TutorialAdvancedArray().into_view(),
-                TutorialPage::ThinkingWithArrays => TutorialThinkingWithArrays().into_view(),
-                TutorialPage::Macros => TutorialMacros().into_view(),
-                TutorialPage::Modules => TutorialModules().into_view(),
-                TutorialPage::Testing => TutorialTesting().into_view(),
-            };
-            view! {
-                <A href="/docs">"Back to Docs Home"</A>
-                <br/>
-                <br/>
-                <TutorialNav page=page/>
-                { tut_view }
-                <br/>
-                <br/>
-                <TutorialNav page=page/>
-                <br/>
-                <br/>
-                <A href="/docs">"Back to Docs Home"</A>
-            }
-            .into_view()
+    let page_view = |page: TutorialPage| {
+        let tut_view = match page {
+            TutorialPage::Introduction => TutorialIntroduction().into_view(),
+            TutorialPage::Basic => TutorialBasic().into_view(),
+            TutorialPage::Math => TutorialMath().into_view(),
+            TutorialPage::Arrays => TutorialArrays().into_view(),
+            TutorialPage::Types => TutorialTypes().into_view(),
+            TutorialPage::Bindings => TutorialBindings().into_view(),
+            TutorialPage::Functions => TutorialFunctions().into_view(),
+            TutorialPage::ControlFlow => TutorialControlFlow().into_view(),
+            TutorialPage::MoreStack => TutorialMoreStack().into_view(),
+            TutorialPage::Inverses => TutorialInverses().into_view(),
+            TutorialPage::PatternMatching => TutorialPatternMatching().into_view(),
+            TutorialPage::MoreArray => TutorialMoreArray().into_view(),
+            TutorialPage::ThinkingWithArrays => TutorialThinkingWithArrays().into_view(),
+            TutorialPage::Macros => TutorialMacros().into_view(),
+            TutorialPage::TacitCode => TutorialTacitCode().into_view(),
+            TutorialPage::Modules => TutorialModules().into_view(),
+            TutorialPage::DataDefs => TutorialDataDefs().into_view(),
+            TutorialPage::Testing => TutorialTesting().into_view(),
+        };
+        view! {
+            <A href="/docs">"Back to Docs Home"</A>
+            <br/>
+            <br/>
+            <TutorialNav page=page/>
+            { tut_view }
+            <br/>
+            <br/>
+            <TutorialNav page=page/>
+            <br/>
+            <br/>
+            <A href="/docs">"Back to Docs Home"</A>
         }
+    };
+    move || match use_params::<TutorialParams>().get() {
+        Ok(params) => page_view(params.page).into_view(),
         Err(_) => match use_params::<OtherTutorialParams>().get() {
             Ok(params) => view! {
                 <A href="/docs">"Back to Docs Home"</A>
@@ -108,19 +117,22 @@ pub fn Tutorial() -> impl IntoView {
                 <A href="/docs">"Back to Docs Home"</A>
             }
             .into_view(),
-            Err(_) => TutorialIntroduction().into_view(),
+            Err(_) => page_view(TutorialPage::Introduction).into_view(),
         },
     }
 }
 
 impl IntoParam for TutorialPage {
     fn into_param(value: Option<&str>, name: &str) -> Result<Self, ParamsError> {
-        if value == Some("custommodifiers") {
-            return Ok(TutorialPage::Macros);
+        match value {
+            Some("custommodifiers") => Ok(TutorialPage::Macros),
+            Some("advancedstack") => Ok(TutorialPage::MoreStack),
+            Some("advancedarray") => Ok(TutorialPage::MoreArray),
+            Some(val) => all::<TutorialPage>()
+                .find(|p| p.path() == val)
+                .ok_or_else(|| ParamsError::MissingParam(name.to_string())),
+            None => Ok(TutorialPage::Introduction),
         }
-        all::<TutorialPage>()
-            .find(|p| p.path() == value.unwrap_or(""))
-            .ok_or_else(|| ParamsError::MissingParam(name.to_string()))
     }
 }
 
@@ -154,13 +166,13 @@ fn TutorialNav(page: TutorialPage) -> impl IntoView {
 #[component]
 fn TutorialIntroduction() -> impl IntoView {
     view! {
-        <Title text="Introduction - Uiua Docs"/>
+        <Title text=format!("Introduction - {} Docs", lang())/>
         <h1>"Introduction"</h1>
-        <p>"Welcome to the Uiua tutorial! Each page of this tutorial will introduce you to a new concept in the language. The tutorial is designed to be read in order, but you can jump around if you want."</p>
-        <p>"Uiua is an array programming language in the same family as APL, J, and BQN. Uiua focuses particularly on tacit programming, that is, writing code without naming variables. It does this by putting all values on a global stack."</p>
+        <p>"Welcome to the "{lang}" tutorial! Each page of this tutorial will introduce you to a new concept in the language. The tutorial is designed to be read in order, but you can jump around if you want."</p>
+        <p>{lang}" is an array programming language in the same family as APL, J, and BQN. "{lang}" focuses particularly on tacit programming, that is, writing code without naming variables. It does this by putting all values on a global stack."</p>
 
         <Hd id="what-is-array-programming">"What is Array Programming?"</Hd>
-        <p>"Before jumping into Uiua, it may be helpful to understand the paradigm of which it is a part."</p>
+        <p>"Before jumping into "{lang}", it may be helpful to understand the paradigm of which it is a part."</p>
         <p><a href="https://en.wikipedia.org/wiki/Array_programming">"Array Programming"</a>" is a way of writing programs first developed by Ken Iverson in the 1960s. It emphasizes the use of arrays as the primary data structure, and many operations work on entire arrays at once. An array language also has a rich set of operations for manipulating arrays in various ways, to the point where many data structures and control flow constructs are replaced with operations on arrays."</p>
 
         <Hd id="why-array-programming">"Why Array Programming?"</Hd>
@@ -169,15 +181,15 @@ fn TutorialIntroduction() -> impl IntoView {
         <p>"Array programming can change the way you think about programs. All operations you use act on a single, unified data structure. You stop thinking about individual items and start thinking about entire collections and how they can interact and transform."</p>
         <p>"Finally, many common algorithms are built-in to array languages, and are often written with a single glyph. This makes array code very concise and expressive. Several lines of code in a language like C or Python can often be just a few characters in an array language. Array languages do away with much of the "<em>"ceremony"</em>" that is present in other languages, so you can focus more on the problem you are trying to solve."</p>
 
-        <Hd id="why-uiua">"Why Uiua?"</Hd>
-        <p>"Uiua retains many of the array operations and semantics of its predecessor array languages. However, while APL, J, and BQN structure code with syntax and semantics based on mathematical notation:"</p>
+        <Hd id="why-uiua">"Why "{lang}"?"</Hd>
+        <p>{lang}" retains many of the array operations and semantics of its predecessor array languages. However, while APL, J, and BQN structure code with syntax and semantics based on mathematical notation:"</p>
         <p><code>"1 + 2"</code>", "<code>"4×ω-2"</code>", etc."</p>
-        <p>"Uiua puts values on a stack, and operators appear to the left of their arguments:"</p>
+        <p>{lang}" puts values on a stack, and operators appear to the left of their arguments:"</p>
         <p>""<code>"+ 1 2"</code>", "<code>"×4-2"</code>", etc."</p>
-        <p>"This allows Uiua to be, in most cases, even more terse than other array languages. That being said, Uiua has been designed to remain readable as much as possible, even without named local variables. While writing tacit code can quickly become unwieldy in other array languages, Uiua embraces tacitness as the only way."</p>
-        <p>"Uiua also features built-in functionality for working with images, audio, and GIFs, so once you learn the language, you can very quickly get started writing programs that do interesting things!"</p>
-        <p>"Note that Uiua is not yet stable. While most of the core features are unlikely to change much, more complex ones are still in flux. This tutorial is based on the current state of the language, and it is updated as the language changes."</p>
-        <p><strong>"Important Note"</strong>": This website usually uses the most recent development version of Uiua, rather than the stable release. This is so people can test new features easily. Some features available here may not be available if you install Uiua locally in the default way. The version of Uiua currently running on this site is "<code>{uiua::VERSION}</code>"."</p>
+        <p>"This allows "{lang}" to be, in most cases, even more terse than other array languages. That being said, "{lang}" has been designed to remain readable as much as possible, even without named local variables. While writing tacit code can quickly become unwieldy in other array languages, "{lang}" embraces tacitness as the only way."</p>
+        <p>{lang}" also features built-in functionality for working with images, audio, and GIFs, so once you learn the language, you can very quickly get started writing programs that do interesting things!"</p>
+        <p>"Note that "{lang}" is not yet stable. While most of the core features are unlikely to change much, more complex ones are still in flux. This tutorial is based on the current state of the language, and it is updated as the language changes."</p>
+        <p><strong>"Important Note"</strong>": This website usually uses the most recent development version of "{lang}", rather than the stable release. This is so people can test new features easily. Some features available here may not be available if you install "{lang}" locally in the default way. The version of "{lang}" currently running on this site is "<code>{uiua::VERSION}</code>"."</p>
 
         <Hd id="who">"Who is this tutorial for?"</Hd>
         <p>"This tutorial is targeted at people who have at least a little bit of experience with programming. While you don't need to be proficient in any particular language, it will be helpful to understand concepts like variables and functions. However, even if you are a beginner, you can likely find your way through by taking the time to understand each example."</p>
@@ -189,28 +201,30 @@ fn TutorialIntroduction() -> impl IntoView {
 fn TutorialBasic() -> impl IntoView {
     use Primitive::*;
 
-    let primitive_table: Vec<_> = Primitive::all()
+    let primitive_table: Vec<_> = Primitive::non_deprecated()
         .filter_map(|p| {
-            if let (Some(ascii), Some(unicode)) = (p.ascii(), p.glyph()) {
-                if ascii.to_string() != unicode.to_string() {
-                    return Some(view! {
-                        <tr>
-                            <td><code>{ p.name() }</code></td>
-                            <td><code>{ ascii.to_string() }</code></td>
-                            <td><Prim prim=p glyph_only=true/></td>
-                        </tr>
-                    });
-                }
+            if p.is_experimental() {
+                return None;
+            }
+            let (ascii, unicode) = (p.ascii()?, p.glyph()?);
+            if ascii.to_string() != unicode.to_string() {
+                return Some(view! {
+                    <tr>
+                        <td><code>{ p.name() }</code></td>
+                        <td><code>{ ascii.to_string() }</code></td>
+                        <td><Prim prim=p glyph_only=true/></td>
+                    </tr>
+                });
             }
             None
         })
         .collect();
 
     view! {
-        <Title text="Basic Stack Operations and Formatting - Uiua Docs"/>
+        <Title text=format!("Basic Stack Operations and Formatting - {} Docs", lang())/>
         <h1>"Basic Stack Operations and Formatting"</h1>
         <Hd id="the-stack">"The Stack"</Hd>
-        <p>"In Uiua, all operations operate on a global stack. Lines of code are evaluated from "<A href="/docs/rtl">"right to left"</A>", top to bottom."</p>
+        <p>"In "{lang}", all operations operate on a global stack. Lines of code are evaluated from "<A href="/docs/rtl">"right to left"</A>", top to bottom."</p>
         <p>"A number simply pushes its value onto the stack."</p>
         <Editor example="5"/>
         <Editor example="1 2 3"/>
@@ -228,12 +242,12 @@ fn TutorialBasic() -> impl IntoView {
         <Hd id="comments">"Comments"</Hd>
         <p>"Comments are denoted with "<code>"#"</code>" and run to the end of the line."</p>
         <Editor example="5 # This is a comment"/>
-        <p>"Uiua does not have multiline comments."</p>
+        <p>{lang}" does not have multiline comments."</p>
 
         <Hd id="formatting">"Formatting"</Hd>
-        <p>"Most Uiua built-in functions use special Unicode characters. To type multiplication and division signs, you can use "<code>"*"</code>" and "<code>"%"</code>" respectively. Then, run the code to format the ASCII characters into Unicode."</p>
+        <p>"Most "{lang}" built-in functions use special Unicode characters. To type multiplication and division signs, you can use "<code>"*"</code>" and "<code>"%"</code>" respectively. Then, run the code to format the ASCII characters into Unicode."</p>
         <Editor example="# Click Run to format!\n%6 *3 8" help={&["", "⇡⇡⇡⇡ Click   "]}/>
-        <p>"Most built-in functions have names you can type rather than symbols. Formatting works on these too. "<em><strong>"This is the primary way of entering Uiua's glyphs."</strong></em></p>
+        <p>"Most built-in functions have names you can type rather than symbols. Formatting works on these too. "<em><strong>"This is the primary way of entering "{lang}"'s glyphs."</strong></em></p>
         <p>"Try formatting the lines below by clicking "<strong>"Run"</strong>"."</p>
         <Editor example="max sqrt 10 mod 10 pow 2 8"/>
         <Editor example="abs +`1 `2"/>
@@ -241,9 +255,9 @@ fn TutorialBasic() -> impl IntoView {
         <Editor example="cei 1.5\nceil 1.5\nceili 1.5\nceilin 1.5\nceiling 1.5"/>
         <p>"You don't even have to remove spaces between built-in function names. The formatter will figure it out!"</p>
         <Editor example="roundsqrtpi"/>
-        <p>"On this site, you can also click the ↧ symbol on any editor to show a palette of all the Uiua glyphs. You can then click on any glyph to insert it into the editor."</p>
+        <p>"On this site, you can also click the "<span class="material-symbols-rounded">"keyboard_arrow_down"</span>" symbol on any editor to show a palette of all the "{lang}" glyphs. You can then click on any glyph to insert it into the editor."</p>
         <p>"Here is a table of all the glyphs that are typed with ASCII characters that get converted to glyphs."</p>
-        <table>
+        <table class="left-header-table">
             <tr>
                 <th>"Name"</th>
                 <th>"ASCII"</th>
@@ -261,13 +275,15 @@ fn TutorialBasic() -> impl IntoView {
         <p>"The formatter will align consecutive end-of-line comments. Try it out!"</p>
         <Editor example="%2 8 # Line\n@x # these\n1 # up"/>
 
-        <h3>"Output Comments"</h3>
+        <Hd id="output-comments">"Output Comments"</Hd>
         <p>"A comment that starts with additional "<code>"#"</code>"s is an "<em>"output comment"</em>". The formatter replaces the text of an output comment with as many values from the stack as there are extra "<code>"#"</code>"s."</p>
         <p>"Click Run to try it out!"</p>
-        <Editor example="1 2 3\n####\n+\n###\n+\n##"/>
+        <Editor example="1 2 4\n####\n+\n###\n+\n##"/>
+        <p>"Output comments on the same line as other code show the values at the top of the stack after the code is run. This is useful for debugging."</p>
+        <Editor example="+1 2 ##\n×3 4 ##"/>
 
         <Hd id="stack-functions">"Stack Functions"</Hd>
-        <p>"There are a few functions that work on the stack itself. Some of these are critical and can be found scattered across all Uiua code."</p>
+        <p>"There are a few functions that work on the stack itself. Some of these are critical and can be found scattered across all "{lang}" code."</p>
         <Hd id="dup"><Prim prim=Dup/></Hd>
         <p><Prim prim=Dup/>" duplicates the top item on the stack."</p>
         <p>"In general, functions do not leave their arguments on the stack. If you want to reuse a value, the most basic way is to "<Prim prim=Dup/>" it first."</p>
@@ -284,28 +300,24 @@ fn TutorialBasic() -> impl IntoView {
         <Editor example="÷:1 5"/>
         <Editor example=":1 2 3 4 5"/>
         <br/>
-        <Hd id="over"><Prim prim=Over/></Hd>
-        <p><Prim prim=Over/>" is like "<Prim prim=Dup/>", but it duplicates the second item on the stack instead of the first."</p>
-        <Editor example=",1 2 3 4"/>
-        <Editor example="+×, 3 5"/>
-        <br/>
         <Hd id="pop"><Prim prim=Pop/></Hd>
         <p><Prim prim=Pop/>" removes the top item from the stack."</p>
         <p>"This is useful when you want to discard a value that you do not need."</p>
         <Editor example="1 pop 2 3 4 ◌ 5 6"/>
-        <Hd id="stack-and-trace"><Prim prim=Stack/>" and "<Prim prim=Trace/></Hd>
+        <Hd id="stack"><Prim prim=Stack/></Hd>
         <p><Prim prim=Stack/>" prints the entire stack."</p>
         <p>"It also attaches line and column numbers."</p>
         <p>"This is useful for debugging by inspecting the stack."</p>
         <Editor example="√+ ? .+ ? 1 ×3 4"/>
-        <p><Prim prim=Trace/>" prints only the top item on the stack."</p>
-        <Editor example="+1 ⸮ ×4 trace ×. -3 5"/>
+        <p><Prim prim=Stack/>" is compatible with a language feature called "<em>"subscripts"</em>". If you add a little subscript number to the right of it, it will only print that many values from the stack."</p>
+        <p>"We'll talk more about subscripts later. For now, know that you can add subscripts to "<Prim prim=Stack/>" by adding consecutive "<code>"?"</code>"s. The formatter will convert it for you!"</p>
+        <Editor example="+1 ?? × ??? 4 ?? ×. -3 5 # Try formatting!"/>
 
         <Hd id="challenges">"Challenges"</Hd>
         <p>"At the end of most sections of this tutorial, there will be a few challenges to test your understanding."</p>
         <p>"The code you write will be run on multiple inputs and tested for correctness."</p>
         <p>"Each challenge has an example input and output followed by some test cases. There is also a hidden test case that your code is checked against, so make sure to think about edge cases!"</p>
-        <p>"Remember that you can click the "<code>"↧"</code>" on the right side of the editor to see a list of all the glyphs."</p>
+        <p>"Remember that you can click the "<span class="material-symbols-rounded">"keyboard_arrow_down"</span>" on the right side of the editor to see a list of all the glyphs."</p>
         <p>"Answers are available, but "<strong>"try to solve the challenges yourself first!"</strong></p>
         <p>"Some challenges have additional answers that use functions and concepts not yet covered in the tutorial, but which are more idiomatic."</p>
         <br/>
@@ -320,9 +332,9 @@ fn TutorialBasic() -> impl IntoView {
 
         <Challenge
             number=2
-            prompt="divides the second number by the first but keeps the inputs on the stack"
+            prompt="divides the first number by the second"
             example="5 10"
-            answer="÷,,"
+            answer="÷:"
             tests={&["6 24", "2 100", "17 51"]}
             hidden="8 32"/>
 
@@ -367,16 +379,16 @@ fn primitive_rows(prims: impl IntoIterator<Item = Primitive>) -> Vec<impl IntoVi
 fn TutorialMath() -> impl IntoView {
     use Primitive::*;
     let math_table = primitive_rows([
-        Add, Sub, Mul, Div, Mod, Pow, Log, Neg, Abs, Ceil, Floor, Round, Sqrt, Sign,
+        Add, Sub, Mul, Div, Modulus, Pow, Log, Neg, Abs, Ceil, Floor, Round, Sqrt, Sign,
     ]);
     let comp_table = primitive_rows([
         Eq, Ne, Lt, Gt, Le, Ge, Min, Max, Floor, Ceil, Round, Sin, Atan,
     ]);
 
     view! {
-        <Title text="Math and Comparison - Uiua Docs"/>
+        <Title text=format!("Math and Comparison - {} Docs", lang())/>
         <h1>"Math and Comparison"</h1>
-        <p>"Uiua supports all the basic math operations as well as comparison, min/max, and rounding."</p>
+        <p>{lang}" supports all the basic math operations as well as comparison, min/max, and rounding."</p>
         <div id="ascii-glyphs">
             <table class="bordered-table">
                 <tr>
@@ -401,7 +413,7 @@ fn TutorialMath() -> impl IntoView {
         <Editor example="ⁿ2 5"/>
         <Editor example="⌈2.5"/>
         <Editor example="√4"/>
-        <p>"Uiua has no boolean type. Comparison operators return "<code>0</code>" for false and "<code>1</code>" for true."</p>
+        <p>{lang}" has no boolean type. Comparison operators return "<code>0</code>" for false and "<code>1</code>" for true."</p>
         <Editor example="=2 5"/>
         <Editor example="=2 2"/>
         <p>"One thing to note is that non-commutative operators work backwards."</p>
@@ -416,10 +428,11 @@ fn TutorialMath() -> impl IntoView {
         <Editor example="# Click Run to format!\nmax sqrt2 mod10 abs`31" help={&["", "⇡⇡⇡⇡ Click   "]}/>
 
         <Hd id="adicity">"Adicity"</Hd>
-        <p>"Some programming languages use the terms \"unary\" and \"binary\" to refer to functions that take one or two arguments respectively. While these are the Latin terms, many array languages, including Uiua, prefer to use the Greek terms \"monadic\" and \"dyadic\"."</p>
-        <p>"As you read Uiua's documentation, you will see these terms used to describe functions (and modifiers)."</p>
+        <p>"Some programming languages use the terms \"unary\" and \"binary\" to refer to functions that take one or two arguments respectively. While these are the Latin terms, many array languages, including "{lang}", prefer to use the Greek terms \"monadic\" and \"dyadic\"."</p>
+        <p>"As you read "{lang}"'s documentation, you will see these terms used to describe functions (and modifiers)."</p>
         <p>"For example, "<Prim prim=Sqrt/>" is a monadic function, and "<Prim prim=Add/>" is a dyadic function."</p>
-        <p>"On this site, monadic functions are in "<span class="monadic-function">"green"</span>" and dyadic functions are in "<span class="dyadic-function">"blue"</span>"."</p>
+        <p>"On this site, "<span class="monadic-function">"monadic"</span>" functions are in "<span class="monadic-function">"green"</span>" and "<span class="dyadic-function">"dyadic"</span>" functions are in "<span class="dyadic-function">"blue"</span>"."</p>
+        <p>"Some documentation may also reference functions which are "<span class="noadic-function">"noadic"</span>", "<span class="triadic-function">"triadic"</span>", or "<span class="tetradic-function">"tetradic"</span>". These are the words for functions that take 0, 3, or 4 arguments respectively. The word "<span class="noadic-function">"noadic"</span>" is not common outside of "{lang}", but it is chosen because such a function takes "<em>"no"</em>" arguments."</p>
 
         <Hd id="challenges">"Challenges"</Hd>
 
@@ -446,12 +459,12 @@ fn TutorialMath() -> impl IntoView {
 fn TutorialArrays() -> impl IntoView {
     use Primitive::*;
     view! {
-        <Title text="Arrays - Uiua Docs"/>
+        <Title text=format!("Arrays - {} Docs", lang())/>
         <h1>"Arrays"</h1>
-        <p>"Uiua is, first and foremost, an array language. The only composite data type is the multidimensional array. Arrays have a lot of nice properties, and the language's built-in functions are designed to make it easy to work with them. If you've only ever programmed in non-array languages, then this will be a completely foreign paradigm. In most array languages, most data structures and control flow are replaced with operations on arrays."</p>
+        <p>{lang}" is, first and foremost, an array language. The only composite data type is the multidimensional array. Arrays have a lot of nice properties, and the language's built-in functions are designed to make it easy to work with them. If you've only ever programmed in non-array languages, then this will be a completely foreign paradigm. In most array languages, most data structures and control flow are replaced with operations on arrays."</p>
 
         <Hd id="creating-arrays">"Creating Arrays"</Hd>
-        <p>"Other than with functions, Uiua has two ways to create arrays. They are called "<em>"strand notation"</em>" and "<em>"stack notation"</em>"."</p>
+        <p>"Other than with functions, "{lang}" has two ways to create arrays. They are called "<em>"strand notation"</em>" and "<em>"stack notation"</em>"."</p>
         <p><strong>"Strand notation"</strong>" uses underscores to connect elements."</p>
         <Editor example="1_2_3"/>
         <Editor example="\"Hello\"_\"World\""/>
@@ -480,7 +493,6 @@ fn TutorialArrays() -> impl IntoView {
 [[1 2 3]
  [4 5 6]
  [7 8 9]]"/>
-        <p>"More precisely, stack notation "<Prim prim=Couple/>"s the first two stack items created between the "<code>"[]"</code>"s and "<Prim prim=Join/>"s the rest to that coupling. You may see this refered to in error messages."</p>
 
         <Hd id="shape-len"><Prim prim=Shape/>" and "<Prim prim=Len/></Hd>
         <p>"Other than their data, arrays also have a property called their "<strong>"shape"</strong>". Shape is a list of non-negative integers that describes the array's size along each of its axes."</p>
@@ -492,7 +504,7 @@ fn TutorialArrays() -> impl IntoView {
         <p>"Arrays with 0 dimensions (an empty "<Prim prim=Shape/>") are called "<strong>"scalars"</strong>"."</p>
         <p>"Arrays with 1 dimension are often called "<strong>"lists"</strong>" or "<strong>"vectors"</strong>"."</p>
         <p>"Arrays with 2 dimensions are often called "<strong>"tables"</strong>" or "<strong>"matrices"</strong>"."</p>
-        <p>"While there are not common names for arrays with 3 or more dimensions, Uiua supports arrays with an arbitrary number of axes."</p>
+        <p>"While there are not common names for arrays with 3 or more dimensions, "{lang}" supports arrays with an arbitrary number of axes."</p>
         <p>"The first element of the shape is the number of "<em>"rows"</em>" of the array. "<em>"Rows"</em>" does not refer just to the rows of a matrix or table. It is the groups of elements along the leading axis of the array. For lists, this is just the individual elements. For matrices, it is the rows as you might traditionally think of them. But arrays with a higher number of dimensions have rows as well. For example, in an array with 3 dimensions, each row is a matrix."</p>
         <p>"From shape we can derive two closely-related properties called "<strong>"length"</strong>" and "<strong>"rank"</strong>"."</p>
         <p><Prim prim=Len/>" is the number of rows in the array. Length is always equal to the first number in the shape (or 1 if the shape is empty)."</p>
@@ -500,13 +512,14 @@ fn TutorialArrays() -> impl IntoView {
         <Editor example=" △[1_2_3 4_5_6 7_8_9]\n ⧻[1_2_3 4_5_6 7_8_9]\n⧻△[1_2_3 4_5_6 7_8_9] # Rank"/>
 
         <Hd id="output">"Pretty Array Output"</Hd>
-        <p>"The online editor and native interpreter both pretty-print any values that remain on the stack when a program is finished. (This can be invoked manually using the "<Prim prim=Sys(SysOp::Show)/>" function.)"</p>
+        <p>"The online editor and native interpreter both pretty-print any values that remain on the stack when a program is finished. (This can be invoked manually using the "<Prim prim=Sys(SysOp::Show)/>" or "<Prim prim=Pretty/>" functions.)"</p>
         <p>"To understand how the pretty-printed output corresponds to the actual array, we can use "<Prim prim=Reshape/>" to create a multidimensional array. "<Prim prim=Reshape/>" uses its first argument as a new shape for its second argument."</p>
         <p>"Here, we create a "<Prim prim=Range/>" array of all the numbers up to "<code>"24"</code>" and turn it into a 3-dimensional array with the shape "<code>"[2 3 4]"</code>"."</p>
         <Editor example="↯2_3_4 ⇡24"/>
         <p>"Notice there are "<code>"2"</code>" big cells, each with "<code>"3"</code>" rows of "<code>"4"</code>" elements."</p>
-        <p>"This expands to any number of dimensions. The more dimensions, the more space between the cells representing earlier axes."</p>
-        <Editor example="↯2_3_2_5 ⇡60"/>
+        <p>"This expands to any number of dimensions. The elements of the last axis are always laid out horizontally. The rows of the second-to-last axis are always laid out vertically. The third-to-last axis is horizontal, the fourth-to-last is vertical, etc."</p>
+        <p>"We can see here that the shape "<code>"[2 3 4 5]"</code>" appears almost like a 2×3 matrix of 4×5 matrices."</p>
+        <Editor example="↯2_3_4_5 ⇡120"/>
 
         <Hd id="pervasion">"Pervasion"</Hd>
         <p>"Most operations that apply to scalars are what is called "<em>"pervasive"</em>" when it comes to arrays. This means that the operation automatically applies to every item in the array."</p>
@@ -524,57 +537,65 @@ fn TutorialArrays() -> impl IntoView {
 
         <Hd id="useful-array-operations">"Useful Array Operations"</Hd>
         <p>"You don't need to memorize all of these right now. This is just a brief introduction to some of the array operations so that you won't be surprised when you see them later."</p>
-        <p>"If you ever see a glyph that you don't recognize in an example, you can mouse over it in the editor to learn its name. You can also click the names of functions in the site text to see their documentation."</p>
+        <p>"If you ever see a glyph that you don't recognize in an example, you can mouse over it in the editor to learn its name."</p>
+        <p>"You can ctrl/⌘-click any glyph in the editor to see its documentation."</p>
+        <p>"You can also click the names of functions in the site text to see their documentation."</p>
         <p><Prim prim=Couple/>" turns two arrays into rows of a new array."</p>
         <Editor example="⊟ 1_2_3 [4 5 6]"/>
-        <p><Prim prim=First/>" gets the first row of an array."</p>
+        <p><Prim prim=Join/>" joins two arrays end-to-end."</p>
+        <Editor example="⊂ 1_2_3 4"/>
+        <Editor example="⊂ 1_2_3 [4 5 6 7]"/>
+        <p><Prim prim=First/>" and "<Prim prim=Last/>" get the first or last row of an array."</p>
         <Editor example="⊢ [4 7 1]"/>
         <Editor example="⊢ [1_2 3_4 5_6]"/>
+        <Editor example="⊣ \"hello\""/>
         <p><Prim prim=Reverse/>" reverses the rows of an array."</p>
         <Editor example="⇌ [4 7 1]"/>
         <Editor example="⇌ [1_2 3_4 5_6]"/>
         <p><Prim prim=Rotate/>" rotates the rows of an array by some amount."</p>
         <Editor example="↻2 [1 2 3 4 5]"/>
         <p><Prim prim=Deshape/>" flattens an array into a 1D array."</p>
-        <Editor example="♭ .[1_2 3_4 5_6]"/>
+        <Editor example="♭ . [1_2 3_4 5_6]"/>
         <p><Prim prim=Take/>" and "<Prim prim=Drop/>" isolate part of an array."</p>
         <Editor example="↙3 [1 2 3 4 5]\n↘3 [1 2 3 4 5]"/>
         <p><Prim prim=Pick/>" indexes an array. Longer indices index deeper into the array."</p>
-        <p>"Uiua is 0-indexed."</p>
+        <p>{lang}" is 0-indexed."</p>
         <Editor example="⊡2 [3 8 4 1]"/>
         <Editor example="⊡1   [1_2_3 4_5_6]\n⊡1_1 [1_2_3 4_5_6]"/>
         <p><Prim prim=Select/>" uses a list of indices to select rows of an array."</p>
         <Editor example="⊏ [0 2 1 1 2] ↯3_3⇡9"/>
-        <Editor example="⊏[3 5 0 1 7 8 9 5 1 2 5 3 10] \"their sinks\""/>
+        <Editor example="⊏ [3 5 0 1 7 8 9 5 1 2 5 3 10] \"their sinks\""/>
+        <p><Prim prim=Transpose/>" rotates the axes of an array. This is useful for changing which axis other functions will work on."</p>
+        <Editor example="⍉ . [1_2_3 4_5_6]"/>
 
         <Hd id="array-model">"The Array Model"</Hd>
-        <p>"For curious array aficionados, Uiua uses an array model resembling "<a href="https://aplwiki.com/wiki/Box">"J's Boxed array model"</a>"."</p>
+        <p>"For curious array aficionados, "{lang}" uses an array model resembling "<a href="https://aplwiki.com/wiki/Box">"J's Boxed array model"</a>"."</p>
         <p>"All arrays are flat and homogenous. Arrays always have a rectangular shape, meaning that all rows along an axis always have the same length. Different types of data, like numbers and characters, cannot be mixed in the same array."</p>
-        <p>"However, there is an escape hatch for when you really want jagged, nested, or mixed-type arrays. In Uiua, an array of heterogeneous values can be simulated with an array of "<em>"boxes"</em>"."</p>
+        <p>"However, there is an escape hatch for when you really want jagged, nested, or mixed-type arrays. In "{lang}", an array of heterogeneous values can be simulated with an array of "<em>"boxes"</em>"."</p>
         <p>"The array below cannot be constructed normally because its rows have different "<Prim prim=Shape/>"s."</p>
-        <Editor example="[1 2 [7 8 9]]"/> // Should fail
+        <Editor example="[1_2 3 [4 5 6] [7]]"/> // Should fail
         <p>"By using "<Prim prim=Box/>", we can turn any value into a "<strong>"box"</strong>" that contains that value. We can then put these boxes into an array together."</p>
-        <Editor example="[□1 □2 □[7 8 9]]"/>
-        <p>"The "<code>"{}"</code>"s in the output hint at some syntax that will be introduced shortly."</p>
+        <Editor example="[□1_2 □3 □[4 5 6] □[7]]"/>
+        <p>"The "<Prim prim=Box/>"ed items in the array are separated by "<code>"│"</code>"s. Scalars are marked with a "<code>"∙"</code>" to distinguish them from single-row lists."</p>
+        <p>"This is "<em>"not"</em>" an array of numbers. It is an array of boxes! Notice that the "<Prim prim=Shape/>" of the array has nothing to do with the shape of any of the boxed values."</p>
+        <Editor example="△ [□1_2 □3 □[4 5 6] □[7]]"/>
         <p><Prim prim=Un/><Prim prim=Box/>" extracts a "<Prim prim=Box/>"ed value."</p>
         <Editor example="°□ .□[1 2 3]"/>
-        <p>"The "<code>"⟦⟧"</code>"s indicate that a list is "<Prim prim=Box/>"ed."</p>
-        <p><Prim prim=Box/>"ed strings also have special output delimiters, using "<code>"⌜⌟"</code>"s."</p>
-        <Editor example="□\"banana\""/>
+        <p>"The "<code>"□"</code>"in front of the list indicates that it is "<Prim prim=Box/>"ed."</p>
         <p>"Having to write "<Prim prim=Box glyph_only=true/>" everywhere is annoying, and so..."</p>
 
         <Hd id="nested-arrays">"Nested Arrays"</Hd>
-        <p>"Uiua has a special syntax for making arrays where every item is "<Prim prim=Box/>"ed."</p>
+        <p>{lang}" has a special syntax for making arrays where every item is "<Prim prim=Box/>"ed."</p>
         <p>"Using "<code>"{}"</code>"s instead of "<code>"[]"</code>"s for stack array notation will automatically "<Prim prim=Box/>" every item."</p>
-        <Editor example="{1 2 [7 8 9]}"/>
+        <Editor example="{1_2 3 [4 5 6] [7]}"/>
         <p>"This is very useful for making lists of strings."</p>
         <Editor example=r#"["Uiua" "APL" "J" "BQN" "K" "Q"] # Fails"#/>
         <Editor example=r#"{"Uiua" "APL" "J" "BQN" "K" "Q"} # Works!"#/>
         <p>"Functions that require their arguments to have matching types may require "<Prim prim=Box/>"ing an argument."</p>
-        <p>"For example, to check if a string is in a list of "<Prim prim=Box/>"ed strings with "<Prim prim=Member/>", you would need to "<Prim prim=Box/>" the string first."</p>
+        <p>"For example, to check if a string is in a list of "<Prim prim=Box/>"ed strings with "<Prim prim=MemberOf/>", you would need to "<Prim prim=Box/>" the string first."</p>
         <Editor example=
 r#"Langs ← {"Uiua" "APL" "J" "BQN" "K" "Q"}
-∊ □"APL" Langs"#/>
+∊ Langs □"APL""#/>
         <p>"Pervasive functions work through boxes and preserve the maximum "<Prim prim=Box/>" depth of their arguments."</p>
         <Editor example="¯ 1\n¯ □1\n¯ □□1"/>
         <Editor example="+1 4\n+1 □4\n+1 □□4\n+□□1 □4"/>
@@ -585,8 +606,7 @@ r#"Langs ← {"Uiua" "APL" "J" "BQN" "K" "Q"}
 >  [1 2 3]  [1 2 5]
 > □[1 2 3] □[1 2 5]
 >  "banana"  "orange"
-> □"banana" □"orange"
-> □"banana"  "orange""#/>
+> □"banana" □"orange""#/>
         <p>"Non-pervasive functions often require "<Prim prim=Un/><Prim prim=Box/>"ing the arguments to get at the value you want."</p>
         <p>"Consider this difference:"</p>
         <Editor example="△    ⊢{1_2_3 5_6}\n△ °□ ⊢{1_2_3 5_6}"/>
@@ -622,7 +642,7 @@ r#"Langs ← {"Uiua" "APL" "J" "BQN" "K" "Q"}
 
         <Challenge
             number=4
-            prompt="appends the first row of the first argument to the second argument"
+            prompt="prepends the first row of the first argument to the second argument"
             example="[1 2 3] 4_5_6"
             answer="⊂⊢"
             tests={&["3_3 2_2", "[1_2_3 4_5_6] +10↯3_3⇡9", "[2 4 3] [9 9 9 9 9 1]"]}
@@ -642,7 +662,7 @@ r#"Langs ← {"Uiua" "APL" "J" "BQN" "K" "Q"}
             prompt="boxes two strings and puts them in an array"
             example="\"Hello\" \"World\""
             answer="⊟□:□:"
-            best_answer="{⊙∘}"
+            best_answer="□₂"
             tests={&["\"ui\" \"ua\"", "\"dog\" \"cat\""]}
             hidden="\"a\" \"b\""/>
     }
@@ -652,9 +672,9 @@ r#"Langs ← {"Uiua" "APL" "J" "BQN" "K" "Q"}
 fn TutorialTypes() -> impl IntoView {
     use Primitive::*;
     view! {
-        <Title text="Types - Uiua Docs"/>
+        <Title text=format!("Types - {} Docs", lang())/>
         <h1>"Types"</h1>
-        <p>"Every value in Uiua is an array. However, different arrays on the stack can have different "<em>"types"</em>" of items. Every element of an array is always the same type. Unlike some other array programming languages, Uiua arrays cannot have elements of different types."</p>
+        <p>"Every value in "{lang}" is an array. However, different arrays on the stack can have different "<em>"types"</em>" of items. Every element of an array is always the same type. Unlike some other array programming languages, "{lang}" arrays cannot have elements of different types."</p>
         <p>"There are four types of arrays:"</p>
         <ul>
             <li><strong>"Number"</strong></li>
@@ -664,9 +684,11 @@ fn TutorialTypes() -> impl IntoView {
         </ul>
 
         <Hd id="numbers">"Numbers"</Hd>
-        <p>"Numbers are decimal numbers with floating precision. They use a 64-bit floating-point representation."</p>
+        <p>"Numbers are decimal numbers with floating precision. They use the IEEE-754 double-precision floating-point format."</p>
         <Editor example="[5 6e3 0 3.2 3/4 ¯1.1 π ∞]"/>
         <p>"Most math operations can only be applied to numbers."</p>
+        <p>"In cases where a number with a fractional part has repeating decimals, or when floating-point errors create tiny differences, the number will be shown with repeated decimal digits replaced by a "<code>"…"</code>"."</p>
+        <Editor example="1/3\n1/12\n1/24\n+ 0.1 0.2"/>
         <p>"Even though numbers can have a fractional part, many built-in functions require whole numbers. These functions will return an error if given a non-whole number."</p>
         <p>"One such example is "<Prim prim=Pick/>"."</p>
         <Editor example="⊡ 2 [4 7 9 1 0]"/>
@@ -685,6 +707,12 @@ fn TutorialTypes() -> impl IntoView {
         <p><Prim prim=Sqrt/>" only returns a complex number if it is called on a complex number. Beware of floating-point errors."</p>
         <Editor example="√  ¯4\n√ℂ0¯4"/>
         <p>"See "<Prim prim=Complex/>"'s docs for more details."</p>
+        <p>"Comparing complex numbers for equality returns a normal number."</p>
+        <Editor example="= i ℂ0 1\n= i ℂ1 1"/>
+        <p>"Comparing complex numbers for order returns a component-wise comparison."</p>
+        <Editor example="< i ℂ¯1 1\n≥ i ℂ1 1"/>
+        <p>"In cases where a complex array has no elements with an imaginary part, it will be displayed in output with a "<code>"ℂ"</code>" marker."</p>
+        <Editor example="ℂ0 5\nℂ0 [1 2 3]\nℂ0 [1_2 3_4]"/>
 
         <Hd id="characters">"Characters"</Hd>
         <p>"Characters are represented as 32-bit Unicode codepoints."</p>
@@ -721,7 +749,7 @@ fn TutorialTypes() -> impl IntoView {
                 <p>"You can "<Prim prim=Sub/>" a "{number}" from a "{character}" to get another "{character}"."</p>
                 <p>"You can "<Prim prim=Sub/>" two "{character}"s to get a "{number}"."</p>
                 <p>"You can "<Prim prim=Mul/>" or "<Prim prim=Div/>" a "{character}" by a "{number}" to possibly toggle its case."</p>
-                <p><em>"No"</em>" other binary arithmetic operations can be done on "{character}"s."</p>
+                <p><em>"No"</em>" other dyadic arithmetic operations can be done on "{character}"s."</p>
             }
         }
         <Editor example="+1 @a"/>
@@ -756,7 +784,7 @@ fn TutorialTypes() -> impl IntoView {
 
         <Hd id="empty-arrays">"Empty Arrays"</Hd>
         <p>"The type of an array that is constructed with no elements depends on the syntax used to construct it. Its shape is always "<code>"[0]"</code>"."</p>
-        <p>"We can use the "<Prim prim=Type/>" function to get the type of an array. "<code>"0"</code>" corresponds to real numbers, "<code>"1"</code>" to complex numbers, "<code>"2"</code>" to characters, and "<code>"3"</code>" to boxes."</p>
+        <p>"We can use the "<Prim prim=Type/>" function to get the type of an array. "<code>"0"</code>" corresponds to real numbers, "<code>"1"</code>" to characters, "<code>"2"</code>" to boxes, and "<code>"3"</code>" to complex numbers."</p>
         <Editor example="type []"/>
         <Editor example="type \"\""/>
         <Editor example="type {}"/>
@@ -768,7 +796,7 @@ fn TutorialTypes() -> impl IntoView {
             prompt="increments the first character of a string"
             example="\"`rray\""
             answer="⊂:↘1:+1⊢."
-            best_answer="⍜⊢+:1"
+            best_answer="⍜⊢+₁"
             tests={&["\"Xou're\"", "\"coing\"", "\"freat!\""]}
             hidden="\"abc\""/>
     }
@@ -778,16 +806,19 @@ fn TutorialTypes() -> impl IntoView {
 fn TutorialBindings() -> impl IntoView {
     use Primitive::*;
     view! {
-        <Title text="Bindings - Uiua Docs"/>
+        <Title text=format!("Bindings - {} Docs", lang())/>
         <h1>"Bindings"</h1>
-        <p>"Bindings are global names that can be given to Uiua values. They are denoted with "<code>"←"</code>", which the formatter will convert from "<code>"="</code>" when appropriate."</p>
+        <p>"Bindings are global names that can be given to "{lang}" values. They are denoted with "<code>"←"</code>", which the formatter will convert from "<code>"="</code>" when appropriate."</p>
         <Editor example="a = 3\nb ← 5\n+ a b" help={&["", "Try running to format the ="]}/>
-        <p>"Valid binding names can be made up of any sequence of uppercase or lowercase alphabetic characters OR a single non-alphanumeric character that is not already used for a Uiua function or syntax."</p>
+        <p>"Valid binding names can be made up of any sequence of uppercase or lowercase alphabetic characters OR a single non-alphanumeric character that is not already used for a "{lang}" function or syntax."</p>
         <Editor example="NumOne ← 1\nNumTwo ← 2\n😀 ← \"happy\""/>
         <p><em>"Warning"</em>": It is not guaranteed that any particular non-alphanumeric character will not be used for a built-in function in the future. Use them at your own risk. Emojis are safe though."</p>
-        <p>"Unlike most programming languages, binding names in Uiua "<em>"cannot"</em>" contain numbers or underscores."</p>
+        <p>"Unlike most programming languages, binding names in "{lang}" "<em>"cannot"</em>" contain numbers or underscores."</p>
         <Editor example="Variable_1 ← 5"/> // Should fail
-        <p>"Bindings are case-sensitive."</p>
+        <p>"Bindings "<em>"can"</em>" contain subscript numbers. These will format from "<code>"__"</code>" followed by some digits. Try formatting the example below!"</p>
+        <Editor example="X__1 = 5\nSha__256 = \"TODO\""/>
+        <p>"Subscripts are only allowed at the end of a binding name."</p>
+        <p><strong>"Bindings are case-sensitive."</strong></p>
         <p>"The parser can sometimes mistake all-lowercase binding names for unformatted built-in functions."</p>
         <p>"Here, the parser thinks that "<code>"part"</code>" is "<Prim prim=Partition/>"."</p>
         <Editor example="part = 5" help={&["", "Run to format and reveal why this does not work"]}/>
@@ -799,7 +830,7 @@ fn TutorialBindings() -> impl IntoView {
 
         <Hd id="binding-functions">"Binding Functions"</Hd>
         <p>"If the code on the right side of the "<code>"←"</code>" requires more than 0 values to be on the stack, then instead of evaluating its right side immediately, the right side will be bound as a function."</p>
-        <p>"This is how you make named functions in Uiua."</p>
+        <p>"This is how you make named functions in "{lang}"."</p>
         <Editor example="F ← +1\nF 5"/>
         <Editor example="Cube ← ××..\nCube 6"/>
         <Editor example="👋 ← ⊂\"Hello, \"\n👋 \"World!\""/>
@@ -815,7 +846,7 @@ fn TutorialBindings() -> impl IntoView {
 fn TutorialFunctions() -> impl IntoView {
     use Primitive::*;
     view! {
-        <Title text="Modifiers and Functions - Uiua Docs"/>
+        <Title text=format!("Modifiers and Functions - {} Docs", lang())/>
         <h1>"Modifiers and Functions"</h1>
 
         <Hd id="modifiers">"Modifiers"</Hd>
@@ -836,10 +867,10 @@ fn TutorialFunctions() -> impl IntoView {
         <p>"The main docs page has "<A href="/docs/modifier">"a list"</A>" of all of the built-in modifiers."</p>
 
         <Hd id="inline-functions">"Inline Functions"</Hd>
-        <p>"In addition to creating a new function with a capitalized binding name, as discussed in the "<A href="/tutorial/bindings">"previous section"</A>", functions in Uiua can also be created by surrounding code with "<code>"()"</code>"s."</p>
+        <p>"In addition to creating a new function with a capitalized binding name, as discussed in the "<A href="/tutorial/bindings">"previous section"</A>", functions in "{lang}" can also be created by surrounding code with "<code>"()"</code>"s."</p>
         <p>"This is usually only necessary when you need to call multiple functions within a modifier."</p>
-        <p>"For example, if you wanted to get the last element of each row of an array, you could use "<Prim prim=Rows/>"."</p>
-        <Editor example="≡(⊢⇌) .[2_5_3 0_2_1 0_0_2]"/>
+        <p>"For example, if you wanted to add each row of an array to its reverse, you could use "<Prim prim=Add/><Prim prim=Reverse/><Prim prim=Dup/>"."</p>
+        <Editor example="≡(+⇌.) .[2_5_3 0_2_1 0_0_2]"/>
         <p>"Inline functions may span multiple lines. Unlike multiline stack notation arrays, which run bottom-to-top, multiline inline functions run top-to-bottom as other code does."</p>
         <Editor example="\
 X ← (
@@ -851,16 +882,15 @@ X 5"/>
         <Editor example="\
 F ← (
   ### Run to see values here!
-  +×.
-  ##
+  +×. ##
 )
 F 3 5
 F 2 9
 F 10 11"/>
 
         <Hd id="local-bindings">"A Note on Local Bindings"</Hd>
-        <p>"Bindings in Uiua can "<em>"only"</em>" be global. There is no way to give a name to a value within an inline function. A "<code>"←"</code>" inside "<code>"()"</code>"s is a syntax error."</p>
-        <p>"This is a deliberate design decision. It forces you to write tacit code, a.k.a. code with functions that do not mention their arguments. Uiua is designed to make writing tacit code as workable as possible. "<em>"How"</em>" it does this will be discussed in "<A href="/tutorial/advancedstack">"later"</A>" "<A href="/tutorial/advancedarray">"sections"</A>"."</p>
+        <p>"Bindings in "{lang}" can "<em>"only"</em>" be global. There is no way to give a name to a value within an inline function. A "<code>"←"</code>" inside "<code>"()"</code>"s is a syntax error."</p>
+        <p>"This is a deliberate design decision. It forces you to write tacit code, a.k.a. code with functions that do not mention their arguments. "{lang}" is designed to make writing tacit code as workable as possible. "<em>"How"</em>" it does this will be discussed in "<A href="/tutorial/morestack">"later"</A>" "<A href="/tutorial/advancedarray">"sections"</A>"."</p>
 
         <Hd id="format-strings">"Format Strings"</Hd>
         <p>"Prefixing a string with a "<code>"$"</code>" creates a format string. A format string is a special kind of function. It takes an argument for each "<code>"_"</code>" in the string and replaces it with the stringified version."</p>
@@ -871,11 +901,12 @@ F 10 11"/>
         <p>"If you need to use a literal "<code>"_"</code>", you can escape them with "<code>"\\"</code>"."</p>
         <Editor example="$\"\\__\\_\" 27"/>
         <p>"Raw strings can be made format strings by adding an additional "<code>"$"</code>"."</p>
-        <Editor example="+,, 1 2\n&p $$ What are two numbers that add up to _?\n   $$ _ and _ do!"/>
+        <Editor example="◡+ 1 2\n&p $$ What are two numbers that add up to _?\n   $$ _ and _ do!"/>
         <p><code>"_"</code>"s still need to be escaped in raw format strings."</p>
         <Editor example="1 2 3\n$$ _\\__\\__"/>
         <p>"Because format strings are just functions, you can use them with modifiers like "<Prim prim=Reduce/>". This is a common way to join a list of "<Prim prim=Box/>"ed strings."</p>
         <Editor example="/$\"_ _\" {\"Separated\" \"by\" \"spaces\"}"/>
+        <p>"The "<A href="/tutorial/strings">"Working with Strings"</A>" tutorial has a "<A href="/tutorial/strings#format-string-tricks">"section"</A>" with more format string tricks."</p>
 
         <Hd id="stack-signatures">"Stack Signatures"</Hd>
         <p>"Bindings and inline functions can have a "<em>"stack signature"</em>" declared with a "<code>"|"</code>" followed by 1 or 2 numbers separated by a "<code>"."</code>". The first number is the number of arguments the function pops from the stack. The second number is the number of values the function pushes to the stack."</p>
@@ -883,22 +914,19 @@ F 10 11"/>
         <p>"In bindings, the "<code>"|"</code>" comes after the "<code>"←"</code>". In inline functions, it comes after the "<code>"("</code>"."</p>
         <Editor example="TimesThree ← |1.1 ×3\nTimesThree 7"/>
         <Editor example="TimesThree ← |1   ×3\nTimesThree 7"/>
-        <Editor example="∵(|2.1 ⊟.×) 1_2_3 4_5_6"/>
+        <Editor example="≡(|2.1 ⊟.×) 1_2_3 4_5_6"/>
         <p>"Stack signatures are useful for documenting functions to make sure that they are used correctly."</p>
         <p>"A signature declaration is "<em>"required"</em>" if the function's signature cannot be inferred. The compiler can usually infer a function's signature unless you are doing something weird that it cannot reason about."</p>
-        <p>"In addition, an error is thrown if a function's signature can be inferred and the inferred signature does not match the declared signature. This can help validate that a function is correct."</p>
-        <Editor example="≡(|2 ↻.) 1_2_3 ↯3_3⇡9"/> // Should fail
+        <p>"A declared signature always overrides the inferred signature. However, if they do not match, a warning will be emitted."</p>
+        <Editor example="F ← |3.2 ⊟+1\nF 1 4"/> // Should fail
+        <p>"In that example, the net stack change of the declared signature of "<code>"|3.2"</code>" is actually the same of that of the inferred signature of "<code>"|2.1"</code>". Either way, the function will cause the stack to have one less value."</p>
+        <p>"If this is "<em>"not"</em>" the case, the declared signature will be "<em>"made"</em>" to be correct by, after the function has run, either popping extra arguments or pushing extra outputs below on the stack."</p>
+        <p>"For example, even though this function has signature "<code>"|2.1"</code>", the declared signature of "<code>"|2.2"</code>" causes an extra debug output to be pushed. This debug output is a boxed string. This is done to ensure that the function does in fact have 2 outputs."</p>
+        <Editor example="F ← |2.2 ⊟+1\nF 1 4 5"/> // Should fail
+        <p>"Conversely, if the function needs to have more "<em>"arguments"</em>", such as here where we declare it to have signature "<code>"|4.2"</code>", some extra arguments will be popped from the stack. In this case, it is the "<code>"6"</code>" that is popped. We can see that this does in fact make the function turn 4 values on the stack into 2."</p>
+        <Editor example="F ← |4.2 ⊟+1\nF 1 4 5 6"/> // Should fail
+        <p><strong>"The point of allowing this is that functions which are only partially written can still be run and debugged. But finished code should never have warnings!"</strong></p>
         <p>"If the compiler cannot derive the stack signature of a function and you give it one which is "<em>"wrong"</em>", the function will throw an error at runtime."</p>
-
-        <Hd id="proxy">"Proxy Values"</Hd>
-        <p>"Because Uiua is a dynamically typed language, the types and shapes of values returned by functions are not known until runtime. This creates a problem when iterating over arrays. What if the array is empty? The function will never be run, so the proper type and shape of the result cannot be determined. Uiua has a way to get around this "<a href="https://mlochbaum.github.io/BQN/commentary/problems.html#empty-arrays-lose-type-information">"problem"</a>" that some other array languages have."</p>
-        <p>"Some iterating modifiers use what are called "<em>"proxy values"</em>" if the iterated array is empty. The modifier's function is called on these values if the array is empty. This ensures that the result has the correct shape and type, even if the function is never run on the actual values."</p>
-        <p>"The following example would produce inconsistent results if the proxy value was not used."</p>
-        <Editor example="△≡⇌↯3_4⇡12\n△≡⇌↯0_4⇡12 # Would be [0] without proxy"/>
-        <p>"There are some ways to make the proxy value visible."</p>
-        <Editor example="≡(&p.) []"/>
-        <p>"To avoid this case, you can conditionally iterate. This example uses a "<Prim prim=Repeat/>" modifier to conditionally call the function."</p>
-        <Editor example="⍥≡(&p.)±⧻. []"/>
 
         <Hd id="challenges">"Challenges"</Hd>
 
@@ -929,12 +957,12 @@ F 10 11"/>
 }
 
 #[component]
-fn TutorialAdvancedStack() -> impl IntoView {
+fn TutorialMoreStack() -> impl IntoView {
     use Primitive::*;
     view! {
-        <Title text="Advanced Stack Manipulation - Uiua Docs"/>
-        <h1>"Advanced Stack Manipulation"</h1>
-        <p>"Uiua does not have local variables. With only "<Prim prim=Dup/>", "<Prim prim=Flip/>", and "<Prim prim=Over/>", how do you work with more than 2 values at a time?"</p>
+        <Title text=format!("More Stack Manipulation - {} Docs", lang())/>
+        <h1>"More Stack Manipulation"</h1>
+        <p>{lang}" does not have local variables. With only "<Prim prim=Dup/>" and "<Prim prim=Flip/>", how do you work with more than 2 values at a time?"</p>
 
         <Hd id="fork"><Prim prim=Fork/></Hd>
         <p><Prim prim=Fork/>" is a dyadic modifier that takes 2 functions and calls them both on the same set of arguments. The number of arguments used is the maximum of the two functions."</p>
@@ -961,13 +989,13 @@ fn TutorialAdvancedStack() -> impl IntoView {
         <Editor example="[⊓⊓⊓+¯×. 1 2 3 4 5 6]"/>
 
         <Hd id="function-packs">"Function Packs"</Hd>
-        <p>"All dyadic modifiers allow a special notation with a single set of "<code>"()"</code>"s with a "<code>"|"</code>" in the middle separating the functions. This is called a "<em>"function pack"</em>". It shares syntax with "<A href="/tutorial/controlflow#switch">"switch functions"</A>", which will be discussed in a "<A href="/tutorial/controlflow">"later section"</A>"."</p>
+        <p>"All dyadic modifiers allow a special notation with a single set of "<code>"()"</code>"s with a "<code>"|"</code>" in the middle separating the functions. This is called a "<em>"function pack"</em>"."</p>
         <Editor example="⊓(+|×) 1 2 3 4"/>
         <p>"While all dyadic modifiers can use function packs, "<Prim prim=Fork/>" and "<Prim prim=Bracket/>" allow more than 2 functions to be used. This can sometimes be shorter and/or more readable than chaining the modifier."</p>
         <Editor example="[⊃(+|-|×|÷) 5 8]"/>
         <Editor example="[⊓(+1|×|÷2) 5 10 12 22]"/>
 
-        <Hd id="dip-gap"><Prim prim=Dip/>" and "<Prim prim=Gap/></Hd>
+        <Hd id="dip"><Prim prim=Dip/></Hd>
         <p>"The "<Prim prim=Dip/>" modifier temporarily pops the top value on the stack, calls its function, then pushes the value back."</p>
         <Editor example="[⊙+ 1 2 3]"/>
         <p><Prim prim=Dip/>" can be chained to dig deeper into the stack, though try not to dig "<em>"too"</em>" deep, as it makes code harder to read."</p>
@@ -975,11 +1003,23 @@ fn TutorialAdvancedStack() -> impl IntoView {
         <p>"One use of "<Prim prim=Dip/>" is to collect values from the stack into an array. Here, a chain of "<Prim prim=Dip/>"s are terminated with "<Prim prim=Identity/>"."</p>
         <Editor example="[⊙⊙⊙∘] 1 2 3 4 5"/>
         <Editor example="{⊙⊙∘} 1 2_3 \"wow\""/>
+        <p>"However, you do not typically need to do this because of..."</p>
+
+        <Hd id="Subscripts">"Subscripts"</Hd>
+        <p>"Subscripts are a special syntax that allows you to augment some functions and modifiers with a number."</p>
+        <p>"Subscripts are typed with "<code>"__"</code>" followed by some digits. The formatter will turn them into subscript digit characters. A leading negative sign is allowed."</p>
+        <p>"Several functions and modifiers are supported, but we'll only cover some stack-related ones here. You can find a full list of subscript-compatible functions "<A href="/docs/subscripts">"here"</A>"."</p>
+        <p>"Subscripted "<Prim prim=Both/>" calls its function on N sets of arguments."</p>
+        <Editor example="[∩+ 1 2 3 4]\n[∩__3+ 1 2 3 4 5 6]\n[∩__4+ 1 2 3 4 5 6 7 8] # Try formatting!"/>
+        <p>"Subscripted "<Prim prim=Couple/>" collects N values from the stack into an array."</p>
+        <Editor example="⊟₄ 1 2 3 4 5"/>
+        <p><Prim prim=Box/>" has similar behavior, but it boxes each value."</p>
+        <Editor example="□₃ 5 \"Hi!\" [1 2 3]"/>
+
+        <Hd id="planet-notation">"🌍 Planet Notation 🪐"</Hd>
         <p><Prim prim=Gap/>" "<em>"discards"</em>" the top value on the stack and calls its function."</p>
         <Editor example="⋅+ 1 2 3"/>
         <p>"But wait, "<Prim prim=Pop/>" exists! Why would you need this?"</p>
-
-        <Hd id="planet-notation">"🌍 Planet Notation 🪐"</Hd>
         <p>"The main reason for "<Prim prim=Dip/>" and "<Prim prim=Gap/>" to exist is to be chained with "<Prim prim=Identity/>", often inside of "<Prim prim=Fork/>". They act as a sort of boolean selector to choose which arguments to keep and which to discard in a branch."</p>
         <p>"This is called "<em>"planet notation"</em>" because it looks like the planets in a solar system chart."</p>
         <p>"For example, let's say you want to "<Prim prim=Mul/>" the 2nd and 4th arguments on the stack and discard the rest:"</p>
@@ -1009,20 +1049,26 @@ fn TutorialAdvancedStack() -> impl IntoView {
         <p>"Try it out!"</p>
         <Editor example="+gdggi 1 2 3 4 5"/>
         <Editor example="+dggdp 1 2 3 4 5"/>
-        <p>"In general, planet notation as complex as the mathematical function example above should only be used when it is necessary. For examples like that with 4+ values, it is. However, when working with fewer values, you can get very far with just "<Prim prim=Dup/>" and "<Prim prim=Flip/>". Maybe sprinkle some "<Prim prim=Over/>"s and "<Prim prim=Dip/>"s in there too."</p>
 
-        <Hd id="on"><Prim prim=On/></Hd>
-        <p>"As you write more Uiua code, you'll find that there is a pattern you'll encounter over and over again. It involves calling a function, then calling another function that re-uses an argument to the first function."</p>
+        <Hd id="on-and-by"><Prim prim=On/>" and "<Prim prim=By/></Hd>
+        <p>"As you write more "{lang}" code, you'll find that there is a kind of pattern you'll encounter over and over again. It involves calling a function, then calling another function that re-uses an argument to the first function."</p>
         <p>"One simple example is getting "<code>"n"</code>" numbers between "<code>"0"</code>" and "<code>"1"</code>". One way you may think to solve this is with "<Prim prim=Dup/>" and "<Prim prim=Flip/>"."</p>
         <Editor example="÷:⇡. 5"/> // Should fail
         <p>"This solution works, but as the style diagnostic suggests, it is not quite idiomatic."</p>
-        <p>"When the first function you call is dyadic, it can get a little trickier. For example, if you wanted to get all the integers between two numbers, you may try either of the following:"</p>
-        <Editor example="+⇡-,: 3 8\n+⊃∘(⇡-) 3 8"/> // Should fail
-        <p>"Again, as the style diagnostics tell you, there is a better way."</p>
+        <p>"When the first function you call is dyadic, it can get a little trickier. For example, if you wanted to get all the integers between two numbers, you may try the following:"</p>
+        <Editor example="+⊃∘(⇡-) 3 8"/> // Should fail
+        <p>"Again, as the style diagnostic tells you, there is a better way."</p>
         <p>"The "<Prim prim=On/>" modifier calls a function but keeps its first argument on top of the stack. This can be used in both of the above examples."</p>
         <Editor example="÷⟜⇡ 5"/>
         <Editor example="+⟜(⇡-) 3 8"/>
         <p>"Having a single glyph for something that can be written as simply "<Prims prims=[Fork, Identity]/>" may seem unnecessary, but you'll find that because the pattern is so common, it makes code easier to both read and write."</p>
+        <p>"The "<Prim prim=By/>" modifier is similar. Instead of keeping the first argument on top of the stack, it keeps the last argument below the function's outputs."</p>
+        <p>"You can read more about these modifiers in the "<A href="/tutorial/evenmorestack">"Even More Stack Manipulation"</A>" tutorial."</p>
+        <Editor example="÷⊸⧻ [1 2 3 4]"/>
+        <Editor example="▽⊸> 5 [1 8 4 9 2 8 4]"/>
+
+        <Hd id="even-more">"Even More Stack Manipulation"</Hd>
+        <p>"But wait, there's more! For even more stack manipulation techniques, see the "<A href="/tutorial/evenmorestack">"Even More Stack Manipulation"</A>" tutorial."</p>
 
         <Hd id="challenges">"Challenges"</Hd>
 
@@ -1031,6 +1077,7 @@ fn TutorialAdvancedStack() -> impl IntoView {
             prompt="moves the 4th value on the stack to the top"
             example="1 2 3 4"
             answer="⊃⋅⋅⋅∘⊙⊙∘"
+            best_answer="⤙⊙⊙⊙◌"
             tests={&["@x [1 2 3] □5 27"]}
             hidden="3 3 3 4"/>
 
@@ -1052,6 +1099,14 @@ fn TutorialAdvancedStack() -> impl IntoView {
 
         <Challenge
             number=4
+            prompt="collects 9 values from the stack evenly into 3 arrays"
+            example="1 2 3 4 5 6 7 8 9"
+            answer="∩₃⊟₃"
+            tests={&["@G @o @o @d @  @j @o @b @!", "...×2..+1...5"]}
+            hidden="1 2 3 4 5 6 7 8 9"/>
+
+        <Challenge
+            number=5
             prompt="for numbers A, B, C, and D calculates (A+C)×(B+D)"
             example="1 2 3 4"
             answer="×⊃(+⊙⋅∘|+⋅⊙⋅∘)"
@@ -1063,78 +1118,10 @@ fn TutorialAdvancedStack() -> impl IntoView {
 
 #[component]
 fn TutorialInverses() -> impl IntoView {
-    use Primitive::*;
     view! {
-        <Title text="Inverses - Uiua Docs"/>
-        <h1>"Inverses"</h1>
-        <p>"Uiua has two modifiers, "<Prim prim=Un/>" and "<Prim prim=Under/>", which work with "<em>"inverses"</em>". The inverse of a function is a function that conceptually \"undoes\" it."</p>
-        <p>"Working with inverses is a fundamental part of writing Uiua code. It is an elegant mechanism that captures many different patterns."</p>
+        <Title text=format!("Inverses - {} Docs", lang())/>
 
-        <Hd id="un"><Prim prim=Un/></Hd>
-        <p>"The "<Prim prim=Un/>" modifier inverts the behavior of a function."</p>
-        <Editor example="°(+1) 5"/>
-        <Editor example="°⊟ [1 2]"/>
-        <Editor example="°∿ 1"/>
-        <p>"As discussed "<A href="/tutorial/arrays#array-model">"previously"</A>", "<Prim prim=Un/><Prim prim=Box/>" removes an array from a box."</p>
-        <Editor example=r#"°□ ⊢{"unbox" "me!"}"#/>
-        <p>"One interesting use of "<Prim prim=Un/>" is to put an array's rows onto the stack by "<Prim prim=Un/>"ing stack array notation with "<Prim prim=Dip/>" and "<Prim prim=Identity/>". The number of rows in the array must match though!"</p>
-        <Editor example="[⊙⊙∘] 1 2 3"/>
-        <Editor example="°[⊙⊙∘] [1 2 3]"/>
-        <Editor example="°[⊙⊙⊙∘] [1 2 3]"/> // Should fail
-        <p><Prim prim=Un/>"ing box array notation will unbox the items."</p>
-        <Editor example="°[⊙⊙∘] {1 2_3 \"hmmm\"}"/>
-        <Editor example="°{⊙⊙∘} {1 2_3 \"hmmm\"}"/>
-        <p>"You can find more uses of "<Prim prim=Un/>" in it's documentation, including a list of all "<Prim prim=Un/>"-compatible functions and modifiers."</p>
-
-        <Hd id="under"><Prim prim=Under/></Hd>
-        <p><Prim prim=Under/>" expresses a more powerful inversion pattern. It captures the pattern of doing some transformation, modifying the data, then undoing the transformation."</p>
-        <p>"This may not seem imediately useful, but you'll find it is a pattern you encounter everwhere, even in your everday life. You might open a drawer, take something out, then close the drawer. You might get on a bus, the bus travels, then you get off the bus."</p>
-        <p><Prim prim=Under/>" takes two functions which we will call "<code>"F"</code>" and "<code>"G"</code>". It calls "<code>"F"</code>", then calls "<code>"G"</code>", then calls an inverse of "<code>"F"</code>"."</p>
-        <p>"Many functions that do not work with "<Prim prim=Un/>" work with "<Prim prim=Under/>" because "<Prim prim=Under/>" can keep track of "<em>"context"</em>". One example of this in action is "<Prim prim=Under/><Prim prim=Pick/>", which allows us to modify an element or row of an array."</p>
-        <Editor example="⍜(⊡2|×10) [1 2 3 4]"/>
-        <p>"This code picks out item "<code>"2"</code>" of the array, multiplies it by "<code>"10"</code>", then puts it back in the array."</p>
-        <p>"If the values passed to "<Prim prim=Under/>"'s functions are not constants, they can also be put outside, albeit in a different order."</p>
-        <Editor example="⍜⊡× 2 [1 2 3 4] 10"/>
-        <p>"This works because "<Prim prim=Under/>" keeps track of the original array and passes it to the inversion of "<Prim prim=Pick/>"."</p>
-        <p>"If you wanted to set a value in an array rather than modifying it, you could use "<Prim prim=Pop/>" or "<Prim prim=Gap/>" instead of "<Prim prim=Mul/>"."</p>
-        <Editor example="⍜(⊡2)⋅∞ [1 2 3 4]\n⍜⊡◌ 2 [1 2 3 4] ∞"/>
-        <p>"It's not just "<Prim prim=Pick/>"! Many functions work with "<Prim prim=Under/>"!"</p>
-        <Editor example="⍜(↙2)/× [3 5 4 2]"/>
-        <Editor example="⍜(↻3|⊂0) [1 2 3 4 5]"/>
-        <Editor example="⍜×⁅ 1e3 π"/>
-        <Editor example=".↯3_4⇡12\n⍜♭⇌"/>
-        <p>"You can even use "<Prim prim=Under/>" on a function that has already been "<Prim prim=Un/>"ed. This is a nice way to work with "<Prim prim=Box/>"ed data."</p>
-        <Editor example=r#"≡⍜°□(⊂:@!) {"wow" "cool" "omg"}"#/>
-        <br/>
-        <p>"Let's say you wanted to utilize a struct-like pattern. Uiua does not have structs or objects with fields like many other languages do, but you can simulate them with box arrays. This can be slow, so you should not do this with any data that needs to accessed in tight loops."</p>
-        <p><Prim prim=Under/>" allows a field getter to also be a setter!"</p>
-        <Editor example=r#"Person ← {⊙⊙∘}
-Name ← °□⊡0
-Surname ← °□⊡1
-Age ← °□⊡2
-
-FmtPerson ← $"_ is _ years old" ⊃(Name|Age)
-PassYear ← ⍜Age(+1)
-
-Dan ← Person "Dan" "Danson" 31
-FmtPerson Dan
-FmtPerson PassYear Dan"#/>
-        <p>"You can find more uses of "<Prim prim=Under/>" in it's documentation, including a list of all "<Prim prim=Under/>"-compatible functions and modifiers."</p>
-
-        <Hd id="setting-inverse">"Setting Inverses"</Hd>
-        <p>"Many functions, especially more complex ones, do not have well-defined inverses. However, you can use the "<Prim prim=SetInverse/>" and "<Prim prim=SetUnder/>" modifiers to define them yourself."</p>
-        <p><Prim prim=SetInverse/>" sets a simple inverse that is compatible with "<Prim prim=Un/>"."</p>
-        <p>"For example, "<Prim prim=First/>" does not have an "<Prim prim=Un/>"-compatible inverse, but we can define one."</p>
-        <Editor example="MyFirst ← setinv(⊢|[∘])\nMyFirst [1 2 3]\n°MyFirst 5"/>
-        <p>"This inverse is also compatible with "<Prim prim=Under/>"."</p>
-        <Editor example="MyFirst ← setinv⊢[∘]\n⍜⊢(×10) [2 3 4]\n⍜MyFirst(×10) [2 3 4]"/>
-        <p><Prim prim=SetUnder/>" is more complicated. See its documentation for how to use it."</p>
-        <p><Prim prim=SetInverse/>" and "<Prim prim=SetUnder/>" can be nested so that an inverse can be fully defined in all cases."</p>
-        <p>"This example shows how the different inverses get called."</p>
-        <Editor example=r#"F ← setund(setinv("normal"|"inverse")|"do"|"undo")
-F
-°F
-{⍜F"G"}"#/>
+        <Markdown src="/text/inverses.md"/>
 
         <Hd id="challenges">"Challenges"</Hd>
 
@@ -1169,9 +1156,9 @@ F
 fn TutorialControlFlow() -> impl IntoView {
     use Primitive::*;
     view! {
-        <Title text="Control Flow - Uiua Docs"/>
+        <Title text=format!("Control Flow - {} Docs", lang())/>
         <h1>"Control Flow"</h1>
-        <p>"Uiua, and array languages in general, require much less control flow than other programming languages. Most operations that would be loops in other languages are simply operations on arrays. Because boolean operations return numbers, a lot of checks that would be done with "<code>"if"</code>" statements in other languages become mathematical or indexing operations in array languages."</p>
+        <p>{lang}", and array languages in general, require much less control flow than other programming languages. Most operations that would be loops in other languages are simply operations on arrays. Because boolean operations return numbers, a lot of checks that would be done with "<code>"if"</code>" statements in other languages become mathematical or indexing operations in array languages."</p>
         <p>"For example, if you wanted to split an array of numbers into an array of odds and an array of evens, you might do it like this in a language like Python:"</p>
         <code class="code-block">"\
 def splitArray(array):
@@ -1185,25 +1172,26 @@ def splitArray(array):
     return even, odd
 
 splitArray([1, 2, 3, 7, 2, 4, 5])"</code>
-        <p>"In Uiua, it is much simpler, and there are no "<code>"if"</code>"s or "<code>"for"</code>"s to be found:"</p>
-        <Editor example="F ← ∩▽¬,,=0◿2.\nF [1 2 3 7 2 4 5]"/>
-        <p>"That being said, not every problem lends itself to array operations. Uiua has a few methods for handling such cases."</p>
+        <p>"In "{lang}", it is much simpler, and there are no "<code>"if"</code>"s or "<code>"for"</code>"s to be found:"</p>
+        <Editor example="F ← ∩▽¬◡⊙∘⊸◿2\nF [1 2 3 7 2 4 5]"/>
+        <p>"That being said, not every problem lends itself to array operations. "{lang}" has a few methods for handling such cases."</p>
 
         <Hd id="repeat-do">"Looping with "<Prim prim=Repeat/>" and "<Prim prim=Do/></Hd>
         <p>"The "<Prim prim=Repeat/>" modifier takes a function and a number and calls the function that many times."</p>
         <p>"Here, we "<Prim prim=Mul/>" a number by "<code>"2"</code>", "<code>"10"</code>" times."</p>
         <Editor example="⍥(×2)10 5"/>
         <Editor example="⍥/+2 ↯3_3⇡9"/>
-        <p><Prim prim=Repeat/><Prim prim=Rand/>" inside "<code>"[]"</code>"s is a common pattern for generating a list of random numbers."</p>
-        <Editor example="⁅[⍥⚂]5"/>
-        <p><Prim prim=Repeat/>" is also useful for conditionally calling a function. Because booleans in Uiua are just numbers, "<Prim prim=Repeat/>"ing with a boolean value will call a function "<code>"0"</code>" or "<code>"1"</code>" times."</p>
+        <p>"If the function has more outputs than arguments, the extra outputs are collected into arrays."</p>
+        <p><Prim prim=Repeat/><Prim prim=Rand/>" is a common pattern for generating a list of random numbers."</p>
+        <Editor example="⁅⍥⚂5"/>
+        <p><Prim prim=Repeat/>" is also useful for conditionally calling a function. Because booleans in "{lang}" are just numbers, "<Prim prim=Repeat/>"ing with a boolean value will call a function "<code>"0"</code>" or "<code>"1"</code>" times."</p>
         <Editor example="F ← ⍥(×10)<10.\nF 5\nF 12"/>
         <p><Prim prim=Repeat/>"'s glyph is a combination of a circle, representing a loop, and the 𝄇 symbol from musical notation."</p>
         <p>"The "<Prim prim=Do/>" modifier takes a loop function and a condition function. It repeatedly calls the loop function as long as the condition function returns "<code>"1"</code>"."</p>
         <Editor example="⍢(×2|<1000) 1"/>
         <Editor example="◌⍢(⊃(×2)⊂|<100) 1 []"/>
         <p>"While "<Prim prim=Do/>" is very powerful, it should only be used when necessary."</p>
-        <p><Prim prim=Do/>" is the only way to do an infinite loop in Uiua. To do so, simply use "<code>"1"</code>" as the condition function."</p>
+        <p><Prim prim=Do/>" is the only way to do an infinite loop in "{lang}". To do so, simply use "<code>"1"</code>" as the condition function."</p>
 
         <Hd id="try">"Catching errors with "<Prim prim=Try/></Hd>
         <p>"The "<Prim prim=Try/>" modifier takes two functions. If the first function throws an error, the second function is called to handle it."</p>
@@ -1218,42 +1206,42 @@ splitArray([1, 2, 3, 7, 2, 4, 5])"</code>
         <Editor example="⍣⋕{⊙∘} \"5\"\n⍣⋕{⊙∘} \"dog\""/>
         <p>"You can read about more uses of "<Prim prim=Try/>" in its documentation."</p>
 
-        <Hd id="switch">"Switch Functions"</Hd>
-        <p>"A "<A href="/tutorial/advancedstack#function-packs">"function pack"</A>" that is used outside a modifier becomes a "<em>"switch function"</em>". Switch functions take an array of natural numbers called the "<em>"selector"</em>" and call the function at the corresponding index in the pack."</p>
-        <Editor example="(3|5) 0\n(3|5) 1"/>
+        <Hd id="switch"><Prim prim=Switch/></Hd>
+        <p>"The "<Prim prim=Switch/>" modifier uses a selector to choose one of its functions to call."</p>
+        <Editor example="⨬(3)(5) 0\n⨬(3)(5) 1"/>
         <p>"The selector goes above the arguments on the stack."</p>
-        <Editor example="(+|-) 0 3 5\n(+|-) 1 3 5"/>
-        <p>"Switch functions are formatted to use "<code>"⟨⟩"</code>"s instead of "<code>"()"</code>"s. This is so they are easier to identify and also so that they can be disambiguated from function packs in modifier arguments."</p>
-        <p>"Try running the examples above to format."</p>
-        <p>"Non-scalar selectors are allowed. They allow the switch function to be evaluated for each row of the input arrays."</p>
-        <Editor example="⟨+|-⟩ [1 0 1] [1 2 3] [4 5 6]"/>
-        <p>"Switch functions can have as many branches as you want, and they can also be nested."</p>
-        <Editor example="⟨+|-|×|÷⟩ [1 2 0 3] [...2] [...5]"/>
-        <Editor example="≡(⟨×10|+1|⟨¯|∘⟩=2.⟩ ◿3.) [2 9 4 0 8 3]"/>
-        <p>"With "<Prim prim=IndexOf/>", switch functions can be used to implement behavior similar to "<code>"switch"</code>" statements in other languages."</p>
-        <Editor example="F ← (\n  ⊗□:{\"foo\" \"bar\" \"baz\"}\n  ⟨+1|×10|÷2|¯⟩\n)\nF \"foo\" 5\nF \"bar\" 5\nF \"baz\" 5\nF \"wow\" 5"/>
-        <p>"Each branch can have a signature specified. For the overall switch function to have a valid signature, all branches must either change the height of the stack by the same amount "<em>"or"</em>" return the same number of outputs."</p>
-        <Editor example="F ← ⟨|2 ×||3.2 ⊃(++)×⟩\n[F 0 2 3 4]\n[F 1 2 3 4]"/>
-        <p>"Signatures in switch functions are a bit messy, so try to avoid them when possible."</p>
+        <p>"Here, we "<Prim prim=Add/>" if the selector is "<code>"0"</code>" and "<Prim prim=Sub/>" if the selector is "<code>"1"</code>"."</p>
+        <Editor example="⨬+- 0 3 5\n⨬+- 1 3 5"/>
+        <p>"Non-scalar selectors are allowed. They allow a different function to be evaluated for each row of the input array(s)."</p>
+        <Editor example="⨬+- [1 0 1] [1 2 3] [4 5 6]"/>
+        <p><Prim prim=Switch/>" can use a "<A href="/tutorial/morestack#function-packs">"function pack"</A>" to select from more functions."</p>
+        <Editor example="⨬(+|-|×|÷) [1 2 0 3] [...2] [...5]"/>
+        <Editor example="⨬(×10|+1|⨬¯∘ =2.) ◿3. [2 9 4 0 8 3]"/>
+        <p>"With "<Prim prim=IndexOf/>", "<Prim prim=Switch/>" can be used to implement behavior similar to "<code>"switch"</code>" statements in other languages."</p>
+        <Editor example="F ← (\n  ⊗□:{\"foo\" \"bar\" \"baz\"}\n  ⨬(+1|×10|÷2|¯)\n)\nF \"foo\" 5\nF \"bar\" 5\nF \"baz\" 5\nF \"wow\" 5"/>
+        <p>"Each branch can have a signature specified. For the overall "<Prim prim=Switch/>" to have a valid signature, all branches must either change the height of the stack by the same amount "<em>"or"</em>" return the same number of outputs."</p>
+        <Editor example="F ← ⨬(|2 ×||3.2 ⊃(++)×)\n[F 0 2 3 4]\n[F 1 2 3 4]"/>
+        <p>"Signatures in "<Prim prim=Switch/>" functions are a bit messy, so try to avoid them when possible."</p>
         <p>"Because a second "<code>"|"</code>" immediately after another indicates a signature, branches that do nothing must contain "<Prim prim=Identity/>"."</p>
-        <Editor example="F ← ⟨+5|∘|÷10⟩+∩>5,10.\n[F2 F6 F200]\nF[2 6 200]"/>
-        <p>"To use a switch function as a modifier argument, you must double-nest the "<code>"()"</code>"s. These will get formatted to a single set of "<code>"⟨⟩"</code>"s."</p>
-        <Editor example="[dip((*|+)) 0 1 2 3]"/>
+        <Editor example="F ← ⨬(+5|∘|÷10)+∩>5:10..\n[F2 F6 F200]\nF[2 6 200]"/>
 
         <Hd id="recursion">"Recursion"</Hd>
         <p>"A bound function that refers to its own name is a "<a href="https://en.wikipedia.org/wiki/Recursion_(computer_science)">"recursive function"</a>". A function that calls itself can easily recurse infinitely, so it is important to have a "<em>"base case"</em>" that stops the recursion when a condition is met. Switch functions are great for this."</p>
-        <p>"As a simple example, here is a function that calculates the factorial of a number. Note that you should not actually do this, as "<Prims prims=[Reduce, Mul, Add]/><code>"1"</code>" is shorter, faster, and more idiomatic."</p>
-        <Editor example="Fact ← |1 ⟨×Fact-1.|1⟩<2.\nFact 5"/>
+        <p>"As a simple example, here is a function that calculates the factorial of a number. Note that you should not actually do this, as "<Prims prims=[Reduce, Mul, Add]/><code>"1"</code><Prims prims=[Range]/>" is shorter, faster, and more idiomatic."</p>
+        <Editor example="Fact ← |1 ⨬(×Fact-1.|1)<2.\nFact 5"/>
         <p>"The base case is when the input is "<code>"1"</code>". In this case, the function returns "<code>"1"</code>". Otherwise, it multiplies the input by the result of calling itself with the input decremented by "<code>"1"</code>"."</p>
         <p>"Recursive functions are required to have signatures declared."</p>
-        <p>"Recursion is only recommended if a particular problem "<em>"really"</em>" calls for it. Recursion in Uiua can be slow, and there is a limit to how deep you can recur."</p>
+        <p>"Recursion is only recommended if a particular problem "<em>"really"</em>" calls for it. Recursion in "{lang}" can be slow, and there is a limit to how deep you can recur."</p>
         <p>"It is usually better to use either array-based methods or iteration with "<Prim prim=Repeat/>" or "<Prim prim=Do/>"."</p>
 
         <Hd id="assert"><Prim prim=Assert/></Hd>
         <p>"The "<Prim prim=Assert/>" function takes any value and a condition. If the condition is anything but "<code>"1"</code>", the value is thrown as an error that can be caught with "<Prim prim=Try/>"."</p>
-        <Editor example="F ← ⍣(¯⍤10≤10.)∘\nF 5\nF 12"/>
+        <Editor example="F ← ⍣(¯⍤10≤10.)⋅∘\nF 5\nF 12"/>
         <p>"If the "<Prim prim=Assert/>"ed value is never caught, it becomes an error."</p>
-        <Editor example="F ← ¯⍤\"too big!\"≤10.\nF 5\nF 12"/> // Should fail
+        <Editor example="F ← ¯⍤\"Too big!\"≤10.\nF 5\nF 12"/> // Should fail
+        <p>"The error message above may not be useful to the user, as it refers to the code of the function itself. You can use the "<code>"# Track caller!"</code>" semantic comment to refer to the call site instead."</p>
+        <Editor example="F ← ¯⍤\"Too big!\"≤10. # Track caller!\nF 5\nF 12"/> // Should fail
+        <p>"You can read more about "<code>"# Track caller!"</code>" "<A href="/tutorial/documentation#track-caller">"here"</A>"."</p>
         <p>"Using "<Prim prim=Assert/>" for this purpose will be covered more in the "<A href="/tutorial/testing">"section on testing"</A>"."</p>
 
         <Hd id="challenges">"Challenges"</Hd>
@@ -1262,7 +1250,7 @@ splitArray([1, 2, 3, 7, 2, 4, 5])"</code>
             number=1
             prompt="pushes \"small\" if a number is less than 10, \"medium\" if it is less than 100, and \"large\" otherwise"
             example="17"
-            answer=r#"⟨"small"|"medium"|"large"⟩/+≥[10 100]"#
+            answer=r#"⨬("small"|"medium"|"large")/+≥[10 100]"#
             tests={&["3", "50", "2357"]}
             hidden="10"/>
 
@@ -1280,9 +1268,9 @@ splitArray([1, 2, 3, 7, 2, 4, 5])"</code>
 fn TutorialPatternMatching() -> impl IntoView {
     use Primitive::*;
     view! {
-        <Title text="Pattern Matching - Uiua Docs"/>
+        <Title text=format!("Pattern Matching - {} Docs", lang())/>
         <h1>"Pattern Matching"</h1>
-        <p>"Uiua has a powerful mechanism for matching patterns in arrays to conditionally extract data."</p>
+        <p>{lang}" has a powerful mechanism for matching patterns in arrays to conditionally extract data."</p>
 
         <Hd id="un-patterns"><Prim prim=Un/>" Patterns"</Hd>
         <p><Prim prim=Un/>" can be applied to a constant value to form a function that throws an error if the top value on the stack does not match the constant."</p>
@@ -1301,11 +1289,11 @@ fn TutorialPatternMatching() -> impl IntoView {
         <Editor example="°(⊂1) [1 2 3]"/>
         <Editor example="°(⊂1) [4 5 6]"/> // Should fail
         <Editor example="°(⊂1_2) [1 2 3]"/>
-        <p>"To match a suffix, you can use "<Prim prim=Under/><Prim prim=Reverse/>"."</p>
-        <Editor example="⍜⇌°(⊂3) [1 2 3]"/>
+        <p>"To match a suffix, you can use "<Prim prim=Flip/>"."</p>
+        <Editor example="°(⊂:3) [1 2 3]"/>
 
         <Hd id="with-try">"Matching multiple patterns with "<Prim prim=Try/></Hd>
-        <p>"Single patterns are of limited usefulness on their own. Because they throw errors when matching fails, you can attempt to match additional errors using "<Prim prim=Try/>"."</p>
+        <p>"Single patterns are of limited usefulness on their own. Because they throw errors when matching fails, you can attempt to match additional patterns using "<Prim prim=Try/>"."</p>
         <p><Prim prim=Try/>" accepts arbitrarily long function packs, so you can match as many patterns as you want in a simple way."</p>
         <p>"In this example, we run different code depending on which pattern matches."</p>
         <Editor example="F ← ⍣(×10°[1⊙3]|°(⊂5)|⇌)\nF [5 6 7]\nF [1 2 3]\nF \"abc\""/>
@@ -1313,11 +1301,26 @@ fn TutorialPatternMatching() -> impl IntoView {
         <Editor example="F ← ⍣(\n  ×10 °[1⊙3]\n| °(⊂5)\n| ⇌\n)"/>
 
         <Hd id="format-string-patterns">"Format String Patterns"</Hd>
-        <p><Prim prim=Un/>" works with format strings to extract substrings where the "<code>"_"</code>"s are. While the "<Prim prim=Regex/>" function is available, is is often more complex than is necessary. In these cases, format string patterns are more appropriate."</p>
+        <p><Prim prim=Un/>" works with format strings to extract substrings where the "<code>"_"</code>"s are. While the "<Prim prim=Regex/>" function is available, it is often more complex than is necessary. In these cases, format string patterns are more appropriate."</p>
         <Editor example="°$\"_, _, _\" \"1, 2, 3\""/>
         <Editor example="°$\"_, _, _\" \"1, 2, 3, 4, 5\""/>
         <Editor example="°$\"Hello, _!\" \"Hello, World!\""/>
+        <p>"Multiline format strings can be inverted as well."</p>
+        <Editor example="\"Hello\\nWorld!\"\n°$$ Hello\n $$ _!"/>
+        <p>"Inverting the "<Prim prim=Reduce/>" of a dyadic format string will split by a delimiter."</p>
+        <Editor example="°/$\"_ - _\" \"a - bcd - ef\""/>
         <p>"More precisely, format string patterns form a regex that replaces all "<code>"_"</code>"s from the format string with "<code>"(.+?|.*)"</code>", where "<code>"."</code>" also matches newlines."</p>
+
+        <Hd id="case">"Propagating errors with "<Prim prim=Case/></Hd>
+        <p>"Consider a function which attempts to match multiple patterns. After a pattern matches, each branch has some code to run."</p>
+        <p>"For example, this function attempts to parse a couple different expected string formats, then "<Prim prim=Parse/>"s and "<Prim prim=Select/>"s the result in some way."</p>
+        <Editor example="F ← ⍣(  ⊏⋕ °$\"_: _\"| ⊏⋕: °$\"_ - _\"| ∘)\nF \"1: abc\"\nF \"def - 2\""/>
+        <p>"But what happens if we give an input that matches the pattern but fails elsewhere in the branch?"</p>
+        <Editor example="F ← ⍣(⊏⋕ °$\"_: _\"|⊏⋕: °$\"_ - _\"|∘)\nF \"r: xyz\"  # Can't parse\nF \"ghi - 3\" # Out of bounds"/>
+        <p>"In both those cases, a pattern match succeeds, but either the "<Prim prim=Parse/>" or "<Prim prim=Select/>" fails. This causes the "<Prim prim=Try/>" to move on to the next branch silently, causing what may be unexpected behavior!"</p>
+        <p>"The "<Prim prim=Case/>" modifier can be used to make the branch fail properly. "<Prim prim=Case/>" simply calls its function. However, in the event that the function errors, the error can escape a single "<Prim prim=Try/>"."</p>
+        <p>"Wrapping the code after a pattern match in "<Prim prim=Case/>" will make the error propagate properly."</p>
+        <Editor example="F ← ⍣(\n  ⍩(⊏⋕) °$\"_: _\"\n| ⍩(⊏⋕): °$\"_ - _\"\n| ∘)\nF \"ghi - 3\""/> // Should fail
 
         <Hd id="challenges">"Challenges"</Hd>
 
@@ -1348,69 +1351,56 @@ fn TutorialPatternMatching() -> impl IntoView {
 }
 
 #[component]
-fn TutorialAdvancedArray() -> impl IntoView {
+fn TutorialMoreArray() -> impl IntoView {
     use Primitive::*;
     view! {
-        <Title text="Advanced Array Manipulation - Uiua Docs"/>
-        <h1>"Advanced Array Manipulation"</h1>
+        <Title text=format!("More Array Manipulation - {} Docs", lang())/>
+        <h1>"More Array Manipulation"</h1>
         <p>"Sometimes the operation you need to perform on an array is more complicated than modifiers like "<Prim prim=Reduce/>", "<Prim prim=Rows/>", or "<Prim prim=Table/>" allow."</p>
+
 
         <Hd id="fix"><Prim prim=Fix/></Hd>
         <p><Prim prim=Rows/>" can be used to iterate over multiple arrays. The nth row of each array will be passed to the function, and the result will be put in a new array."</p>
         <Editor example="≡⊂ 1_2_3 4_5_6"/>
-        <p>"Usually, the arrays must have the same number of rows."</p>
+        <p>"This works because both arrays have the same shape (in this case, "<code>[3]</code>"). If they didn't, we would get an error."</p>
         <Editor example="≡⊂ 1_2_3 4_5"/> // Should fail
-        <p>"However, there is an exception for arrays that have exactly one row. In this case, that row will be repeated for each row of the other array(s)."</p>
-        <Editor example="≡⊂ 1_2_3 4"/>
+        <p>"However, there is an exception to this rule. If one of the arrays has exactly one row, that array will be repeated for each row of the other array. This includes scalars."</p>
         <Editor example="≡⊂ 1 2_3_4"/>
-        <Editor example="≡(⊂⊂) 1 2_3_4 5"/>
-        <p>"Notice that the second argument here is a 2D array with 1 row of 2 elements. It will be repeated just like the scalars above."</p>
-        <Editor example="≡⊟ [1_2 3_4 5_6] [¯1_0]"/>
-        <p>"If we want to combine each row of one array with copies of another, we can turn one of the arrays into a single row array with "<Prim prim=Fix/>". "<Prim prim=Fix/>" adds a 1 to the front of the shape of an array."</p>
-        <Editor example="¤.1_2_3"/>
-        <p>"Here, we "<Prim prim=Fix/>" "<code>"1_2_3"</code>" so that it is reused for each row of "<code>"4_5_6"</code>"."</p>
-        <Editor example="≡⊂ ¤ 1_2_3 4_5_6"/>
-        <p>"If we have a bunch of arrays and want to choose which ones are fixed and which are not, we can use planet notation."</p>
+        <Editor example="≡⊂ 1_2_3 4"/>
+        <Editor example="≡⊂ [1_2] 3_4_5"/>
+        <Editor example="≡⊂ 1_2_3 [4_5]"/>
+        <p>"Notice how in this last example, the array "<code>"[4_5]"</code>" is an array of a single row, so that row is repeated across all iterations. It would be equivalent to:"</p>
+        <Editor example="[\n  ⊂ 1 4_5\n  ⊂ 2 4_5\n  ⊂ 3 4_5\n]"/>
+        <p>"The "<Prim prim=Fix/>" function turns an array into an array of a single row by prepending a "<code>"1"</code>" to the array's shape. This is equivalent to wrapping in "<code>"[]"</code>" as above, but it is shorter and better communicates the intention of \"fixing\" an array during iteration."</p>
+        <Editor example="¤1_2_3  # Fixing is equivalent to...\n[1_2_3] # ...surrounding with brackets"/>
+        <p>"With "<Prim prim=Fix/>", we can rewrite the previous examples."</p>
+        <Editor example="≡⊂ ¤1_2 3_4_5"/>
+        <Editor example="≡⊂ 1_2_3 ¤4_5"/>
+        <p>"If we have a several arrays and want to choose which ones are fixed and which are not, we can use planet notation."</p>
         <Editor example="≡⊂ ⊙¤ 1_2_3 4_5_6"/>
-        <Editor example="≡(⊂⊂⊂) ⊓⊓⊓∘¤¤∘ 1_2_3 4_5_6 7_8_9 10_11_12"/>
-        <Editor example="≡(⊂⊂⊂) ⊙∩¤     1_2_3 4_5_6 7_8_9 10_11_12"/>
-        <p><Prim prim=Fix/>" also works without "<Prim prim=Rows/>" with pervasive dyadic functions."</p>
-        <Editor example="-  [1 2 3]  [4 5 6]\n- ¤[1 2 3]  [4 5 6]\n-  [1 2 3] ¤[4 5 6]"/>
-        <Editor example="-  1_3 [3_4 5_6 7_8]"/> // Should fail
-        <Editor example="- ¤1_3 [3_4 5_6 7_8]"/>
+        <Editor example="≡(⊂⊂⊂) ⊙∩¤ 1_2_3 4_5_6 7_8_9 10_11_12"/>
+        <p><Prim prim=Fix/>" also works with pervasive dyadic functions without "<Prim prim=Rows/>"."</p>
+        <Editor example="+  [1 2 3]  [10 20 30]\n+ ¤[1 2 3]  [10 20 30]\n+  [1 2 3] ¤[10 20 30]"/>
+        <Editor example="- 1_2 [3_4 5_6 7_8]"/> // Should fail
+        <Editor example="-¤1_2 [3_4 5_6 7_8]"/>
 
-        <Hd id="rerank"><Prim prim=Rerank/></Hd>
-        <p>"The above examples dig into an array from the top down. But what if you want to think about the array from the "<em>"bottom up"</em>"?"</p>
-        <p>"The "<Prim prim=Rerank/>" function changes the rows of an array to have the specified rank."</p>
-        <Editor example="☇3 ↯2_2_2_5⇡40 # The rows are already rank 3"/>
-        <Editor example="☇2 ↯2_2_2_5⇡40"/>
-        <Editor example="☇1 ↯2_2_2_5⇡40"/>
-        <Editor example="☇0 ↯2_2_2_5⇡40 # Equivalent to ♭ deshape"/>
-        <p>"You can then use "<Prim prim=Rows/>" to iterate over arrays of that rank."</p>
-        <Editor example="≡□ ☇1 ↯2_2_2_3⇡24"/>
-        <p>"You can think of "<Prim prim=Rerank/>" as combining the dimensions of the array that are above the specified rank into a single dimension."</p>
-        <p>"In the example above, the shape information of the original array is lost."</p>
-        <p>"If you want to keep the part of the shape that is above the specified rank, you can use "<Prim prim=Under/>". This will "<em>"uncombine"</em>" the combined dimensions after the operation is complete."</p>
-        <Editor example="⍜(☇1)≡□ ↯2_2_2_3⇡24"/>
-        <p>"Notice in the above example that we specified the rank "<code>"1"</code>", and it was rank "<code>"1"</code>" arrays that were "<Prim prim=Box/>"ed."</p>
-        <p>"We can think of this pattern as allowing us to operate on arrays of the specified rank within the greater array. For example, by changing the rank to "<code>"2"</code>", we end up "<Prim prim=Box/>"ing matrices instead of lists."</p>
-        <Editor example="⍜(☇2)≡□ ↯2_2_2_3⇡24"/>
-        <p>"The specified rank can still be dynamic in this case by simply putting it on the stack."</p>
-        <Editor example="⍜☇≡□ 1 ↯2_2_2_3⇡24"/>
-        <Editor example="⍜☇≡□ 2 ↯2_2_2_3⇡24"/>
-        <p>"You can use "<Prim prim=Under/><Prim prim=Both/><Prim prim=Rerank/>" to "<Prim prim=Rerank/>" 2 arrays. Here, we insert one of the ranks for "<Prim prim=Rerank/>" using "<Prim prim=Dip/>"."</p>
-        <Editor example="⍜∩☇≡⊂ 1⊙1 ↯6_2⇡12 ↯2_3_4⇡24"/>
-
-        <Hd id="table">"Multi-dimensional "<Prim prim=Table/></Hd>
-        <p><Prim prim=Table/>" called on arrays of multiple dimensions calls its function on all "<em>"combinations"</em>" of rows of its arguments."</p>
-        <Editor example="⊞⊂ η_π_τ ↯3_3⇡9"/>
-        <p><Prim prim=Table/>" can be useful when working with "<Prim prim=Rerank/>"ed or "<Prim prim=Fix/>"ed arrays."</p>
-        <p>"In this example, we apply a table of rotations to each matrix cell of a 3D array."</p>
-        <Editor example="°⊚ ≡[..]⇡3           # Target array
-[0_0 0_1]_[¯1_1 1_0] # Rotations table
-,,                   # Copy to see inputs
-⍜(☇1)⊞↻              # All rotation combinations
-≡≡□                  # Box for display"/>
+        <Hd id="operating-at-different-ranks">"Operating at Different Ranks"</Hd>
+        <p><Prim prim=Rows/>" is the bread and butter of traversing an array's structure. It calls its function on each row of an array, but what if you want to go deeper?"</p>
+        <p>"One option is to simply chain "<Prim prim=Rows/>" multiple times."</p>
+        <Editor example="≡□ °△ 2_3_4\n≡≡□ °△ 2_3_4\n≡≡≡□ °△ 2_3_4"/>
+        <p>"This can get a bit unwieldy if an array has a lot of dimensions. You can instead use "<A href="/tutorial/morestack#Subscripts">"subscripted"</A>" "<Prim prim=Rows/>" to specify the depth of the operation."</p>
+        <Editor example="≡□ °△ 2_3_4\n≡₂□ °△ 2_3_4\n≡₃□ °△ 2_3_4"/>
+        <p>"This is useful when you are approaching the array's structure from the top down, but what if you want to start at the bottom?"</p>
+        <p>"Subscripted "<Prim prim=Each/>" allows you to specify the rank of the arrays you want to apply the function to, regardless of the outer array's rank. Notice how the rank of the "<Prim prim=Box/>"ed arrays is this example corresponds to the subscript."</p>
+        <Editor example="∵□ °△2_3_4\n∵₁□ °△2_3_4\n∵₂□ °△2_3_4"/>
+        <p>"Sometimes you simply want to collapse the dimensions of an array to make it a certain rank. This can be done with subscripted "<Prim prim=Deshape/>"."</p>
+        <Editor example="△ ♭ °△2_3_4_5\n△ ♭₂ °△2_3_4_5\n△ ♭₃ °△2_3_4_5\n△ ♭₄ °△2_3_4_5"/>
+        <p>"Combined with "<Prim prim=Range/>", this is a nice way to generate all combinations of indices given a list of maximums."</p>
+        <Editor example="⍉ ♭₂ ⇡2_2_3"/>
+        <p>"Subscripting these works in the vast majority of cases. However, subscripts are static. The rank to use cannot be taken from the stack."</p>
+        <p>"In the rare event that you need a dynamic rank, you can use the "<Prims prims=[Un, By]/><code>"("</code><Prims prims=[Len, Shape]/><code>")"</code>" idiom introduced in the "<A href="/tutorial/inverses#un-by">"Inverses"</A>" tutorial."</p>
+        <Editor example="⍉ °⊸(⧻△) 2 ⇡2_2_2"/>
+        <Editor example="°⊸(⧻△) 1 °△2_3_3"/>
 
         <Hd id="challenges">"Challenges"</Hd>
 
@@ -1419,17 +1409,16 @@ fn TutorialAdvancedArray() -> impl IntoView {
             prompt="adds the first argument list to each row of the second argument matrix"
             example="1_2_3 [4_5_6 7_8_9]"
             answer="+¤"
-            tests={&["10_20 10_20 ↯4_2⇡8", "\"Wow\" ¯[10_0_10 19_14_19]"]}
+            tests={&["10_20 ↯4_2⇡8", "\"Wow\" ¯[10_0_10 19_14_19]"]}
             hidden="1_2 [3_4]"/>
 
         <Challenge
             number=2
-            prompt="rotates all rank 2 arrays in the second argument by all rank 1 arrays in the first"
-            example="[¯1_¯2 0_1] [.] ↯3_4⇡12"
-            answer="⊞↻ ☇1⊙(☇2)"
-            best_answer="⊞↻ ∩☇1⊙2"
-            tests={&["[0_2 2_1 1_1] ⊞×⊞×.↘1.+1⇡3"]}
-            hidden="1 [1 2 3]"/>
+            prompt="joins the first argument to each list in the second argument"
+            example="0 +1°△3_4"
+            answer="∵₁⊂"
+            tests={&["0 [1 2 3]", r#"@| ⬚@ [["Hey""there""buddy"] [@a "bc" "def"]]"#, "η_π_τ ⇡2_2_2"]}
+            hidden="3 5"/>
     }
 }
 
@@ -1437,9 +1426,9 @@ fn TutorialAdvancedArray() -> impl IntoView {
 fn TutorialThinkingWithArrays() -> impl IntoView {
     use Primitive::*;
     view! {
-        <Title text="Thinking with Arrays - Uiua Docs"/>
+        <Title text=format!("Thinking with Arrays - {} Docs", lang())/>
         <h1>"Thinking with Arrays"</h1>
-        <p>"So far, we've covered the mechanics of working with arrays in Uiua. However, if you are new to the array paradigm, it may not be clear how to use arrays to solve problems."</p>
+        <p>"So far, we've covered the mechanics of working with arrays in "{lang}". However, if you are new to the array paradigm, it may not be clear how to use arrays to solve problems."</p>
         <p>"This section covers some of the common functions and modifiers that pop up when solving many different problems."</p>
 
         <Hd id="masks-and-keep">"Masks and "<Prim prim=Keep/></Hd>
@@ -1500,7 +1489,7 @@ fn TutorialThinkingWithArrays() -> impl IntoView {
 
         <Challenge
             number=1
-            prompt="negates each number in an list that is not a multiple of 3"
+            prompt="negates each number in a list that is not a multiple of 3"
             example="[1 2 3 4 5 6 7 8 9]"
             answer="⍜▽¯ ≠0◿3."
             tests={&["[3 0 1 8]", "[3 6 9 12 15 18 21 25 27]"]}
@@ -1516,7 +1505,7 @@ fn TutorialThinkingWithArrays() -> impl IntoView {
 
         <Challenge
             number=3
-            prompt="multiplies by 10 each number that comes after a multiple of 3 (the first number is never multiplied)"
+            prompt="for every multiple of 3 in a list, multiplies the following number by 10"
             example="[1 2 3 4 5 6 7]"
             answer="⍜▽(×10) ⬚0↻¯1 =0◿3."
             tests={&["[2 9 3 8 7 1]", "[3 3 3 3]"]}
@@ -1526,7 +1515,7 @@ fn TutorialThinkingWithArrays() -> impl IntoView {
             number=4
             prompt="given a matrix of 0s an 1s, only keeps the 1s that have even x and y coordinates"
             example="[1_1_0 0_1_1 0_1_1]"
-            answer="⬚0× °⊚ ▽≡/× =0◿2. ⊚."
+            answer="⍜⊚(▽≡/×¬⊸◿2)"
             tests={&["↯3_4 1_0_1", "↯4_4 1_0_0_1_0"]}
             hidden="[1_1 1_1]"/>
 
@@ -1534,8 +1523,7 @@ fn TutorialThinkingWithArrays() -> impl IntoView {
             number=5
             prompt="reverses each word in a string but keeps the words in the same order"
             example=r#""get in the racecar""#
-            answer="⍜⊜□≡⍜°□⇌ ≠@ ."
-            best_answer="⍜⊜□⍚⇌ ≠@ ."
+            answer="⍜⊜□≡⇌ ≠@ ."
             tests={&[r#""arrays are neat""#, r#""wow mom""#]}
             hidden=r#""Wow, mom!""#/>
     }
@@ -1543,73 +1531,10 @@ fn TutorialThinkingWithArrays() -> impl IntoView {
 
 #[component]
 fn TutorialMacros() -> impl IntoView {
-    use Primitive::*;
     view! {
-        <Title text="Macros - Uiua Docs"/>
-        <h1>"Macros"</h1>
-        <p>"Defining your own functions that work on arrays is pretty easy. Just a name, a "<code>"←"</code>", and you're done."</p>
-        <p>"But what if you want to define functions that use other functions?"</p>
+        <Title text=format!("Macros - {} Docs", lang())/>
 
-        <Hd id="placeholders-and-bangs">"Placeholders and "<code>"!"</code>"s"</Hd>
-        <p>"Anywhere you can put a built-in or inline function, you can also put a "<code>"^!"</code>". This is called a "<em>"placeholder"</em>"."</p>
-        <p>"Any named function with "<code>"^!"</code>"s in it is a macro."</p>
-        <p>"However, there is one additional requirement: macros must have names that end in as many "<code>"!"</code>"s as the number of functions they take."</p>
-        <p>"Macros work similarly to modifiers. They take some function arguments and modify how they are used."</p>
-        <p>"Lets look at a simple example using "<Prim prim=Reduce/>". It reduces a function over the numbers up to the given range."</p>
-        <Editor example="\
-ReduceRange! ← /^!+1⇡
-ReduceRange!+5
-ReduceRange!×4"/>
-        <p>"Here is another simple example which calls a function on a reversed version of each row of an array."</p>
-        <Editor example="\
-OnRev! ← ≡⍜⇌^!
-OnRev!(↘1) ↯3_4⇡12
-OnRev!(⊂π) ↯3_4⇡12"/>
-        <p>"A macro can take as many functions as you want. Modifiers with two or more function arguments will be formatted to use "<code>"‼"</code>"s as needed. Try running the following example to format it."</p>
-        <Editor example="\
-F!!! ← ⊂/^!⊃^!^!
-F!!!+×⊂ [1 2 3][4 5 6]"/>
-
-        <Hd id="operand-functions">"Operand Functions"</Hd>
-        <p>"When Uiua code is compiled, a macro passes its operands as values on a special operand stack. This stack can be manipulated in a few ways to make macros more powerful."</p>
-        <p><code>"^!"</code>" is actually an operand function. It pops the operand at the top of the operand stack and inlines it into its place in the macro."</p>
-        <p>"There are also operand function analogues for "<Prim prim=Dup/>", "<Prim prim=Flip/>", and "<Prim prim=Over/>"."</p>
-        <p>"These are "<code>"^."</code>", "<code>"^:"</code>", and "<code>"^,"</code>" respectively."</p>
-        <p>"Like normal Uiua code, operand functions are evaluated from right to left."</p>
-        <p>"However, operands are initially pushed to the stack in reverse order. This means that the macro operand furthest to the right starts at the top of the operand stack."</p>
-        <p>"Let's look at a simple example to see how this ordering works."</p>
-        <Editor example="F‼ ← ^!^!\nG‼ ← ^!^!^:\nF‼(⊂1|⊂2) []\nG‼(⊂1|⊂2) []"/>
-        <p>"If we wanted to call each of two functions twice, we could use a similar pattern to what we use in normal Uiua code."</p>
-        <Editor example="[,, 1 2]\nF‼ ← ^!^!^!^!^,^,\nF‼(⊂1|⊂2) []"/>
-
-        <Hd id="two-kinds">"Two Kinds of Macros"</Hd>
-        <p>"The macros described so far are called "<em>"stack macros"</em>", because they move operands around on a stack."</p>
-        <p>"But Uiua actually has a second kind of macro. "<em>"Array macros"</em>" put their operands in an array. The array can then be arbitrarily manipulated with normal Uiua code."</p>
-
-        <Hd id="array-macros">"Array Macros"</Hd>
-        <p>"Array macros are defined by putting a "<code>"^"</code>" right after the binding's "<code>"←"</code>". Array macro names must still end in some number of "<code>"!"</code>"s."</p>
-        <p>"Here is a basic example that simply prints its operands. It returns the number "<code>"5"</code>" as the actual generated code."</p>
-        <Editor example="F‼ ←^ \"5\" &pf\nF‼⊂(+1)"/>
-        <p>"As you can see, the operands are passed to the function as an array of boxed strings."</p>
-        <p>"Array macros may be passed a function pack operand. Each operand from the pack will be put in the array."</p>
-        <Editor example="F! ←^ $\"_\"\nF!(+|-|×|÷)"/>
-        <p>"The array macro's function must return either a string or an array of boxed strings. This value will be converted back to Uiua code and compiled as normal."</p>
-        <p>"Format strings can help a lot in generating new code. For example, if we wanted to make a version of "<Prim prim=Both/>" that calls its function on an arbitrary number of sets of values, we could use "<Prim prim=Reshape/>" and "<Prim prim=Bracket/>"."</p>
-        <Editor example="All‼ ←^ $\"⊓(_)\" /$\"_|_\" ↯⋕ °{⊙∘}\n[All‼3+ 1 2 3 4 5 6]"/>
-        <p>"First, we extract the two operands: the count and the function. The count comes in as a string, so we have to "<Prim prim=Parse/>" it before using "<Prim prim=Keep/>" to make an array of copies of the function."</p>
-        <p>"We use "<Prim prim=Reduce/>" with a format string to form the branches of a function pack, then use another format string to put them in "<Prim prim=Bracket/>"."</p>
-        <p>"The resulting string is then compiled as Uiua code."</p>
-        <br/>
-        <p>"Array macros have the ability to create new bindings, including new macros."</p>
-        <Editor example="Def‼ ←^ $\"_\\n_\" ⊃(/$\"_ ← _\"|/$\"Also_ ← _\")\nDef‼(X|5)\n+ X AlsoX"/>
-        <p>"This is a simple example, but this concept can be used to create very powerful meta-programming tools."</p>
-
-        <Hd id="which-to-use">"What kind of macro should I use?"</Hd>
-        <p>"Which kind of macro you use depends on what kind of code you are writing."</p>
-        <p>"Array macros are much more powerful than stack macros, but they can be more complicated to write."</p>
-        <p>"Additionally, stack macros are "<a href="https://en.wikipedia.org/wiki/hygienic_macro">"hygienic"</a>". When a stack macro refers to names of things, bindings you have definined in the surrounding code will not interfere; you will never accidentally use the wrong binding. Array macros make no such guarantees."</p>
-        <p>"If you conteptually just want to define your own modifier, a stack macro is probably the simplest way to go."</p>
-        <p>"If you want the full power (and all the complexity) of compile-time meta-programming, you'll need to use an array macro."</p>
+        <Markdown src="/text/macros.md"/>
 
         <Hd id="challenges">"Challenges"</Hd>
 
@@ -1617,27 +1542,34 @@ F!!!+×⊂ [1 2 3][4 5 6]"/>
             number=1
             prompt="creates a macro called F! which calls its function on each row of an array, reverses each row, and reverses the whole array"
             example="F!(⊂.) ↯3_4⇡12"
-            answer="F! ← ⇌≡(⇌^!)"
-            default="F! ← ^!"
+            answer="F! ← ⇌≡(⇌^0)"
+            default="F! ← ^0"
             flip=true
             tests={&["F!(↯3) [1_2_3 4_5_6]", "F!(⊟.) 1_2 3_4"]}
             hidden="5"/>
 
         <Challenge
             number=2
-            prompt="creates a macro called F‼ which calls its first function, then its second, then its first again."
+            prompt="creates a macro called F‼ which calls its first function, then its second, then its first again"
             example="F‼⇌(⊂10) [1 2 3]"
-            answer="F‼ ← ^!^!^!^,"
-            default="F‼ ← ^!^!"
+            answer="F‼ ← ^0^1^0"
+            default="F‼ ← ^0"
             flip=true
             tests={&["F‼⇌⍉ [1_2 3_4]", "F‼⊂⇌ 1_2 3_4 5_6"]}
             hidden="5"/>
+    }
+}
+
+#[component]
+fn TutorialTacitCode() -> impl IntoView {
+    view! {
+        { title_markdown("Tacit Code", "/text/tacit_code.md", ()).into_view() }
 
         <br/>
         <br/>
         <hr/>
         <p>"This is the end of the tutorial that pertains to writing "<em>"programs"</em>"."</p>
-        <p>"If you want to use Uiua to write "<em>"software"</em>", then read on for the sections on modules and testing."</p>
+        <p>"If you want to use "{lang}" to write "<em>"software"</em>", then read on for the sections on modules and testing."</p>
         <p>"If you don't care about that stuff and want to learn more about the language, you can check out:"</p>
         <EndOfTutorialList/>
     }
@@ -1651,7 +1583,6 @@ fn EndOfTutorialList() -> impl IntoView {
             <li><A href="/docs#other-tutorials">"Other tutorials about more specific topics"</A></li>
             <li><A href="/docs#other-docs">"Other language topics"</A></li>
             <li>"The online "<A href="/pad">"pad"</A>" for writing longer code"</li>
-            <li><A href="/docs/isms">"Uiuisms"</A>", a currated list of common operations"</li>
         </ul>
     }
 }
@@ -1660,15 +1591,42 @@ fn EndOfTutorialList() -> impl IntoView {
 fn TutorialModules() -> impl IntoView {
     use Primitive::*;
     view! {
-        <Title text="Modules - Uiua Docs"/>
+        <Title text=format!("Modules - {} Docs", lang())/>
         <h1>"Modules"</h1>
-        <p>"Modules are a way to organize your code in Uiua. Any Uiua file can be used as a module."</p>
+        <p>"Modules are a way to organize your code in "{lang}". They can either be defined in a scope, or imported from a file. Any "{lang}" file can be used as a module."</p>
+        <p>"Modules can be compared to namespaces in other languages."</p>
 
-        <h3 id="web-files">"Files on the Website"</h3>
-        <p>"Using modules involves loading files from the file system."</p>
+        <Hd id="scoped-modules">"Scoped Modules"</Hd>
+        <p>"Scoped modules are defined between a "<code>"┌─╴"</code>" and a "<code>"└─╴"</code>"."</p>
+        <p>"Both delimiters format from "<code>"---"</code>"."</p>
+        <p>" The "<code>"┌─╴"</code>" should be immediately followed by a name for the module. Module names follow the same rules as other bindings."</p>
+        <p>"Names from inside the module can be referenced by following the module name with a "<code>"~"</code>"."</p>
+        <Editor example="---Mod\n  A ← 5\n  F ← +1\n  G ← F F\n---\nMod~G Mod~A" help={&["", "Try formatting!"]}/>
+        <p>"Bindings defined inside a scoped module are only visible inside the module."</p>
+        <Editor example="┌─╴Mod\n  A ← 5\n  F ← +1\n  G ← F F\n└─╴\nG A"/> // Should fail
+        <p>"Names from inside the module can be "<em>"made"</em>" visible by following the module name with a "<code>"~"</code>" and a list of the names to make visible."</p>
+        <Editor example="┌─╴Mod ~ A G\n  A ← 5\n  F ← +1\n  G ← F F\n└─╴\nG A"/>
+        <p>"Note that these names are brought into the module's parent scope as private bindings, so they cannot be referenced from outside the parent."</p>
+        <Editor example="┌─╴Mod\n  ┌─╴SubMod ~ X\n    X ← 5\n  └─╴\n└─╴\nMod~X"/> // Should fail
+        <p>"Names must be re-bound in the parent to be made visible."</p>
+        <Editor example="┌─╴Mod\n  ┌─╴SubMod\n    X ← 5\n  └─╴\n  X ← SubMod~X\n└─╴\nMod~X"/>
+        <p>"Names defined above the module can be referenced inside it."</p>
+        <Editor example="B ← 5\n┌─╴Mod\n  C ← ×2 B\n└─╴\nMod~C"/>
+
+        <Hd id="modules-as-functions">"Modules as Functions"</Hd>
+        <p>"If a module defines a function called "<code>"Call"</code>" or "<code>"New"</code>", it can be called as a function. This can be useful if your module defines functions that all work on the same kind of data, like methods in some other languages."</p>
+        <Editor example="┌─╴Foo\n  New ← {⊓$Bar$Baz}\n  Format ← /$\"_ _\"\n└─╴\nFoo \"Hi!\" 5\nFoo~Format ."/>
+
+        <Hd id="module-import-macros">"Module Import Macros"</Hd>
+        <p>"If the name of a module is referenced as a macro (with a trailing "<code>"!"</code>"), names defined in the module will be available in the macro's scope."</p>
+        <p>"This is useful if you need to refer to a bunch of bindings from a module without having to prefix them with the module name."</p>
+        <Editor example="┌─╴Foo\n  New ← {⊓$Bar$Baz}\n  Format ← /$\"_ _\"\n  Incr ← ⍜⊣(+1)\n└─╴\nFoo!(Format Incr New) \"Oh\" 10"/>
+
+        <Hd id="web-files">"Files on the Website"</Hd>
+        <p>"Using files as modules involves loading files from the file system."</p>
         <p>"This website has a virtual file system. You can write to virtual files with "<Prim prim=Sys(SysOp::FWriteAll)/>". You can also drag and drop files from your computer into the editor to make them available to import."</p>
         <p>"There is also a test module that can always be imported as "<code>"example.ua"</code>". Its contents is:"</p>
-        <Editor example={&example_ua(|ex| ex.clone())}/>
+        <Editor example=EXAMPLE_UA/>
 
         <Hd id="importing">"Importing Modules"</Hd>
         <p>"Modules can be imported by file path with "<code>"~"</code>"."</p>
@@ -1686,10 +1644,12 @@ fn TutorialModules() -> impl IntoView {
         <p>"This can be mixed and matched with the other import syntax."</p>
         <Editor example="Ex ~ \"example.ua\" ~ Increment Square\n\nEx~Double Square 3\nEx~Mac!×\nIncrement Ex~Bar"/>
 
-        <Hd id="aliasing">"Aliasing Module Items"</Hd>
+        <Hd id="aliasing">"Aliasing Modules"</Hd>
         <p>"If you want to be able to refer to an item from a module with a different name, simply make a binding with the new name."</p>
         <Editor example="Ex ~ \"example.ua\"\nSqr ← Ex~Square\nSp ← Ex~Span\n\nSp⟜Sqr 3"/>
-        <p>"These bindings will also get indented by the formatter if they immediately follow the import."</p>
+        <p>"These bindings will also get indented by the formatter if they immediately follow the import. Try formatting the above code!"</p>
+        <p>"You can also re-bind the module itself."</p>
+        <Editor example="Ex ~ \"example.ua\"\nLocalEx ← Ex\nLocalEx~Square 7"/>
 
         <Hd id="visibility">"Visibility"</Hd>
         <p>"All bindings in a module bound with the normal "<code>"←"</code>" arrow are public and can be used by importers of the module."</p>
@@ -1703,49 +1663,32 @@ fn TutorialModules() -> impl IntoView {
 
         <Hd id="git-modules">"Git Modules"</Hd>
         <p>"Modules can be imported from Git repositories. Instead of a path, use a URL prefixed with "<code>"git:"</code>"."</p>
-        <p>"The Uiua GitHub organization hosts an example module at "<a href="https://github.com/uiua-lang/example-module">"https://github.com/uiua-lang/example-module"</a>". The protocol specification can be omitted."</p>
+        <p>"The "{lang}" GitHub organization hosts an example module at "<a href="https://github.com/uiua-lang/example-module">"https://github.com/uiua-lang/example-module"</a>". The protocol specification can be omitted."</p>
         <Editor example="~ \"git: github.com/uiua-lang/example-module\" ~ Upscale\nUpscale 3 [1_2 3_4]"/>
-        <p>"On the site, code is pulled from a "<code>"lib.ua"</code>" file at the root of the repository. Loading other files is not supported."</p>
-        <p>"To use Git modules in the "<A href="/docs/install">"native interpreter"</A>", you must have Git installed. The repository is added as a Git submodule and the "<code>"lib.ua"</code>" file is loaded as the module's contents."</p>
-        <p>"The native interpreter also supports adding an additional "<code>"branch: <branch-name>"</code>" specifier after the URL."</p>
+        <p>"On the site, code is pulled from a "<code>"lib.ua"</code>" file at the root of the repository. Loading other files on the site is not supported."</p>
+        <p>"To use Git modules in the "<A href="/docs/install">"native interpreter"</A>", you must have Git installed. The repository is cloned and the "<code>"lib.ua"</code>" file is loaded as the module's contents. Code from other files can be made available by importing them as modules in the "<code>"lib.ua"</code>" file."</p>
+        <p>"The native interpreter also supports adding an additional "<code>"branch: <branch-name>"</code>" or "<code>"commit: <commit-hash>"</code>" specifier after the URL."</p>
+        <p>"The "<code>"uiua module"</code>" command can be used to list or update Git modules."</p>
+        <p>"You can find a curated list of "{lang}" modules "<a href="https://github.com/uiua-lang/uiua-modules">"here"</a>"."</p>
     }
 }
 
 #[component]
-fn TutorialTesting() -> impl IntoView {
-    use Primitive::*;
-    view! {
-        <Title text="Testing - Uiua Docs"/>
-        <h1>"Testing"</h1>
-        <Hd id="test-scopes">"Test Scopes"</Hd>
-        <p>"Test scopes are regions of code that are delimited with "<code>"---"</code>"s at the top level of a file. They are meant to be used with "<Prim prim=Assert/>"."</p>
-        <Editor example="Square ← ×.\n---\n⍤.=9 Square 3\n⍤.=225 Square 15\n---"/>
-        <p><Prim prim=Assert/>" will return an error when its second argument is anything other than "<code>"1"</code>"."</p>
-        <Editor example="Square ← ×.\n---\n⍤.=25 Square 4\n---"/> // Should fail
-        <p>"The first argument to "<Prim prim=Assert/>" is the value that will be thrown if the assertion fails. In the examples above, we have simply been "<Prim prim=Dup/>"ing the test value. We can throw a message instead."</p>
-        <Editor example=r#"Square ← ×.
----
-⍤"3² is not 9!" =9 Square 3
-⍤"4² is not 25!" =25 Square 4
----"#/>
-        <p>"One nice pattern for writing tests is to put the expected result before the test computation and use "<Prims prims=[Assert, On, Match, Flip]/>"."</p>
-        <p>"If the result does not match the expectation, that incorrect result will be thrown."</p>
-        <Editor example="---\n⍤⟜≍: 4 +2 2 # Passes\n---"/>
-        <Editor example="---\n⍤⟜≍: [2 3 5] +1 [1 2 3]\n--- # ↓↓↓↓↓↓↓"/> // Should fail
+fn TutorialDataDefs() -> impl IntoView {
+    title_markdown("Data Definitions", "/text/data_defs.md", ())
+}
 
-        <Hd id="run-modes">"Run Modes"</Hd>
-        <p>"Whether tests will run or not depends on how you run the code."</p>
-        <p>"On this website, both test and non-test code will always be run."</p>
-        <p>"However, if you use the "<A href="/docs/install">"native interpreter"</A>", you have a few options."</p>
-        <p><code>"uiua watch"</code>" will run all code, including tests."</p>
-        <p><code>"uiua run"</code>" will only run non-test code."</p>
-        <p><code>"uiua test"</code>" will only run test code, but also any non-test bindings and any non-test code which makes imports."</p>
+#[component]
+fn TutorialTesting() -> impl IntoView {
+    view! {
+        <Title text=format!("Testing - {} Docs", lang())/>
+        <Markdown src="/text/testing.md"/>
 
         <br/>
         <br/>
         <hr/>
         <p>"Hooray! You've reached the end of the tutorial!"</p>
-        <p>"To keep going with Uiua, you can check out:"</p>
+        <p>"To keep going with "{lang}", you can check out:"</p>
         <EndOfTutorialList/>
     }
 }
