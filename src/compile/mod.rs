@@ -14,12 +14,13 @@ use std::{
 };
 
 use ecow::{eco_vec, EcoString, EcoVec};
+use indexmap::IndexMap;
 use instant::Duration;
 
 use crate::{
     algorithm::invert::{invert_instrs, under_instrs},
     ast::*,
-    check::{instrs_all_signatures, instrs_signature, SigCheckError},
+    check::{instrs_all_signatures, instrs_signature, SigCheckError, SigCheckErrorKind},
     example_ua,
     format::format_word,
     function::*,
@@ -28,9 +29,9 @@ use crate::{
     lsp::{CodeMeta, SigDecl},
     optimize::{optimize_instrs, optimize_instrs_mut},
     parse::{count_placeholders, parse, split_words, unsplit_words},
-    Array, Assembly, Boxed, Diagnostic, DiagnosticKind, Global, Ident, ImplPrimitive, InputSrc,
-    IntoInputSrc, IntoSysBackend, Primitive, RunMode, SemanticComment, SysBackend, Uiua, UiuaError,
-    UiuaResult, Value, CONSTANTS, VERSION,
+    Array, Assembly, BindingKind, Boxed, Diagnostic, DiagnosticKind, Ident, ImplPrimitive,
+    InputSrc, IntoInputSrc, IntoSysBackend, Primitive, RunMode, SemanticComment, SysBackend, Uiua,
+    UiuaError, UiuaResult, Value, CONSTANTS, VERSION,
 };
 
 /// The Uiua compiler
@@ -55,9 +56,9 @@ pub struct Compiler {
     /// The bindings of imported files
     imports: HashMap<PathBuf, Import>,
     /// Unexpanded stack macros
-    stack_macros: HashMap<usize, Vec<Sp<Word>>>,
+    stack_macros: HashMap<usize, StackMacro>,
     /// Unexpanded array macros
-    array_macros: HashMap<usize, Function>,
+    array_macros: HashMap<usize, ArrayMacro>,
     /// The depth of macro expansion
     macro_depth: usize,
     /// Accumulated errors
@@ -115,9 +116,21 @@ pub struct Import {
     /// The top level comment
     pub comment: Option<Arc<str>>,
     /// Map module-local names to global indices
-    names: HashMap<Ident, LocalName>,
+    names: IndexMap<Ident, LocalName>,
     /// Whether the import uses experimental features
     experimental: bool,
+}
+
+#[derive(Clone)]
+struct StackMacro {
+    words: Vec<Sp<Word>>,
+    names: IndexMap<Ident, LocalName>,
+}
+
+#[derive(Clone)]
+struct ArrayMacro {
+    function: Function,
+    names: IndexMap<Ident, LocalName>,
 }
 
 impl AsRef<Assembly> for Compiler {
@@ -140,35 +153,46 @@ struct CurrentBinding {
     global_index: usize,
 }
 
+/// A scope where names are defined
 #[derive(Clone)]
 pub(crate) struct Scope {
+    kind: ScopeKind,
     /// The top level comment
     comment: Option<Arc<str>>,
     /// Map local names to global indices
-    names: HashMap<Ident, LocalName>,
+    names: IndexMap<Ident, LocalName>,
     /// Whether to allow experimental features
     experimental: bool,
     /// The stack height between top-level statements
     stack_height: Result<usize, Sp<SigCheckError>>,
     /// The stack of referenced bind locals
     bind_locals: Vec<HashSet<usize>>,
-    /// Whether currently compiling fill's second function
-    fill: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScopeKind {
+    /// A scope at the top level of a file
+    File,
+    /// A temporary scope, probably for a macro
+    Temp,
+    /// A test scope between `---`s
+    Test,
 }
 
 impl Default for Scope {
     fn default() -> Self {
         Self {
+            kind: ScopeKind::File,
             comment: None,
-            names: HashMap::new(),
+            names: IndexMap::new(),
             experimental: false,
             stack_height: Ok(0),
             bind_locals: Vec::new(),
-            fill: false,
         }
     }
 }
 
+/// The index of a named local in the bindings, and whether it is public
 #[derive(Clone, Copy)]
 pub(crate) struct LocalName {
     pub index: usize,
@@ -306,12 +330,14 @@ impl Compiler {
     /// those names will not.
     ///
     /// All other runtime state other than the stack, will also be restored.
-    pub fn in_scope<T>(
+    fn in_scope<T>(
         &mut self,
+        kind: ScopeKind,
         f: impl FnOnce(&mut Self) -> UiuaResult<T>,
     ) -> UiuaResult<Import> {
         let experimental = self.scope.experimental;
         self.higher_scopes.push(take(&mut self.scope));
+        self.scope.kind = kind;
         self.scope.experimental = experimental;
         let res = f(self);
         let scope = replace(&mut self.scope, self.higher_scopes.pop().unwrap());
@@ -434,7 +460,7 @@ code:
         let prev_com = prev_comment.take();
         let mut lines = match item {
             Item::TestScope(items) => {
-                self.in_scope(|env| env.items(items.value, true))?;
+                self.in_scope(ScopeKind::Test, |env| env.items(items.value, true))?;
                 return Ok(());
             }
             Item::Words(lines) => lines,
@@ -509,7 +535,8 @@ code:
                     // Try to evaluate at comptime
                     // This can be done when there are at least as many push instructions
                     // preceding the current line as there are arguments to the line
-                    if instr_count_before >= sig.args
+                    if !instrs.is_empty()
+                        && instr_count_before >= sig.args
                         && (self.asm.instrs.iter().take(instr_count_before).rev())
                             .take(sig.args)
                             .all(|instr| matches!(instr, Instr::Push(_)))
@@ -569,7 +596,7 @@ code:
         Ok(())
     }
     #[must_use]
-    pub(crate) fn add_function<I>(&mut self, id: FunctionId, sig: Signature, instrs: I) -> Function
+    pub(crate) fn make_function<I>(&mut self, id: FunctionId, sig: Signature, instrs: I) -> Function
     where
         I: IntoIterator<Item = Instr> + fmt::Debug,
         I::IntoIter: ExactSizeIterator,
@@ -605,7 +632,12 @@ code:
     /// Import a module
     pub(crate) fn import_module(&mut self, path_str: &str, span: &CodeSpan) -> UiuaResult<PathBuf> {
         // Resolve path
-        let path = if let Some(url) = path_str.strip_prefix("git:") {
+        let path = if let Some(mut url) = path_str.strip_prefix("git:") {
+            let mut branch = None;
+            if let Some((a, b)) = url.split_once("branch:") {
+                url = a;
+                branch = Some(b.trim());
+            }
             // Git import
             let mut url = url.trim().trim_end_matches(".git").to_string();
             if ![".com", ".net", ".org", ".io", ".dev"]
@@ -621,7 +653,7 @@ code:
                 url = format!("https://{url}");
             }
             self.backend()
-                .load_git_module(&url)
+                .load_git_module(&url, branch)
                 .map_err(|e| self.fatal_error(span.clone(), e))?
         } else {
             // Normal import
@@ -648,7 +680,9 @@ code:
                     format!("Cycle detected importing {}", path.to_string_lossy()),
                 ));
             }
-            let import = self.in_scope(|env| env.load_str_src(&input, &path).map(drop))?;
+            let import = self.in_scope(ScopeKind::File, |env| {
+                env.load_str_src(&input, &path).map(drop)
+            })?;
             self.imports.insert(path.clone(), import);
         }
         let import = self.imports.get(&path).unwrap();
@@ -723,37 +757,78 @@ code:
         let sig = if let Some(sig) = sig {
             sig
         } else {
-            instrs_signature(&instrs).map_err(|e| {
-                self.fatal_error(span, format!("Cannot infer function signature: {e}"))
-            })?
+            self.sig_of(&instrs, &span)?
         };
         let instrs = optimize_instrs(instrs, false, &self.asm);
         Ok((instrs, sig))
     }
-    fn words(&mut self, words: Vec<Sp<Word>>, call: bool) -> UiuaResult {
-        let mut words = words
-            .into_iter()
-            .rev()
-            .filter(|word| word.value.is_code())
-            .peekable();
-        while let Some(word) = words.next() {
-            if let Some(next) = words.peek() {
-                // First select diagnostic
-                if let (Word::Primitive(Primitive::Select), Word::Primitive(Primitive::First)) =
-                    (&word.value, &next.value)
-                {
-                    self.emit_diagnostic(
-                        format!(
-                            "Flip the order of {} and {} to improve performance",
-                            Primitive::First.format(),
-                            Primitive::Select.format()
-                        ),
-                        DiagnosticKind::Advice,
-                        word.span.clone(),
-                    );
-                }
+    fn words(&mut self, mut words: Vec<Sp<Word>>, call: bool) -> UiuaResult {
+        words.retain(|word| word.value.is_code());
+        words.reverse();
+        #[derive(Debug, Clone)]
+        struct PrevWord(Option<Primitive>, Option<Signature>, CodeSpan);
+        let mut a: Option<PrevWord> = None;
+        let mut b: Option<PrevWord> = None;
+        for word in words {
+            let span = word.span.clone();
+            let prim = match word.value {
+                Word::Primitive(prim) => Some(prim),
+                _ => None,
+            };
+
+            // First select diagnostic
+            if let (Some(PrevWord(Some(Primitive::Select), _, b_span)), Some(Primitive::First)) =
+                (&b, prim)
+            {
+                self.emit_diagnostic(
+                    format!(
+                        "Flip the order of {} and {} to improve performance",
+                        Primitive::First.format(),
+                        Primitive::Select.format()
+                    ),
+                    DiagnosticKind::Advice,
+                    b_span.clone().merge(span.clone()),
+                );
             }
+            // Flip monadic dup diagnostic
+            if let (
+                Some(PrevWord(Some(Primitive::Dup), _, a_span)),
+                Some(PrevWord(
+                    _,
+                    Some(Signature {
+                        args: 1,
+                        outputs: 1,
+                    }),
+                    _,
+                )),
+                Some(Primitive::Flip),
+            ) = (a, &b, prim)
+            {
+                self.emit_diagnostic(
+                    format!(
+                        "Prefer {} over {} {} here",
+                        Primitive::On,
+                        Primitive::Flip,
+                        Primitive::Dup
+                    ),
+                    DiagnosticKind::Style,
+                    a_span.merge(span.clone()),
+                );
+            }
+
+            let start = self.new_functions.last().unwrap().len();
+
+            // Compile the word
             self.word(word, call)?;
+
+            let new_functions = self.new_functions.last().unwrap();
+            let sig = if new_functions.len() >= start {
+                instrs_signature(&new_functions[start..]).ok()
+            } else {
+                None
+            };
+            a = b;
+            b = Some(PrevWord(prim, sig, span));
         }
         Ok(())
     }
@@ -776,7 +851,7 @@ code:
                 if call {
                     self.push_instr(Instr::push(n));
                 } else {
-                    let f = self.add_function(
+                    let f = self.make_function(
                         FunctionId::Anonymous(word.span.clone()),
                         Signature::new(0, 1),
                         vec![Instr::push(n)],
@@ -793,7 +868,7 @@ code:
                 if call {
                     self.push_instr(Instr::push(val));
                 } else {
-                    let f = self.add_function(
+                    let f = self.make_function(
                         FunctionId::Anonymous(word.span.clone()),
                         Signature::new(0, 1),
                         vec![Instr::push(val)],
@@ -805,7 +880,7 @@ code:
                 if call {
                     self.push_instr(Instr::push(s));
                 } else {
-                    let f = self.add_function(
+                    let f = self.make_function(
                         FunctionId::Anonymous(word.span.clone()),
                         Signature::new(0, 1),
                         vec![Instr::push(s)],
@@ -828,7 +903,7 @@ code:
                 if call {
                     self.push_instr(instr);
                 } else {
-                    let f = self.add_function(
+                    let f = self.make_function(
                         FunctionId::Anonymous(word.span),
                         Signature::new(1, 1),
                         vec![instr],
@@ -844,8 +919,11 @@ code:
                 if call {
                     self.push_instr(instr)
                 } else {
-                    let f =
-                        self.add_function(FunctionId::Anonymous(word.span), signature, vec![instr]);
+                    let f = self.make_function(
+                        FunctionId::Anonymous(word.span),
+                        signature,
+                        vec![instr],
+                    );
                     self.push_instr(Instr::PushFunc(f));
                 }
             }
@@ -873,19 +951,22 @@ code:
                 if call {
                     self.push_instr(instr)
                 } else {
-                    let f =
-                        self.add_function(FunctionId::Anonymous(word.span), signature, vec![instr]);
+                    let f = self.make_function(
+                        FunctionId::Anonymous(word.span),
+                        signature,
+                        vec![instr],
+                    );
                     self.push_instr(Instr::PushFunc(f));
                 }
             }
             Word::Ref(r) => self.reference(r, call)?,
-            Word::IncompleteRef(comps) => {
-                if let Some((_, locals)) = self.ref_path(&comps)? {
+            Word::IncompleteRef { path, in_macro_arg } => {
+                if let Some((_, locals)) = self.ref_path(&path, in_macro_arg)? {
                     self.add_error(
-                        comps.last().unwrap().tilde_span.clone(),
+                        path.last().unwrap().tilde_span.clone(),
                         "Incomplete module reference",
                     );
-                    for (local, comp) in locals.iter().zip(comps) {
+                    for (local, comp) in locals.iter().zip(path) {
                         self.validate_local(&comp.module.value, *local, &comp.module.span);
                         self.code_meta
                             .global_references
@@ -897,6 +978,8 @@ code:
                 }
             }
             Word::Strand(items) => {
+                // Track span for LSP
+                let just_spans: Vec<_> = items.iter().map(|w| w.span.clone()).collect();
                 // Compile individual items
                 let op_instrs = items
                     .into_iter()
@@ -913,6 +996,7 @@ code:
                         to make a function strand.",
                     ));
                 }
+                self.code_meta.strands.insert(word.span.clone(), just_spans);
                 // Flatten instrs
                 let inner: Vec<Instr> = op_instrs
                     .into_iter()
@@ -941,13 +1025,13 @@ code:
                 let instrs = self.new_functions.last_mut().unwrap();
                 // Inline constant arrays
                 if call && inner.iter().all(|instr| matches!(instr, Instr::Push(_))) {
-                    instrs.pop();
                     let values = inner.iter().rev().map(|instr| match instr {
                         Instr::Push(v) => v.clone(),
                         _ => unreachable!(),
                     });
                     match Value::from_row_values(values, &(&word.span, &self.asm.inputs)) {
                         Ok(val) => {
+                            instrs.pop();
                             self.push_instr(Instr::push(val));
                             return Ok(());
                         }
@@ -964,11 +1048,24 @@ code:
                 if !call {
                     let instrs = self.new_functions.pop().unwrap();
                     let sig = instrs_signature(&instrs).unwrap();
-                    let func = self.add_function(FunctionId::Anonymous(word.span), sig, instrs);
+                    let func = self.make_function(FunctionId::Anonymous(word.span), sig, instrs);
                     self.push_instr(Instr::PushFunc(func));
                 }
             }
             Word::Array(arr) => {
+                // Track span for LSP
+                if !arr.boxes
+                    && (arr.lines.iter().flatten())
+                        .filter(|w| w.value.is_code())
+                        .all(|w| w.value.is_literal() && !matches!(w.value, Word::Strand(_)))
+                {
+                    let just_spans: Vec<_> = (arr.lines.iter().rev().flatten())
+                        .filter(|w| w.value.is_code())
+                        .map(|w| w.span.clone())
+                        .collect();
+                    self.code_meta.arrays.insert(word.span.clone(), just_spans);
+                }
+
                 if !call {
                     self.new_functions.push(EcoVec::new());
                 }
@@ -977,6 +1074,32 @@ code:
                 let line_count = arr.lines.len();
                 for lines in arr.lines.into_iter().rev() {
                     inner.extend(self.compile_words(lines, true)?);
+                }
+                // Validate inner loop correctness
+                if let Err(e) = instrs_signature(&inner) {
+                    let sig = (0..=inner.len())
+                        .find_map(|i| instrs_signature(&inner[i..]).ok())
+                        .unwrap();
+                    match e.kind {
+                        SigCheckErrorKind::LoopExcess if sig.args > 0 => self.emit_diagnostic(
+                            format!(
+                                "This array contains a loop that has a variable \
+                                number of outputs. The code after the loop has \
+                                signature {sig}, which may result in a variable \
+                                number of values being pulled into the array."
+                            ),
+                            DiagnosticKind::Warning,
+                            word.span.clone(),
+                        ),
+                        SigCheckErrorKind::LoopOverreach => self.emit_diagnostic(
+                            "This array contains a loop that has a variable \
+                            number of inputs. This may result in a variable \
+                            number of values being pulled into the array.",
+                            DiagnosticKind::Warning,
+                            word.span.clone(),
+                        ),
+                        _ => {}
+                    }
                 }
                 // Diagnostic for array of characters
                 if line_count <= 1
@@ -1032,7 +1155,7 @@ code:
                 if !call {
                     let instrs = self.new_functions.pop().unwrap();
                     let sig = instrs_signature(&instrs).unwrap_or(Signature::new(0, 0));
-                    let func = self.add_function(FunctionId::Anonymous(word.span), sig, instrs);
+                    let func = self.make_function(FunctionId::Anonymous(word.span), sig, instrs);
                     self.push_instr(Instr::PushFunc(func));
                 }
             }
@@ -1058,7 +1181,7 @@ code:
                     match instrs_signature(&instrs) {
                         Ok(sig) => {
                             let func =
-                                self.add_function(FunctionId::Anonymous(word.span), sig, instrs);
+                                self.make_function(FunctionId::Anonymous(word.span), sig, instrs);
                             self.push_instr(Instr::PushFunc(func));
                         }
                         Err(e) => {
@@ -1066,7 +1189,7 @@ code:
                                 word.span,
                                 format!(
                                     "Cannot infer function signature: {e}{}",
-                                    if e.ambiguous {
+                                    if e.kind == SigCheckErrorKind::Ambiguous {
                                         ". A signature can be declared after the opening `(`."
                                     } else {
                                         ""
@@ -1079,7 +1202,19 @@ code:
             }
             Word::Func(func) => self.func(func, word.span, call)?,
             Word::Switch(sw) => self.switch(sw, word.span, call)?,
-            Word::Primitive(p) => self.primitive(p, word.span, call),
+            Word::Primitive(p) => self.primitive(p, word.span, call)?,
+            Word::SemicolonPop => {
+                self.emit_diagnostic(
+                    format!(
+                        "Using `;` for {} is deprecated and will be \
+                        removed in the future. Type `pop` or `po` instead.",
+                        Primitive::Pop.format()
+                    ),
+                    DiagnosticKind::Warning,
+                    word.span.clone(),
+                );
+                self.primitive(Primitive::Pop, word.span, call)?
+            }
             Word::Modified(m) => self.modified(*m, call)?,
             Word::Placeholder(_) => {
                 // We could error here, but it's easier to handle it higher up
@@ -1090,7 +1225,7 @@ code:
                     if call {
                         self.push_instr(Instr::NoInline);
                     } else {
-                        let f = self.add_function(
+                        let f = self.make_function(
                             FunctionId::Anonymous(word.span.clone()),
                             Signature::new(0, 0),
                             vec![Instr::NoInline],
@@ -1108,7 +1243,7 @@ code:
         Ok(())
     }
     fn ref_local(&self, r: &Ref) -> UiuaResult<(Vec<LocalName>, LocalName)> {
-        if let Some((module, path_locals)) = self.ref_path(&r.path)? {
+        if let Some((module, path_locals)) = self.ref_path(&r.path, r.in_macro_arg)? {
             if let Some(local) = self.imports[&module].names.get(&r.name.value).copied() {
                 Ok((path_locals, local))
             } else {
@@ -1121,8 +1256,8 @@ code:
                     ),
                 ))
             }
-        } else if let Some(local) = self.scope.names.get(&r.name.value) {
-            Ok((Vec::new(), *local))
+        } else if let Some(local) = self.find_name(&r.name.value, r.in_macro_arg) {
+            Ok((Vec::new(), local))
         } else {
             Err(self.fatal_error(
                 r.name.span.clone(),
@@ -1130,16 +1265,37 @@ code:
             ))
         }
     }
-    fn ref_path(&self, path: &[RefComponent]) -> UiuaResult<Option<(PathBuf, Vec<LocalName>)>> {
+    fn find_name(&self, name: &str, skip_local: bool) -> Option<LocalName> {
+        if !skip_local {
+            if let Some(local) = self.scope.names.get(name).copied() {
+                return Some(local);
+            }
+        }
+        let mut hit_file = false;
+        for scope in self.higher_scopes.iter().rev() {
+            if scope.kind == ScopeKind::File {
+                if hit_file || self.scope.kind == ScopeKind::File {
+                    break;
+                }
+                hit_file = true;
+            }
+            if let Some(local) = scope.names.get(name).copied() {
+                return Some(local);
+            }
+        }
+        None
+    }
+    fn ref_path(
+        &self,
+        path: &[RefComponent],
+        skip_local: bool,
+    ) -> UiuaResult<Option<(PathBuf, Vec<LocalName>)>> {
         let Some(first) = path.first() else {
             return Ok(None);
         };
         let mut path_locals = Vec::new();
         let module_local = self
-            .scope
-            .names
-            .get(&first.module.value)
-            .copied()
+            .find_name(&first.module.value, skip_local)
             .ok_or_else(|| {
                 self.fatal_error(
                     first.module.span.clone(),
@@ -1147,22 +1303,22 @@ code:
                 )
             })?;
         path_locals.push(module_local);
-        let global = &self.asm.bindings[module_local.index].global;
+        let global = &self.asm.bindings[module_local.index].kind;
         let mut module = match global {
-            Global::Module(module) => module,
-            Global::Func(_) => {
+            BindingKind::Module(module) => module,
+            BindingKind::Func(_) => {
                 return Err(self.fatal_error(
                     first.module.span.clone(),
                     format!("`{}` is a function, not a module", first.module.value),
                 ))
             }
-            Global::Const(_) => {
+            BindingKind::Const(_) => {
                 return Err(self.fatal_error(
                     first.module.span.clone(),
                     format!("`{}` is a constant, not a module", first.module.value),
                 ))
             }
-            Global::Macro => {
+            BindingKind::Macro => {
                 return Err(self.fatal_error(
                     first.module.span.clone(),
                     format!("`{}` is a modifier, not a module", first.module.value),
@@ -1185,22 +1341,22 @@ code:
                     )
                 })?;
             path_locals.push(submod_local);
-            let global = &self.asm.bindings[submod_local.index].global;
+            let global = &self.asm.bindings[submod_local.index].kind;
             module = match global {
-                Global::Module(module) => module,
-                Global::Func(_) => {
+                BindingKind::Module(module) => module,
+                BindingKind::Func(_) => {
                     return Err(self.fatal_error(
                         comp.module.span.clone(),
                         format!("`{}` is a function, not a module", comp.module.value),
                     ))
                 }
-                Global::Const(_) => {
+                BindingKind::Const(_) => {
                     return Err(self.fatal_error(
                         comp.module.span.clone(),
                         format!("`{}` is a constant, not a module", comp.module.value),
                     ))
                 }
-                Global::Macro => {
+                BindingKind::Macro => {
                     return Err(self.fatal_error(
                         comp.module.span.clone(),
                         format!("`{}` is a modifier, not a module", comp.module.value),
@@ -1213,7 +1369,7 @@ code:
     }
     fn reference(&mut self, r: Ref, call: bool) -> UiuaResult {
         if r.path.is_empty() {
-            self.ident(r.name.value, r.name.span, call)
+            self.ident(r.name.value, r.name.span, call, r.in_macro_arg)
         } else {
             let (path_locals, local) = self.ref_local(&r)?;
             self.validate_local(&r.name.value, local, &r.name.span);
@@ -1228,7 +1384,7 @@ code:
             Ok(())
         }
     }
-    fn ident(&mut self, ident: Ident, span: CodeSpan, call: bool) -> UiuaResult {
+    fn ident(&mut self, ident: Ident, span: CodeSpan, call: bool, skip_local: bool) -> UiuaResult {
         if let Some(curr) = (self.current_binding.as_mut()).filter(|curr| curr.name == ident) {
             // Name is a recursive call
             let Some(sig) = curr.signature else {
@@ -1246,7 +1402,7 @@ code:
             if call {
                 self.push_all_instrs([Instr::PushSig(sig), instr, Instr::PopSig]);
             } else {
-                let f = self.add_function(FunctionId::Anonymous(span), sig, [instr]);
+                let f = self.make_function(FunctionId::Anonymous(span), sig, [instr]);
                 self.push_instr(Instr::PushFunc(f));
             }
         } else if !self.scope.bind_locals.is_empty()
@@ -1259,10 +1415,7 @@ code:
                 self.scope.bind_locals.last_mut().unwrap().insert(index);
                 self.push_instr(Instr::GetLocal { index, span });
             }
-        } else if let Some(local) = (self.scope.names.get(&ident))
-            .or_else(|| self.higher_scopes.last()?.names.get(&ident))
-            .copied()
-        {
+        } else if let Some(local) = self.find_name(&ident, skip_local) {
             // Name exists in scope
             (self.code_meta.global_references).insert(span.clone().sp(ident), local.index);
             self.global_index(local.index, span, call);
@@ -1275,7 +1428,7 @@ code:
             if call {
                 self.push_instr(instr);
             } else {
-                let f = self.add_function(
+                let f = self.make_function(
                     FunctionId::Anonymous(span),
                     Signature::new(0, 1),
                     vec![instr],
@@ -1288,27 +1441,27 @@ code:
         Ok(())
     }
     fn global_index(&mut self, index: usize, span: CodeSpan, call: bool) {
-        let global = self.asm.bindings[index].global.clone();
+        let global = self.asm.bindings[index].kind.clone();
         match global {
-            Global::Const(Some(val)) if call => self.push_instr(Instr::push(val)),
-            Global::Const(Some(val)) => {
-                let f = self.add_function(
+            BindingKind::Const(Some(val)) if call => self.push_instr(Instr::push(val)),
+            BindingKind::Const(Some(val)) => {
+                let f = self.make_function(
                     FunctionId::Anonymous(span),
                     Signature::new(0, 1),
                     vec![Instr::push(val)],
                 );
                 self.push_instr(Instr::PushFunc(f));
             }
-            Global::Const(None) if call => self.push_instr(Instr::CallGlobal { index, call }),
-            Global::Const(None) => {
-                let f = self.add_function(
+            BindingKind::Const(None) if call => self.push_instr(Instr::CallGlobal { index, call }),
+            BindingKind::Const(None) => {
+                let f = self.make_function(
                     FunctionId::Anonymous(span),
                     Signature::new(0, 1),
                     vec![Instr::CallGlobal { index, call }],
                 );
                 self.push_instr(Instr::PushFunc(f));
             }
-            Global::Func(f) if self.inlinable(f.instrs(self)) => {
+            BindingKind::Func(f) if self.inlinable(f.instrs(self)) => {
                 if call {
                     // Inline instructions
                     self.push_instr(Instr::PushSig(f.signature()));
@@ -1319,15 +1472,15 @@ code:
                     self.push_instr(Instr::PushFunc(f));
                 }
             }
-            Global::Func(f) => {
+            BindingKind::Func(f) => {
                 self.push_instr(Instr::PushFunc(f));
                 if call {
                     let span = self.add_span(span);
                     self.push_instr(Instr::Call(span));
                 }
             }
-            Global::Module { .. } => self.add_error(span, "Cannot import module item here."),
-            Global::Macro => {
+            BindingKind::Module { .. } => self.add_error(span, "Cannot import module item here."),
+            BindingKind::Macro => {
                 // We could error here, but it's easier to handle it higher up
             }
         }
@@ -1362,7 +1515,7 @@ code:
             return Ok(Function::clone(f));
         }
 
-        Ok(self.add_function(id, sig, instrs))
+        Ok(self.make_function(id, sig, instrs))
     }
     fn compile_func_instrs(
         &mut self,
@@ -1400,7 +1553,7 @@ code:
                         span,
                         format!(
                             "Cannot infer function signature: {e}{}",
-                            if e.ambiguous {
+                            if e.kind == SigCheckErrorKind::Ambiguous {
                                 ". A signature can be declared after the opening `(`."
                             } else {
                                 ""
@@ -1487,7 +1640,7 @@ code:
                         span,
                         format!(
                             "Cannot infer function signature: {e}{}",
-                            if e.ambiguous {
+                            if e.kind == SigCheckErrorKind::Ambiguous {
                                 ". A signature can be declared after the opening `(`."
                             } else {
                                 ""
@@ -1496,7 +1649,7 @@ code:
                     ));
                 }
             };
-            let function = self.add_function(FunctionId::Anonymous(span), sig, instrs);
+            let function = self.make_function(FunctionId::Anonymous(span), sig, instrs);
             self.push_instr(Instr::PushFunc(function));
         }
         Ok(())
@@ -1537,7 +1690,7 @@ code:
             );
         }
     }
-    fn primitive(&mut self, prim: Primitive, span: CodeSpan, call: bool) {
+    fn primitive(&mut self, prim: Primitive, span: CodeSpan, call: bool) -> UiuaResult {
         self.handle_primitive_experimental(prim, &span);
         self.handle_primitive_deprecation(prim, &span);
         let span_i = self.add_span(span.clone());
@@ -1545,14 +1698,11 @@ code:
             self.push_instr(Instr::Prim(prim, span_i));
         } else {
             let instrs = [Instr::Prim(prim, span_i)];
-            match instrs_signature(&instrs) {
-                Ok(sig) => {
-                    let func = self.add_function(FunctionId::Primitive(prim), sig, instrs);
-                    self.push_instr(Instr::PushFunc(func))
-                }
-                Err(e) => self.add_error(span, format!("Cannot infer function signature: {e}")),
-            }
+            let sig = self.sig_of(&instrs, &span)?;
+            let func = self.make_function(FunctionId::Primitive(prim), sig, instrs);
+            self.push_instr(Instr::PushFunc(func));
         }
+        Ok(())
     }
     fn inlinable(&self, instrs: &[Instr]) -> bool {
         use ImplPrimitive::*;
@@ -1594,12 +1744,9 @@ code:
         kind: DiagnosticKind,
         span: CodeSpan,
     ) {
-        self.diagnostics.insert(Diagnostic::new(
-            message.into(),
-            span,
-            kind,
-            self.asm.inputs.clone(),
-        ));
+        let inputs = self.asm.inputs.clone();
+        self.diagnostics
+            .insert(Diagnostic::new(message.into(), span, kind, inputs));
     }
     fn add_error(&mut self, span: impl Into<Span>, message: impl ToString) {
         let e = UiuaError::Run(
@@ -1638,7 +1785,7 @@ code:
         let signature = signature.into();
         let index = self.asm.dynamic_functions.len();
         self.asm.dynamic_functions.push(Arc::new(f));
-        self.add_function(
+        self.make_function(
             FunctionId::Unnamed,
             signature,
             vec![Instr::Dynamic(DynamicFunction { index, signature })],
@@ -1675,12 +1822,12 @@ code:
     }
     #[must_use]
     fn pre_eval_instrs(&mut self, instrs: EcoVec<Instr>) -> (EcoVec<Instr>, Vec<UiuaError>) {
-        use Primitive::*;
         let mut errors = Vec::new();
         let instrs = optimize_instrs(instrs, true, &self.asm);
-        if self.scope.fill
-            || self.pre_eval_mode == PreEvalMode::Lazy
+        if self.pre_eval_mode == PreEvalMode::Lazy
             || instrs.iter().all(|instr| matches!(instr, Instr::Push(_)))
+            || (instrs.iter())
+                .any(|instr| matches!(instr, Instr::PushLocals { .. } | Instr::PopLocals))
         {
             return (instrs, errors);
         }
@@ -1689,33 +1836,7 @@ code:
         'start: while start < instrs.len() {
             for end in (start + 1..=instrs.len()).rev() {
                 let section = &instrs[start..end];
-                let begin_array_pos =
-                    (section.iter()).position(|instr| matches!(instr, Instr::BeginArray));
-                let begin_array_count = section
-                    .iter()
-                    .filter(|instr| matches!(instr, Instr::BeginArray))
-                    .count();
-                let end_array_pos =
-                    (section.iter()).position(|instr| matches!(instr, Instr::EndArray { .. }));
-                let end_array_count = section
-                    .iter()
-                    .filter(|instr| matches!(instr, Instr::EndArray { .. }))
-                    .count();
-                let array_allowed = begin_array_count == end_array_count
-                    && match (begin_array_pos, end_array_pos) {
-                        (Some(0), Some(end)) => end == section.len() - 1,
-                        (None, None) => true,
-                        _ => false,
-                    };
-                if !array_allowed
-                    || matches!(
-                        section.last().unwrap(),
-                        Instr::PushFunc(_) | Instr::BeginArray
-                    )
-                    || section.iter().all(|instr| matches!(instr, Instr::Push(_)))
-                    || (section.iter())
-                        .any(|instr| matches!(instr, Instr::Prim(SetInverse | SetUnder, _)))
-                {
+                if !instrs_can_pre_eval(section, &self.asm) {
                     continue;
                 }
                 if instrs_are_pure(section, &self.asm)
@@ -1810,6 +1931,66 @@ code:
             }
         })
     }
+    fn sig_of(&self, instrs: &[Instr], span: &CodeSpan) -> UiuaResult<Signature> {
+        instrs_signature(instrs).map_err(|e| {
+            self.fatal_error(
+                span.clone(),
+                format!("Cannot infer function signature: {e}"),
+            )
+        })
+    }
+}
+
+fn instrs_can_pre_eval(instrs: &[Instr], asm: &Assembly) -> bool {
+    use Primitive::*;
+    if instrs.is_empty() {
+        return true;
+    }
+    // Begin and end array instructions must be balanced
+    let begin_array_pos = (instrs.iter()).position(|instr| matches!(instr, Instr::BeginArray));
+    let begin_array_count = (instrs.iter())
+        .filter(|instr| matches!(instr, Instr::BeginArray))
+        .count();
+    let end_array_pos = (instrs.iter()).position(|instr| matches!(instr, Instr::EndArray { .. }));
+    let end_array_count = (instrs.iter())
+        .filter(|instr| matches!(instr, Instr::EndArray { .. }))
+        .count();
+    let array_allowed = begin_array_count == end_array_count
+        && match (begin_array_pos, end_array_pos) {
+            (Some(0), Some(end)) => end == instrs.len() - 1,
+            (None, None) => true,
+            _ => false,
+        };
+    // Local instructions must be balanced
+    let locals_allowed = (instrs.iter())
+        .position(|instr| matches!(instr, Instr::PushLocals { .. }))
+        .map_or(true, |pos| {
+            pos == 0 && instrs.ends_with(&[Instr::PopLocals])
+        });
+    if !array_allowed
+        || !locals_allowed
+        || matches!(
+            instrs.last().unwrap(),
+            Instr::PushFunc(_) | Instr::BeginArray
+        )
+        || instrs.iter().all(|instr| matches!(instr, Instr::Push(_)))
+        || instrs.iter().any(|instr| {
+            matches!(
+                instr,
+                Instr::Prim(SetInverse | SetUnder, _) | Instr::ImplPrim(ImplPrimitive::UnPop, _)
+            )
+        })
+    {
+        return false;
+    }
+    for instr in instrs {
+        if let Instr::PushFunc(f) = instr {
+            if !instrs_can_pre_eval(f.instrs(asm), asm) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn words_look_pervasive(words: &[Sp<Word>]) -> bool {
@@ -1832,24 +2013,16 @@ fn collect_placeholder(words: &[Sp<Word>]) -> Vec<Sp<PlaceholderOp>> {
         match &word.value {
             Word::Placeholder(op) => ops.push(word.span.clone().sp(*op)),
             Word::Strand(items) => ops.extend(collect_placeholder(items)),
-            Word::Array(arr) => {
-                for line in &arr.lines {
-                    ops.extend(collect_placeholder(line));
-                }
-            }
-            Word::Func(func) => {
-                for line in &func.lines {
-                    ops.extend(collect_placeholder(line));
-                }
-            }
+            Word::Array(arr) => arr.lines.iter().for_each(|line| {
+                ops.extend(collect_placeholder(line));
+            }),
+            Word::Func(func) => func.lines.iter().for_each(|line| {
+                ops.extend(collect_placeholder(line));
+            }),
             Word::Modified(m) => ops.extend(collect_placeholder(&m.operands)),
-            Word::Switch(sw) => {
-                for branch in &sw.branches {
-                    for line in &branch.value.lines {
-                        ops.extend(collect_placeholder(line));
-                    }
-                }
-            }
+            Word::Switch(sw) => sw.branches.iter().for_each(|branch| {
+                (branch.value.lines.iter()).for_each(|line| ops.extend(collect_placeholder(line)))
+            }),
             _ => {}
         }
     }
@@ -1857,30 +2030,37 @@ fn collect_placeholder(words: &[Sp<Word>]) -> Vec<Sp<PlaceholderOp>> {
 }
 
 fn replace_placeholders(words: &mut Vec<Sp<Word>>, next: &mut dyn FnMut() -> Sp<Word>) {
-    for word in &mut *words {
+    recurse_words(words, &mut |word| match &mut word.value {
+        Word::Placeholder(PlaceholderOp::Call) => *word = next(),
+        _ => {}
+    });
+    words.retain(|word| !matches!(word.value, Word::Placeholder(_)))
+}
+
+fn set_in_macro_arg(words: &mut Vec<Sp<Word>>) {
+    recurse_words(words, &mut |word| match &mut word.value {
+        Word::Ref(r) => r.in_macro_arg = true,
+        Word::IncompleteRef { in_macro_arg, .. } => *in_macro_arg = true,
+        _ => {}
+    });
+}
+
+fn recurse_words(words: &mut Vec<Sp<Word>>, f: &mut dyn FnMut(&mut Sp<Word>)) {
+    for word in words {
+        f(word);
         match &mut word.value {
-            Word::Placeholder(PlaceholderOp::Call) => *word = next(),
-            Word::Strand(items) => replace_placeholders(items, next),
-            Word::Array(arr) => {
-                for line in &mut arr.lines {
-                    replace_placeholders(line, next);
-                }
-            }
-            Word::Func(func) => {
-                for line in &mut func.lines {
-                    replace_placeholders(line, next);
-                }
-            }
-            Word::Modified(m) => replace_placeholders(&mut m.operands, next),
-            Word::Switch(sw) => {
-                for branch in &mut sw.branches {
-                    for line in &mut branch.value.lines {
-                        replace_placeholders(line, next);
-                    }
-                }
-            }
+            Word::Strand(items) => recurse_words(items, f),
+            Word::Array(arr) => arr.lines.iter_mut().for_each(|line| {
+                recurse_words(line, f);
+            }),
+            Word::Func(func) => func.lines.iter_mut().for_each(|line| {
+                recurse_words(line, f);
+            }),
+            Word::Modified(m) => recurse_words(&mut m.operands, f),
+            Word::Switch(sw) => sw.branches.iter_mut().for_each(|branch| {
+                (branch.value.lines.iter_mut()).for_each(|line| recurse_words(line, f))
+            }),
             _ => {}
         }
     }
-    words.retain(|word| !matches!(word.value, Word::Placeholder(_)))
 }

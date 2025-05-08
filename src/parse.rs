@@ -523,7 +523,10 @@ impl<'i> Parser<'i> {
                 {
                     let span = start_span.merge(comp.tilde_span.clone());
                     path.push(comp);
-                    return Some(span.sp(Word::IncompleteRef(path)));
+                    return Some(span.sp(Word::IncompleteRef {
+                        path,
+                        in_macro_arg: false,
+                    }));
                 }
                 self.index = checkpoint;
                 return None;
@@ -533,7 +536,11 @@ impl<'i> Parser<'i> {
             name = next;
         }
         let span = start_span.merge(name.span.clone());
-        Some(span.sp(Word::Ref(Ref { name, path })))
+        Some(span.sp(Word::Ref(Ref {
+            name,
+            path,
+            in_macro_arg: false,
+        })))
     }
     fn try_signature(&mut self, initial_token: AsciiToken) -> Option<Sp<Signature>> {
         let start = self.try_exact(initial_token)?;
@@ -688,14 +695,14 @@ impl<'i> Parser<'i> {
         // Collect items
         let mut items = Vec::new();
         while (tokens.iter()).any(|tok| self.try_exact(tok.clone()).is_some()) {
-            let item = match self.try_modified() {
+            let item = match inner(self) {
                 Some(mut item) => {
                     if let Word::Spaces = item.value {
                         if items.is_empty() {
                             break;
                         }
                         self.errors.push(self.expected([Expectation::Term]));
-                        item = match self.try_modified() {
+                        item = match inner(self) {
                             Some(item) => item,
                             None => {
                                 self.errors.push(self.expected([Expectation::Term]));
@@ -928,16 +935,7 @@ impl<'i> Parser<'i> {
         } else if let Some(span) = self.try_exact(Quote2) {
             span.sp(Word::UnbreakLine)
         } else if let Some(span) = self.try_exact(Semicolon) {
-            self.diagnostics.push(Diagnostic::new(
-                format!(
-                    "`;` for {} is deprecated and will be removed in the future",
-                    Primitive::Pop.format(),
-                ),
-                span.clone(),
-                DiagnosticKind::Warning,
-                self.inputs.clone(),
-            ));
-            span.sp(Word::Primitive(Primitive::Pop))
+            span.sp(Word::SemicolonPop)
         } else if let Some(sc) = self.next_token_map(Token::as_semantic_comment) {
             sc.map(Word::SemanticComment)
         } else {

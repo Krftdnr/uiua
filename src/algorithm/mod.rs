@@ -3,15 +3,18 @@
 use std::{
     cmp::Ordering,
     convert::Infallible,
+    fmt,
     hash::{Hash, Hasher},
+    iter,
     mem::size_of,
+    option,
 };
 
 use tinyvec::TinyVec;
 
 use crate::{
-    Array, ArrayValue, CodeSpan, Function, Inputs, Shape, Signature, Span, TempStack, Uiua,
-    UiuaError, UiuaResult, Value,
+    Array, ArrayValue, CodeSpan, ExactDoubleIterator, Function, Inputs, PersistentMeta, Shape,
+    Signature, Span, TempStack, Uiua, UiuaError, UiuaResult, Value,
 };
 
 mod dyadic;
@@ -169,16 +172,8 @@ fn fill_value_shape<C>(
 where
     C: FillContext,
 {
-    // val.generic_mut_shallow(
-    //     |arr| fill_array_shape(arr, target, expand_fixed, ctx),
-    //     |arr| fill_array_shape(arr, target, expand_fixed, ctx),
-    //     |arr| fill_array_shape(arr, target, expand_fixed, ctx),
-    //     |arr| fill_array_shape(arr, target, expand_fixed, ctx),
-    //     |arr| fill_array_shape(arr, target, expand_fixed, ctx),
-    // )
     match val {
         Value::Num(arr) => fill_array_shape(arr, target, expand_fixed, ctx),
-        #[cfg(feature = "bytes")]
         Value::Byte(arr) => {
             *val = op_bytes_retry_fill(
                 arr.clone(),
@@ -626,26 +621,25 @@ pub fn try_(env: &mut Uiua) -> UiuaResult {
             but their signatures are {f_sig} and {handler_sig} respectively."
         )));
     }
+    if handler_sig.args > f_sig.args + 1 {
+        return Err(env.error(format!(
+            "Handler function must have at most one more argument than the tried function, \
+            but their signatures are {handler_sig} and {f_sig} respectively."
+        )));
+    }
     if env.stack_height() < f_sig.args {
         for i in 0..f_sig.args {
             env.pop(i + 1)?;
         }
     }
-    let backup_count = if handler_sig.args == 0 || handler_sig.args == 1 {
-        0
-    } else {
-        handler_sig.args - 1
-    };
-    let backup = env.clone_stack_top(backup_count)?;
+    let backup = env.clone_stack_top(f_sig.args.min(handler_sig.args))?;
     if let Err(e) = env.call_clean_stack(f) {
+        if handler_sig.args > f_sig.args {
+            (env.rt.backend).save_error_color(e.message(), e.report().to_string());
+            env.push(e.value());
+        }
         for val in backup {
             env.push(val);
-        }
-        if handler_sig.args > 0 {
-            env.rt
-                .backend
-                .save_error_color(e.message(), e.report().to_string());
-            env.push(e.value());
         }
         env.call(handler)?;
     }
@@ -668,7 +662,6 @@ fn op_bytes_retry_fill<T, E: FillError>(
 
 /// If a function fails on a byte array because no fill byte is defined,
 /// convert the byte array to a number array and try again.
-#[cfg(feature = "bytes")]
 fn op_bytes_ref_retry_fill<T>(
     bytes: &Array<u8>,
     on_bytes: impl FnOnce(&Array<u8>) -> UiuaResult<T>,
@@ -683,7 +676,6 @@ fn op_bytes_ref_retry_fill<T>(
 
 /// If a function fails on 2 byte arrays because no fill byte is defined,
 /// convert the byte arrays to number arrays and try again.
-#[cfg(feature = "bytes")]
 fn op2_bytes_retry_fill<T, C: FillContext>(
     a: Array<u8>,
     b: Array<u8>,
@@ -735,4 +727,87 @@ impl<'a, T: ArrayValue> Hash for ArrayCmpSlice<'a, T> {
             elem.array_hash(state);
         }
     }
+}
+
+type FixedRows = Vec<
+    Result<iter::Chain<Box<dyn ExactDoubleIterator<Item = Value>>, option::IntoIter<Value>>, Value>,
+>;
+
+struct FixedRowsData {
+    rows: FixedRows,
+    row_count: usize,
+    is_empty: bool,
+    all_scalar: bool,
+    per_meta: PersistentMeta,
+}
+
+fn fixed_rows(
+    prim: impl fmt::Display,
+    sig: Signature,
+    mut args: Vec<Value>,
+    env: &Uiua,
+) -> UiuaResult<FixedRowsData> {
+    for a in 0..args.len() {
+        let a_can_fill = args[a].length_is_fillable(env);
+        for b in a + 1..args.len() {
+            let b_can_fill = args[b].length_is_fillable(env);
+            let mut err = None;
+            if a_can_fill {
+                let b_row_count = args[b].row_count();
+                err = args[a].fill_length_to(b_row_count, env).err();
+            }
+            if err.is_none() && b_can_fill {
+                let a_row_count = args[a].row_count();
+                err = args[b].fill_length_to(a_row_count, env).err();
+            }
+            if err.is_none()
+                && args[a].row_count() != args[b].row_count()
+                && args[a].row_count() != 1
+                && args[b].row_count() != 1
+            {
+                err = Some("");
+            }
+            if let Some(e) = err {
+                return Err(env.error(format!(
+                    "Cannot {prim} arrays with different number of rows, shapes {} and {}{e}",
+                    args[a].shape(),
+                    args[b].shape(),
+                )));
+            }
+        }
+    }
+    let mut row_count = 0;
+    let mut all_scalar = true;
+    let mut all_1 = true;
+    let outputs = sig.outputs;
+    let is_empty = outputs > 0 && args.iter().any(|v| v.row_count() == 0);
+    let mut per_meta = Vec::new();
+    let fixed_rows: FixedRows = args
+        .into_iter()
+        .map(|mut v| {
+            all_scalar = all_scalar && v.rank() == 0;
+            if v.row_count() == 1 {
+                v.unfix();
+                Err(v)
+            } else {
+                let proxy = is_empty.then(|| v.proxy_row(env));
+                row_count = row_count.max(v.row_count());
+                all_1 = false;
+                per_meta.push(v.take_per_meta());
+                Ok(v.into_rows().chain(proxy))
+            }
+        })
+        .collect();
+    if all_1 {
+        row_count = 1;
+    }
+    let per_meta = PersistentMeta::xor_all(per_meta);
+    let row_count = row_count + is_empty as usize;
+    Ok(FixedRowsData {
+        rows: fixed_rows,
+        row_count,
+        is_empty,
+        all_scalar,
+        per_meta,
+    })
 }

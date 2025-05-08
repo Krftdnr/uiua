@@ -217,15 +217,20 @@ pub fn set_font_size(size: &str) {
 pub fn get_autorun() -> bool {
     get_local_var("autorun", || true)
 }
-
 pub fn set_autorun(autorun: bool) {
     set_local_var("autorun", autorun);
+}
+
+pub fn get_autoplay() -> bool {
+    get_local_var("autoplay", || true)
+}
+pub fn set_autoplay(autoplay: bool) {
+    set_local_var("autoplay", autoplay)
 }
 
 pub fn get_show_experimental() -> bool {
     get_local_var("show-experimental", || false)
 }
-
 pub fn set_show_experimental(show_experimental: bool) {
     set_local_var("show-experimental", show_experimental);
     update_style();
@@ -535,7 +540,7 @@ fn set_code_html(id: &str, code: &str) {
             SpanKind::Primitive(prim) => prim_class(prim),
             SpanKind::Number => "number-literal",
             SpanKind::String => "string-literal-span",
-            SpanKind::Comment => "comment-span",
+            SpanKind::Comment | SpanKind::OutputComment => "comment-span",
             SpanKind::Strand => "strand-span",
             _ => "",
         };
@@ -897,6 +902,16 @@ fn run_code_single(code: &str) -> (Vec<OutputItem>, Option<UiuaError>) {
                 _ => {}
             }
         }
+        // Try to convert the value to SVG
+        if let Ok(mut str) = value.as_string(&rt, "") {
+            if str.starts_with("<svg") && str.ends_with("</svg>") {
+                if !str.contains("xmlns") {
+                    str = str.replacen("<svg", "<svg xmlns=\"http://www.w3.org/2000/svg\"", 1);
+                }
+                stack.push(OutputItem::Svg(str));
+                continue;
+            }
+        }
         // Otherwise, just show the value
         let class = if value_count == 1 {
             ""
@@ -1042,9 +1057,9 @@ pub struct ChallengeDef {
 }
 
 #[component]
-pub fn Challenge<'a>(
+pub fn Challenge<'a, P: IntoView + 'static>(
     number: u8,
-    prompt: &'a str,
+    prompt: P,
     example: &'a str,
     answer: &'a str,
     tests: &'a [&'a str],
@@ -1062,15 +1077,10 @@ pub fn Challenge<'a>(
         flip,
         did_init_run: Cell::new(false),
     };
-    let (main_part, rest) = if let Some((a, b)) = prompt.split_once('.') {
-        (a.to_string(), b.to_string())
-    } else {
-        (prompt.to_string(), String::new())
-    };
     view! {
         <div class="challenge">
             <h3>"Challenge "{number}</h3>
-            <p>"Write a program that "<strong>{main_part}</strong>"."{rest}</p>
+            <p>"Write a program that "<strong>{prompt}</strong>"."</p>
             <Editor challenge=def example=default/>
         </div>
     }

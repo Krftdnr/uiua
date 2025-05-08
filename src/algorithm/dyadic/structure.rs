@@ -8,7 +8,6 @@ use std::{
 
 use ecow::EcoVec;
 
-#[cfg(feature = "bytes")]
 use crate::algorithm::{op_bytes_ref_retry_fill, op_bytes_retry_fill};
 use crate::{
     algorithm::FillContext,
@@ -63,7 +62,6 @@ impl Value {
                 }
                 (&arr.shape, index_data)
             }
-            #[cfg(feature = "bytes")]
             Value::Byte(arr) => {
                 let mut index_data = Vec::with_capacity(arr.element_count());
                 for &n in &arr.data {
@@ -84,7 +82,6 @@ impl Value {
         let (index_shape, index_data) = self.as_shaped_indices(env)?;
         Ok(match from {
             Value::Num(a) => Value::Num(a.pick(index_shape, &index_data, env)?),
-            #[cfg(feature = "bytes")]
             Value::Byte(a) => op_bytes_retry_fill(
                 a,
                 |a| a.pick(index_shape, &index_data, env).map(Into::into),
@@ -109,6 +106,7 @@ impl Value {
                     sorted_indices.push((i, index));
                 }
                 sorted_indices.sort_unstable_by_key(|(_, index)| *index);
+                let depth = idx_shape.len() - 2;
                 if sorted_indices.windows(2).any(|w| {
                     let (ai, a) = w[0];
                     let (bi, b) = w[1];
@@ -125,7 +123,7 @@ impl Value {
                         };
                         a == b
                     });
-                    same && self.row(ai) != self.row(bi)
+                    same && self.depth_row(depth, ai) != self.depth_row(depth, bi)
                 }) {
                     return Err(env.error(
                         "Cannot undo pick with duplicate \
@@ -319,7 +317,6 @@ impl Value {
         let index = self.as_ints(env, "Index must be a list of integers")?;
         Ok(match from {
             Value::Num(a) => Value::Num(a.take(&index, env)?),
-            #[cfg(feature = "bytes")]
             Value::Byte(a) => op_bytes_retry_fill(
                 a,
                 |a| a.take(&index, env).map(Into::into),
@@ -335,7 +332,6 @@ impl Value {
         let index = self.as_ints(env, "Index must be a list of integers")?;
         Ok(match from {
             Value::Num(a) => Value::Num(a.drop(&index, env)?),
-            #[cfg(feature = "bytes")]
             Value::Byte(a) => Value::Byte(a.drop(&index, env)?),
             Value::Complex(a) => Value::Complex(a.drop(&index, env)?),
             Value::Char(a) => Value::Char(a.drop(&index, env)?),
@@ -376,16 +372,6 @@ impl Value {
                     b.type_name()
                 ))
             },
-        )
-    }
-    pub(crate) fn undrop(self, from: Self, env: &Uiua) -> UiuaResult<Self> {
-        let index = self.as_ints(env, "Index must be a list of integers")?;
-        from.generic_into(
-            |a| a.undrop(&index, env).map(Into::into),
-            |a| a.undrop(&index, env).map(Into::into),
-            |a| a.undrop(&index, env).map(Into::into),
-            |a| a.undrop(&index, env).map(Into::into),
-            |a| a.undrop(&index, env).map(Into::into),
         )
     }
 }
@@ -730,44 +716,6 @@ impl<T: ArrayValue> Array<T> {
             .collect();
         self.undo_take_impl("drop", "dropped", &index, into, env)
     }
-    fn undrop(mut self, index: &[isize], env: &Uiua) -> UiuaResult<Self> {
-        if self.map_keys().is_some() {
-            return Err(env.error("Cannot undrop from map array"));
-        }
-        if index.len() > self.rank() {
-            return Err(env.error(format!(
-                "Cannot undrop from array of rank {} \
-                with index of length {}",
-                self.rank(),
-                index.len()
-            )));
-        }
-        Ok(match index {
-            [] => self,
-            &[0] => self,
-            &[undropping] => {
-                let fill = env
-                    .scalar_fill::<T>()
-                    .map_err(|e| env.error(format!("Cannot undrop without fill{e}")))?;
-                let abs_undropping = undropping.unsigned_abs();
-                let elem_count = self.shape().row().elements() * abs_undropping;
-                self.data.extend(repeat(fill).take(elem_count));
-                if undropping > 0 {
-                    self.data.as_mut_slice().rotate_right(elem_count);
-                }
-                self.shape[0] += abs_undropping;
-                self
-            }
-            &[undropping, ref sub_index @ ..] => {
-                let mut rows = Vec::with_capacity(self.row_count());
-                for row in self.into_rows() {
-                    rows.push(row.undrop(sub_index, env)?);
-                }
-                let arr = Self::from_row_arrays_infallible(rows);
-                arr.undrop(&[undropping], env)?
-            }
-        })
-    }
 }
 
 impl Value {
@@ -776,7 +724,6 @@ impl Value {
         let (indices_shape, indices_data) = self.as_shaped_indices(env)?;
         Ok(match from {
             Value::Num(a) => a.select(indices_shape, &indices_data, env)?.into(),
-            #[cfg(feature = "bytes")]
             Value::Byte(a) => op_bytes_ref_retry_fill(
                 a,
                 |a| Ok(a.select(indices_shape, &indices_data, env)?.into()),
@@ -788,9 +735,10 @@ impl Value {
         })
     }
     pub(crate) fn undo_select(self, index: Self, into: Self, env: &Uiua) -> UiuaResult<Self> {
-        let (ind_shape, ind) = index.as_shaped_indices(env)?;
+        let (idx_shape, ind) = index.as_shaped_indices(env)?;
         let mut sorted_indices: Vec<_> = ind.iter().copied().enumerate().collect();
         sorted_indices.sort_unstable_by_key(|(_, index)| *index);
+        let depth = idx_shape.len().saturating_sub(1);
         if sorted_indices.windows(2).any(|win| {
             let (ai, a) = win[0];
             let (bi, b) = win[1];
@@ -804,7 +752,7 @@ impl Value {
             } else {
                 into.row_count() - b.unsigned_abs()
             };
-            a == b && self.row(ai) != self.row(bi)
+            a == b && self.depth_row(depth, ai) != self.depth_row(depth, bi)
         }) {
             return Err(env.error(
                 "Cannot undo selection with duplicate \
@@ -813,11 +761,11 @@ impl Value {
         }
         self.generic_bin_into(
             into,
-            |a, b| a.undo_select_impl(ind_shape, &ind, b, env).map(Into::into),
-            |a, b| a.undo_select_impl(ind_shape, &ind, b, env).map(Into::into),
-            |a, b| a.undo_select_impl(ind_shape, &ind, b, env).map(Into::into),
-            |a, b| a.undo_select_impl(ind_shape, &ind, b, env).map(Into::into),
-            |a, b| a.undo_select_impl(ind_shape, &ind, b, env).map(Into::into),
+            |a, b| a.undo_select_impl(idx_shape, &ind, b, env).map(Into::into),
+            |a, b| a.undo_select_impl(idx_shape, &ind, b, env).map(Into::into),
+            |a, b| a.undo_select_impl(idx_shape, &ind, b, env).map(Into::into),
+            |a, b| a.undo_select_impl(idx_shape, &ind, b, env).map(Into::into),
+            |a, b| a.undo_select_impl(idx_shape, &ind, b, env).map(Into::into),
             |a, b| {
                 env.error(format!(
                     "Cannot untake {} into {}",
@@ -944,15 +892,23 @@ impl<T: ArrayValue> Array<T> {
             ));
         }
         if indices_shape.is_empty() {
-            undo_select_inner(once(self.data.as_slice()), indices, &mut into, env)?;
+            if self.shape == into.shape[1.min(into.shape.len())..] {
+                undo_select_same_size(once(self.data.as_slice()), indices, &mut into, env)?;
+            } else {
+                let mut from = self.clone();
+                from.shape.insert(0, 1);
+                into = under_select_different_size(&from, indices, &into, env)?;
+            }
+        } else if self.shape[1..] == into.shape[1..] {
+            undo_select_same_size(self.row_slices(), indices, &mut into, env)?;
         } else {
-            undo_select_inner(self.row_slices(), indices, &mut into, env)?;
+            into = under_select_different_size(self, indices, &into, env)?;
         }
         Ok(into)
     }
 }
 
-fn undo_select_inner<'a, T: ArrayValue>(
+fn undo_select_same_size<'a, T: ArrayValue>(
     row_slices: impl Iterator<Item = &'a [T]>,
     indices: &[isize],
     into: &mut Array<T>,
@@ -992,4 +948,57 @@ fn undo_select_inner<'a, T: ArrayValue>(
         }
     }
     Ok(())
+}
+
+fn under_select_different_size<T: ArrayValue>(
+    from: &Array<T>,
+    indices: &[isize],
+    into: &Array<T>,
+    env: &Uiua,
+) -> UiuaResult<Array<T>> {
+    let mut abs_indices: Vec<usize> = Vec::with_capacity(indices.len());
+    for &index in indices {
+        if index >= 0 {
+            let index = index as usize;
+            if index >= into.row_count() {
+                return Err(env
+                    .error(format!(
+                        "Index {} is out of bounds of length {}",
+                        index,
+                        into.row_count()
+                    ))
+                    .fill());
+            }
+            abs_indices.push(index);
+        } else {
+            let pos_i = (into.row_count() as isize + index) as usize;
+            if pos_i >= into.row_count() {
+                return Err(env
+                    .error(format!(
+                        "Index {} is out of bounds of length {}",
+                        index,
+                        into.row_count()
+                    ))
+                    .fill());
+            }
+            abs_indices.push(pos_i);
+        }
+    }
+    abs_indices.sort_unstable();
+    let mut new_rows = Vec::new();
+    let mut i = 0;
+    let mut from_rows = from.rows();
+    for index in abs_indices {
+        while i < index {
+            new_rows.push(into.row(i));
+            i += 1;
+        }
+        new_rows.extend(from_rows.next().into_iter().flat_map(Array::into_rows));
+        i += 1;
+    }
+    while i < into.row_count() {
+        new_rows.push(into.row(i));
+        i += 1;
+    }
+    Array::from_row_arrays(new_rows, env)
 }

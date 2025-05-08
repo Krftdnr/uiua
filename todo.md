@@ -1,12 +1,18 @@
 # Uiua Todo
 
 - 0.10
-  - Proofread and update tutorial and tour
+  - Release it!
+- 0.11
+  - Non-`|2.1` `reduce`
+  - `un insert` pattern
+  - Allow warnings to be disabled
+  - List-filled `keep`
+  - `duplicate` and `over` patterns
+  - Spatial thinking tutorial/blog
+  - Full HTTPS support
   - System functions
     - Excel
-  - Site pages/tutorials
-    - Style and readability
-    - Git imports
+- Change how functions are compiled so that compiled-out functions don't end up in the assembly
 - Multimedia
   - Sound input
   - Webcam input

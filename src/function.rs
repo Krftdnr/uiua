@@ -14,7 +14,7 @@ use crate::{
     lex::CodeSpan,
     primitive::{ImplPrimitive, Primitive},
     value::Value,
-    Assembly, Global, Ident,
+    Assembly, BindingKind, Ident,
 };
 
 /// A Uiua bytecode instruction
@@ -63,6 +63,11 @@ pub enum Instr {
         parts: EcoVec<EcoString>,
         span: usize,
     },
+    /// Match a format string pattern
+    MatchFormatPattern {
+        parts: EcoVec<EcoString>,
+        span: usize,
+    },
     /// Label an array
     Label {
         label: EcoString,
@@ -101,17 +106,6 @@ pub enum Instr {
         span: usize,
     },
     CopyToTemp {
-        stack: TempStack,
-        count: usize,
-        span: usize,
-    },
-    CopyFromTemp {
-        stack: TempStack,
-        offset: usize,
-        count: usize,
-        span: usize,
-    },
-    DropTemp {
         stack: TempStack,
         count: usize,
         span: usize,
@@ -155,22 +149,10 @@ impl PartialEq for Instr {
             (Self::ImplPrim(a, _), Self::ImplPrim(b, _)) => a == b,
             (Self::Call(a), Self::Call(b)) => a == b,
             (Self::Format { parts: a, .. }, Self::Format { parts: b, .. }) => a == b,
+            (Self::MatchFormatPattern { parts: a, .. }, Self::Format { parts: b, .. }) => a == b,
             (Self::PushFunc(a), Self::PushFunc(b)) => a == b,
             (Self::PushTemp { count: a, .. }, Self::PushTemp { count: b, .. }) => a == b,
             (Self::PopTemp { count: a, .. }, Self::PopTemp { count: b, .. }) => a == b,
-            (
-                Self::CopyFromTemp {
-                    offset: ao,
-                    count: ac,
-                    ..
-                },
-                Self::CopyFromTemp {
-                    offset: bo,
-                    count: bc,
-                    ..
-                },
-            ) => ao == bo && ac == bc,
-            (Self::DropTemp { count: a, .. }, Self::DropTemp { count: b, .. }) => a == b,
             (Self::TouchStack { count: a, .. }, Self::TouchStack { count: b, .. }) => a == b,
             (Self::Comment(a), Self::Comment(b)) => a == b,
             (Self::CallGlobal { index: a, .. }, Self::CallGlobal { index: b, .. }) => a == b,
@@ -229,17 +211,11 @@ impl Hash for Instr {
             Instr::ImplPrim(prim, _) => (4, prim).hash(state),
             Instr::Call(index) => (5, index).hash(state),
             Instr::Format { parts, .. } => (6, parts).hash(state),
+            Instr::MatchFormatPattern { parts, .. } => (28, parts).hash(state),
             Instr::PushFunc(func) => (7, func).hash(state),
             Instr::PushTemp { count, stack, .. } => (8, count, stack).hash(state),
             Instr::PopTemp { count, stack, .. } => (9, count, stack).hash(state),
             Instr::CopyToTemp { count, stack, .. } => (10, count, stack).hash(state),
-            Instr::CopyFromTemp {
-                offset,
-                count,
-                stack,
-                ..
-            } => (11, offset, count, stack).hash(state),
-            Instr::DropTemp { count, stack, .. } => (12, count, stack).hash(state),
             Instr::TouchStack { count, .. } => (13, count).hash(state),
             Instr::Comment(_) => (14, 0).hash(state),
             Instr::CallGlobal { index, call } => (15, index, call).hash(state),
@@ -270,15 +246,6 @@ impl Instr {
         let val = val.into();
         Self::Push(val)
     }
-    pub(crate) fn is_temp(&self) -> bool {
-        matches!(
-            self,
-            Self::PushTemp { .. }
-                | Self::PopTemp { .. }
-                | Self::CopyFromTemp { .. }
-                | Self::DropTemp { .. }
-        )
-    }
     pub(crate) fn is_compile_only(&self) -> bool {
         matches!(self, Self::PushSig(_) | Self::PopSig)
     }
@@ -293,9 +260,9 @@ pub(crate) fn instrs_are_pure(instrs: &[Instr], asm: &Assembly) -> bool {
         match instr {
             Instr::CallGlobal { index, .. } => {
                 if let Some(binding) = asm.bindings.get(*index) {
-                    match &binding.global {
-                        Global::Const(Some(_)) => {}
-                        Global::Func(f) => {
+                    match &binding.kind {
+                        BindingKind::Const(Some(_)) => {}
+                        BindingKind::Func(f) => {
                             if !instrs_are_pure(f.instrs(asm), asm) {
                                 return false;
                             }
@@ -336,9 +303,9 @@ pub(crate) fn instrs_are_limit_bounded(instrs: &[Instr], asm: &Assembly) -> bool
         match instr {
             Instr::CallGlobal { index, .. } => {
                 if let Some(binding) = asm.bindings.get(*index) {
-                    match &binding.global {
-                        Global::Const(Some(_)) => {}
-                        Global::Func(f) => {
+                    match &binding.kind {
+                        BindingKind::Const(Some(_)) => {}
+                        BindingKind::Func(f) => {
                             if !instrs_are_limit_bounded(f.instrs(asm), asm) {
                                 return false;
                             }
@@ -402,6 +369,16 @@ impl fmt::Display for Instr {
                 }
                 write!(f, "\"")
             }
+            Instr::MatchFormatPattern { parts, .. } => {
+                write!(f, "°$\"")?;
+                for (i, part) in parts.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, "_")?
+                    }
+                    write!(f, "{part}")?
+                }
+                write!(f, "\"")
+            }
             Instr::Label { label, .. } => write!(f, "${label}"),
             Instr::Dynamic(df) => write!(f, "{df:?}"),
             Instr::PushLocals { count, .. } => write!(f, "<push {count} locals>"),
@@ -418,16 +395,9 @@ impl fmt::Display for Instr {
             Instr::TouchStack { count, .. } => write!(f, "<touch {count}>"),
             Instr::PushTemp { stack, count, .. } => write!(f, "<push {stack} {count}>"),
             Instr::PopTemp { stack, count, .. } => write!(f, "<pop {stack} {count}>"),
-            Instr::CopyFromTemp {
-                stack,
-                offset,
-                count,
-                ..
-            } => write!(f, "<copy from {stack} {offset}/{count}>"),
             Instr::CopyToTemp { stack, count, .. } => {
                 write!(f, "<copy to {stack} {count}>")
             }
-            Instr::DropTemp { stack, count, .. } => write!(f, "<drop {stack} {count}>"),
             Instr::SetOutputComment { i, n, .. } => write!(f, "<set output comment {i}({n})>"),
             Instr::PushSig(sig) => write!(f, "{sig}"),
             Instr::PopSig => write!(f, "-|"),

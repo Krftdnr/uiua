@@ -35,7 +35,7 @@ pub enum EditorMode {
 }
 
 thread_local! {
-    static ID: Cell<u64> = Cell::new(0);
+    static ID: Cell<u64> = const { Cell::new(0) };
 }
 
 /// An editor for Uiua code
@@ -209,6 +209,22 @@ pub fn Editor<'a>(
             code_text.clone()
         };
 
+        // Update title
+        if let EditorMode::Pad = mode {
+            let title = if let Some(line) = (input.lines())
+                .find(|line| line.starts_with('#') && !line.starts_with("# Experimental!"))
+            {
+                line[1..].trim()
+            } else if let Some(line) = (input.lines())
+                .find(|line| !line.trim().is_empty() && !line.starts_with("# Experimental!"))
+            {
+                line.trim()
+            } else {
+                "Pad"
+            };
+            (window().document().unwrap()).set_title(&format!("Uiua - {title}"));
+        }
+
         // Update URL
         {
             let encoded = url_encode_code(&clean_code());
@@ -224,7 +240,7 @@ pub fn Editor<'a>(
 
         // Run code
         set_output.set(view!(<div class="running-text">"Running"</div>).into_view());
-        let mut allow_autoplay = !matches!(mode, EditorMode::Example);
+        let allow_autoplay = !matches!(mode, EditorMode::Example) && get_autoplay();
         let render_output_item = move |item| match item {
             OutputItem::String(s) => {
                 if s.is_empty() {
@@ -252,12 +268,17 @@ pub fn Editor<'a>(
                 let encoded = STANDARD.encode(bytes);
                 let src = format!("data:audio/wav;base64,{}", encoded);
                 if allow_autoplay {
-                    allow_autoplay = false;
                     view!(<div><audio class="output-audio" controls autoplay src=src/></div>)
                         .into_view()
                 } else {
                     view!(<div><audio class="output-audio" controls src=src/></div>).into_view()
                 }
+            }
+            OutputItem::Svg(s) => {
+                view!(<div><img 
+                    class="output-image" 
+                    src={format!("data:image/svg+xml;utf8, {}", urlencoding::encode(&s))}/>
+                </div>).into_view()
             }
             OutputItem::Report(report) => report_view(&report).into_view(),
             OutputItem::Separator => view!(<div class="output-item"><hr/></div>).into_view(),
@@ -832,6 +853,13 @@ pub fn Editor<'a>(
             "functions#inline-functions",
         ),
         ("⟨⟩", "switch", "", Some(('⟨', '⟩')), "controlflow#switch"),
+        (
+            "‿",
+            "function strand",
+            "strand-span experimental-glyph-button",
+            None,
+            "",
+        ),
         ("¯", "negative (`)", "number-literal", None, ""),
         (
             "@",
@@ -1129,9 +1157,8 @@ pub fn Editor<'a>(
     let toggle_right_to_left = move |_| {
         set_right_to_left(!get_right_to_left());
     };
-    let toggle_autorun = move |_| {
-        set_autorun(!get_autorun());
-    };
+    let toggle_autorun = move |_| set_autorun(!get_autorun());
+    let toggle_autoplay = move |_| set_autoplay(!get_autoplay());
     let toggle_show_experimental = move |_| {
         set_show_experimental(!get_show_experimental());
     };
@@ -1199,6 +1226,13 @@ pub fn Editor<'a>(
                                 type="checkbox"
                                 checked=get_autorun
                                 on:change=toggle_autorun/>
+                        </div>
+                        <div title="Automatically play audio">
+                            "Autoplay audio:"
+                            <input
+                                type="checkbox"
+                                checked=get_autoplay
+                                on:change=toggle_autoplay/>
                         </div>
                         <div title="Show experimental primitive glyphs">
                             "Show experimental:"
@@ -1308,7 +1342,7 @@ pub fn Editor<'a>(
                                 { move || diag_output.get() }
                             </div>
                             <div class="output-wrapper">
-                                <div class="output sized-code">
+                                <div id=format!("output-{id}") class="output sized-code">
                                     { move || output.get() }
                                     {state().challenge.as_ref().map(|chal| {
                                         let intended = chal.intended_answer.clone();

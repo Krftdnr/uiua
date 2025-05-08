@@ -120,14 +120,14 @@ fn run() -> UiuaResult {
                     .with_args(args)
                     .time_instrs(time_instrs);
                 if path.extension().is_some_and(|ext| ext == "uasm") {
-                    let json = match fs::read_to_string(&path) {
+                    let uasm = match fs::read_to_string(&path) {
                         Ok(json) => json,
                         Err(e) => {
                             eprintln!("Failed to read assembly: {e}");
                             return Ok(());
                         }
                     };
-                    let assembly = match serde_json::from_str::<Assembly>(&json) {
+                    let assembly = match Assembly::from_uasm(&uasm) {
                         Ok(assembly) => assembly,
                         Err(e) => {
                             eprintln!("Failed to parse assembly: {e}");
@@ -167,14 +167,8 @@ fn run() -> UiuaResult {
                     .load_file(&path)?
                     .finish();
                 let output = output.unwrap_or_else(|| path.with_extension("uasm"));
-                let json = match serde_json::to_string(&assembly) {
-                    Ok(json) => json,
-                    Err(e) => {
-                        eprintln!("Failed to serialize assembly: {e}");
-                        return Ok(());
-                    }
-                };
-                if let Err(e) = fs::write(output, json) {
+                let uasm = assembly.to_uasm();
+                if let Err(e) = fs::write(output, uasm) {
                     eprintln!("Failed to write assembly: {e}");
                 }
             }
@@ -198,6 +192,7 @@ fn run() -> UiuaResult {
             App::Test {
                 path,
                 formatter_options,
+                args,
             } => {
                 let path = if let Some(path) = path {
                     path
@@ -213,7 +208,9 @@ fn run() -> UiuaResult {
                 let config =
                     FormatConfig::from_source(formatter_options.format_config_source, Some(&path))?;
                 format_file(&path, &config, false)?;
-                let mut rt = Uiua::with_native_sys();
+                let mut rt = Uiua::with_native_sys()
+                    .with_file_path(&path)
+                    .with_args(args);
                 rt.compile_run(|comp| {
                     comp.mode(RunMode::Test)
                         .print_diagnostics(true)
@@ -574,7 +571,7 @@ enum App {
         #[cfg(feature = "audio")]
         #[clap(flatten)]
         audio_options: AudioOptions,
-        #[clap(trailing_var_arg = true)]
+        #[clap(trailing_var_arg = true, help = "Arguments to pass to the program")]
         args: Vec<String>,
     },
     #[clap(about = "Build an assembly (the .uasm format is currently unstable)")]
@@ -591,7 +588,7 @@ enum App {
         #[cfg(feature = "audio")]
         #[clap(flatten)]
         audio_options: AudioOptions,
-        #[clap(trailing_var_arg = true)]
+        #[clap(trailing_var_arg = true, help = "Arguments to pass to the program")]
         args: Vec<String>,
     },
     #[clap(about = "Format and test a file")]
@@ -599,6 +596,8 @@ enum App {
         path: Option<PathBuf>,
         #[clap(flatten)]
         formatter_options: FormatterOptions,
+        #[clap(trailing_var_arg = true, help = "Arguments to pass to the program")]
+        args: Vec<String>,
     },
     #[clap(about = "Run .ua files in the current directory when they change")]
     Watch {
@@ -612,7 +611,7 @@ enum App {
         clear: bool,
         #[clap(long, help = "Read stdin from file")]
         stdin_file: Option<PathBuf>,
-        #[clap(trailing_var_arg = true)]
+        #[clap(trailing_var_arg = true, help = "Arguments to pass to the program")]
         args: Vec<String>,
     },
     #[clap(about = "Format a Uiua file or all files in the current directory")]
@@ -779,9 +778,6 @@ fn update(main: bool, check: bool) {
     if cfg!(feature = "audio") {
         features.push("audio");
     }
-    if cfg!(feature = "bytes") {
-        features.push("bytes");
-    }
     let feature_str;
     if !features.is_empty() {
         args.push("--features");
@@ -897,63 +893,67 @@ fn color_code(code: &str, compiler: &Compiler) -> String {
     let mut colored = String::new();
     let (spans, inputs) = uiua::lsp::spans_with_compiler(code, compiler);
 
-    let noadic = (237, 94, 106);
-    let monadic = (149, 209, 106);
-    let monadic_mod = (240, 195, 111);
-    let dyadic_mod = (204, 107, 233);
-    let dyadic = (84, 176, 252);
+    let noadic = Color::Red;
+    let monadic = Color::Green;
+    let monadic_mod = Color::Yellow;
+    let dyadic_mod = Color::Magenta;
+    let dyadic = Color::Blue;
 
     for span in spans {
-        let (r, g, b) = match span.value {
+        let color = match span.value {
             SpanKind::Primitive(prim) => match prim.class() {
-                PrimClass::Stack => (209, 218, 236),
-                PrimClass::Constant => (237, 94, 36),
+                PrimClass::Stack if prim.modifier_args().is_none() => None,
+                PrimClass::Constant => None,
                 _ => {
                     if let Some(margs) = prim.modifier_args() {
-                        if margs == 1 {
-                            monadic_mod
-                        } else {
-                            dyadic_mod
-                        }
+                        Some(if margs == 1 { monadic_mod } else { dyadic_mod })
                     } else {
                         match prim.args() {
-                            Some(0) => noadic,
-                            Some(1) => monadic,
-                            Some(2) => dyadic,
-                            _ => (255, 255, 255),
+                            Some(0) => Some(noadic),
+                            Some(1) => Some(monadic),
+                            Some(2) => Some(dyadic),
+                            _ => None,
                         }
                     }
                 }
             },
             SpanKind::Ident(Some(docs)) => match docs.kind {
                 BindingDocsKind::Function { sig, .. } => match sig.args {
-                    0 => noadic,
-                    1 => monadic,
-                    2 => dyadic,
-                    _ => (255, 255, 255),
+                    0 => Some(noadic),
+                    1 => Some(monadic),
+                    2 => Some(dyadic),
+                    _ => None,
                 },
-                BindingDocsKind::Modifier(margs) => match margs {
+                BindingDocsKind::Modifier(margs) => Some(match margs {
                     1 => monadic_mod,
                     _ => dyadic_mod,
-                },
-                _ => (255, 255, 255),
+                }),
+                _ => None,
             },
-            SpanKind::String => (32, 249, 252),
-            SpanKind::Number => (255, 136, 68),
-            SpanKind::Comment => (127, 127, 127),
-            SpanKind::Strand => (200, 200, 200),
+            SpanKind::String => Some(Color::Cyan),
+            SpanKind::Number => Some(Color::TrueColor {
+                r: 235,
+                g: 136,
+                b: 68,
+            }),
+            SpanKind::Comment | SpanKind::OutputComment | SpanKind::Strand => {
+                Some(Color::BrightBlack)
+            }
             SpanKind::Ident(None)
             | SpanKind::Label
             | SpanKind::Signature
             | SpanKind::Whitespace
             | SpanKind::Placeholder(_)
             | SpanKind::Delimiter
-            | SpanKind::FuncDelim(_) => (255, 255, 255),
+            | SpanKind::FuncDelim(_) => None,
         };
-        colored.push_str(&format!(
-            "{}",
-            span.span.as_str(&inputs, |s| s.truecolor(r, g, b))
-        ));
+        span.span.as_str(&inputs, |s| {
+            colored.push_str(&if let Some(color) = color {
+                s.color(color).to_string()
+            } else {
+                s.to_string()
+            });
+        })
     }
     colored
 }

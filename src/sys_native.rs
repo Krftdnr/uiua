@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     slice,
-    sync::atomic::{self, AtomicU64},
+    sync::atomic::{self, AtomicBool, AtomicU64},
     thread::sleep,
     time::Duration,
 };
@@ -24,6 +24,7 @@ pub struct NativeSys;
 type Buffered<T> = BufReaderWriterSeq<T>;
 
 struct GlobalNativeSys {
+    output_enabled: AtomicBool,
     next_handle: AtomicU64,
     files: DashMap<Handle, Buffered<File>>,
     child_procs: DashMap<Handle, Child>,
@@ -45,13 +46,13 @@ struct GlobalNativeSys {
 enum SysStream<'a> {
     File(dashmap::mapref::one::RefMut<'a, Handle, Buffered<File>>),
     Child(dashmap::mapref::one::RefMut<'a, Handle, Child>),
-    TcpListener(dashmap::mapref::one::RefMut<'a, Handle, TcpListener>),
     TcpSocket(dashmap::mapref::one::RefMut<'a, Handle, Buffered<TcpStream>>),
 }
 
 impl Default for GlobalNativeSys {
     fn default() -> Self {
         Self {
+            output_enabled: AtomicBool::new(true),
             next_handle: Handle::FIRST_UNRESERVED.0.into(),
             files: DashMap::new(),
             child_procs: DashMap::new(),
@@ -91,8 +92,6 @@ impl GlobalNativeSys {
             SysStream::File(file)
         } else if let Some(child) = self.child_procs.get_mut(&handle) {
             SysStream::Child(child)
-        } else if let Some(listener) = self.tcp_listeners.get_mut(&handle) {
-            SysStream::TcpListener(listener)
         } else if let Some(socket) = self.tcp_sockets.get_mut(&handle) {
             SysStream::TcpSocket(socket)
         } else {
@@ -118,6 +117,12 @@ pub fn set_audio_stream_time_port(port: u16) -> std::io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn set_output_enabled(enabled: bool) -> bool {
+    NATIVE_SYS
+        .output_enabled
+        .swap(enabled, atomic::Ordering::Relaxed)
+}
+
 impl SysBackend for NativeSys {
     fn any(&self) -> &dyn Any {
         self
@@ -126,6 +131,9 @@ impl SysBackend for NativeSys {
         self
     }
     fn print_str_stdout(&self, s: &str) -> Result<(), String> {
+        if !NATIVE_SYS.output_enabled.load(atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
         let mut stdout = stdout().lock();
         stdout.write_all(s.as_bytes()).map_err(|e| e.to_string())?;
         stdout.flush().map_err(|e| e.to_string())
@@ -140,6 +148,9 @@ impl SysBackend for NativeSys {
         _ = stderr().flush();
     }
     fn scan_line_stdin(&self) -> Result<Option<String>, String> {
+        if !NATIVE_SYS.output_enabled.load(atomic::Ordering::Relaxed) {
+            return Ok(None);
+        }
         let mut buffer = Vec::new();
         let mut b = 0u8;
         loop {
@@ -246,7 +257,6 @@ impl SysBackend for NativeSys {
                 buf.truncate(n);
                 buf
             }
-            SysStream::TcpListener(_) => return Err("Cannot read from a tcp listener".to_string()),
             SysStream::TcpSocket(mut socket) => {
                 socket.flush().map_err(|e| e.to_string())?;
                 let mut buf = vec![0; len];
@@ -271,7 +281,6 @@ impl SysBackend for NativeSys {
                     .map_err(|e| e.to_string())?;
                 buf
             }
-            SysStream::TcpListener(_) => return Err("Cannot read from a tcp listener".to_string()),
             SysStream::TcpSocket(mut socket) => {
                 socket.flush().map_err(|e| e.to_string())?;
                 let mut buf = Vec::new();
@@ -297,7 +306,6 @@ impl SysBackend for NativeSys {
             SysStream::Child(mut child) => (child.stdin.as_mut().unwrap())
                 .write_all(conts)
                 .map_err(|e| e.to_string()),
-            SysStream::TcpListener(_) => Err("Cannot write to a tcp listener".to_string()),
             SysStream::TcpSocket(mut socket) => socket.write_all(conts).map_err(|e| e.to_string()),
         }
     }
@@ -480,16 +488,19 @@ impl SysBackend for NativeSys {
         );
         Ok(handle)
     }
-    fn tcp_addr(&self, handle: Handle) -> Result<String, String> {
-        let socket = NATIVE_SYS
+    fn tcp_addr(&self, handle: Handle) -> Result<SocketAddr, String> {
+        NATIVE_SYS
             .tcp_sockets
             .get(&handle)
-            .ok_or_else(|| "Invalid tcp socket handle".to_string())?;
-        Ok(socket
-            .get_ref()
-            .peer_addr()
-            .map_err(|e| e.to_string())?
-            .to_string())
+            .map(|s| s.get_ref().peer_addr())
+            .or_else(|| {
+                NATIVE_SYS
+                    .tcp_listeners
+                    .get(&handle)
+                    .map(|l| l.local_addr())
+            })
+            .ok_or_else(|| "Invalid tcp socket handle".to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()))
     }
     fn tcp_set_non_blocking(&self, handle: Handle, non_blocking: bool) -> Result<(), String> {
         let socket = NATIVE_SYS
@@ -593,39 +604,45 @@ impl SysBackend for NativeSys {
     }
     #[cfg(feature = "https")]
     fn https_get(&self, request: &str, handle: Handle) -> Result<String, String> {
-        let host = NATIVE_SYS
-            .hostnames
-            .get(&handle)
+        use std::io;
+
+        let host = (NATIVE_SYS.hostnames.get(&handle))
             .ok_or_else(|| "Invalid tcp socket handle".to_string())?
-            .to_string();
+            .clone();
         let request = check_http(request.to_string(), &host)?;
 
-        // https://github.com/rustls/rustls/blob/c9cfe3499681361372351a57a00ccd793837ae9c/examples/src/bin/simpleclient.rs
-        static CLIENT_CONFIG: Lazy<std::sync::Arc<rustls::ClientConfig>> = Lazy::new(|| {
-            let mut store = rustls::RootCertStore::empty();
-            store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            rustls::ClientConfig::builder()
-                .with_root_certificates(store)
-                .with_no_client_auth()
-                .into()
-        });
-
-        let mut socket = NATIVE_SYS
-            .tcp_sockets
-            .get_mut(&handle)
+        let mut socket = (NATIVE_SYS.tcp_sockets.get_mut(&handle))
             .ok_or_else(|| "Invalid tcp socket handle".to_string())?;
 
-        let server_name =
-            rustls::pki_types::ServerName::try_from(host).map_err(|e| e.to_string())?;
-        let tcp_stream = socket.get_mut();
-
-        let mut conn = rustls::ClientConnection::new(CLIENT_CONFIG.clone(), server_name)
-            .map_err(|e| e.to_string())?;
-        let mut tls = rustls::Stream::new(&mut conn, tcp_stream);
-        tls.write_all(request.as_bytes())
-            .map_err(|e| e.to_string())?;
         let mut buffer = Vec::new();
-        tls.read_to_end(&mut buffer).map_err(|e| e.to_string())?;
+        if let Ok(443) = socket.get_ref().peer_addr().map(|a| a.port()) {
+            static CLIENT_CONFIG: Lazy<std::sync::Arc<rustls::ClientConfig>> = Lazy::new(|| {
+                let mut store = rustls::RootCertStore::empty();
+                store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(store)
+                    .with_no_client_auth()
+                    .into()
+            });
+
+            let server_name =
+                rustls::pki_types::ServerName::try_from(host).map_err(|e| e.to_string())?;
+            let tcp_stream = socket.get_mut();
+            let mut conn = rustls::ClientConnection::new(CLIENT_CONFIG.clone(), server_name)
+                .map_err(|e| e.to_string())?;
+            let mut tls = rustls::Stream::new(&mut conn, tcp_stream);
+            tls.write_all(request.as_bytes())
+                .map_err(|e| e.to_string())?;
+            match tls.read_to_end(&mut buffer) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        } else {
+            (socket.write_all(request.as_bytes())).map_err(|e| e.to_string())?;
+            socket.read_to_end(&mut buffer).map_err(|e| e.to_string())?;
+        }
+
         let s = String::from_utf8(buffer).map_err(|e| {
             "Error converting HTTP Response to utf-8: ".to_string() + &e.to_string()
         })?;
@@ -645,7 +662,7 @@ impl SysBackend for NativeSys {
             .ffi
             .do_ffi(file, return_ty, name, arg_tys, arg_values)
     }
-    fn load_git_module(&self, url: &str) -> Result<PathBuf, String> {
+    fn load_git_module(&self, url: &str, branch: Option<&str>) -> Result<PathBuf, String> {
         if let Some(path) = NATIVE_SYS.git_paths.get(url) {
             if path.is_err() || path.as_ref().unwrap().exists() {
                 return path.clone();
@@ -659,28 +676,57 @@ impl SysBackend for NativeSys {
         }
         let parent_path = Path::new("uiua-modules").join(repo_owner);
         let path = parent_path.join(repo_name).join("lib.ua");
+        // Early return if the module already exists
         if path.exists() {
             return Ok(path);
         }
+        // Create the parent directory if it doesn't exist
         if !parent_path.exists() {
             fs::create_dir_all(&parent_path).map_err(|e| e.to_string())?;
         }
-        let current_dir = env::current_dir().map_err(|e| e.to_string())?;
+        // Make sure this folder is a git repository
+        let mut child = Command::new("git")
+            .arg("init")
+            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let status = child.wait().map_err(|e| e.to_string())?;
+        if !status.success() {
+            let stderr = child.stderr.as_mut().unwrap();
+            let mut err = String::new();
+            stderr.read_to_string(&mut err).map_err(|e| e.to_string())?;
+            return Err(format!("Failed to initialize git repository: {err}"));
+        }
+
+        // Add submodule
+        let submodule_path = parent_path.join(repo_name);
         let res = (move || {
-            env::set_current_dir(&parent_path).map_err(|e| e.to_string())?;
-            if !Path::new(repo_name).exists() {
-                let status = Command::new("git")
-                    .args(["clone", url])
+            if !submodule_path.exists() {
+                let submod_path = submodule_path.to_string_lossy();
+                let mut args = vec!["submodule", "add", "--force"];
+                if let Some(branch) = branch {
+                    args.push("-b");
+                    args.push(branch);
+                }
+                args.push(url);
+                args.push(&submod_path);
+                let mut child = Command::new("git")
+                    .args(args)
+                    .stderr(Stdio::piped())
+                    .stdout(Stdio::null())
                     .spawn()
-                    .and_then(|mut c| c.wait())
                     .map_err(|e| e.to_string())?;
+                let status = child.wait().map_err(|e| e.to_string())?;
                 if !status.success() {
-                    return Err("Failed to clone git repository".to_string());
+                    let stderr = child.stderr.as_mut().unwrap();
+                    let mut err = String::new();
+                    stderr.read_to_string(&mut err).map_err(|e| e.to_string())?;
+                    return Err(format!("Failed to add submodule: {err}"));
                 }
             }
             Ok(path)
         })();
-        env::set_current_dir(current_dir).map_err(|e| e.to_string())?;
         NATIVE_SYS.git_paths.insert(url.to_string(), res.clone());
         res
     }

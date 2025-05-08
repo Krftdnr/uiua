@@ -142,9 +142,9 @@ uiuisms!(
     /// Check if character is numeric [0-9]
     r#"×⊓≥≤@0,@9 "hi-5!""#,
     /// Check if character is letter [a-zA-Z]
-    r#"↥∩×∩⊓≥≤@a,@z,@A,@Z "oiCu812""#,
+    r#"↥∩×∩⊓≥≤@a,@z,@A,@Z "oiCu812α""#,
     /// Check if character is alphabetic
-    r#"≠0± "oiCu812""#,
+    r#"⌵± "oiCu812α""#,
     /// Check if an array is a palindrome
     r#"≍⇌. "racecar""#,
     /// Convert a number to a string
@@ -247,7 +247,7 @@ uiuisms!(
     "⍜°ℂ¯ +i1",
     /// Cosine
     "∿+η 1",
-    /// Arc tangent
+    /// Tangent
     "÷:°∠ 1",
     /// Factorial
     "/×+1⇡ 5",
@@ -274,7 +274,7 @@ uiuisms!(
     /// Binomial coefficient
     "/×÷¬⟜+¯⇡ 3 5",
     /// Replace all of one element in a list with another
-    "⍜▽◌⊃=∘ [1 5 8 2] 5 3",
+    "⍜▽≡⋅∘=, 5 [1 5 8 5 2] 3",
     /// Boxed powerset
     "⍚▽⋯⇡ⁿ:2⧻⟜¤ [1 5 8 2]",
     /// Irrational number to n terms of continued fraction

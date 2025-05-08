@@ -128,9 +128,14 @@ impl<T: Clone + std::fmt::Debug> Array<T> {
 
         let a_row_shape = &a.shape[a_depth..];
         let b_row_shape = &b.shape[b_depth..];
+        let a_row_len: usize = a_row_shape.iter().product();
+        let b_row_len: usize = b_row_shape.iter().product();
+        if a_row_len == 0 || b_row_len == 0 {
+            return Ok(());
+        }
         for (a, b) in (a.data.as_mut_slice())
-            .chunks_exact_mut(a_row_shape.iter().product())
-            .zip(b.data.as_slice().chunks_exact(b_row_shape.iter().product()))
+            .chunks_exact_mut(a_row_len)
+            .zip(b.data.as_slice().chunks_exact(b_row_len))
         {
             f(a_row_shape, a, b_row_shape, b, ctx)?;
         }
@@ -143,8 +148,8 @@ impl Value {
     pub fn reshape(&mut self, shape: &Self, env: &Uiua) -> UiuaResult {
         let target_shape = shape.as_number_list(
             env,
-            "Shape should be a single natural number \
-                or a list of integers or infinity",
+            "Shape should be a single integer \
+            or a list of integers or infinity",
             |n| n.fract() == 0.0 || n.is_infinite(),
             |n| {
                 if n.is_infinite() {
@@ -158,7 +163,6 @@ impl Value {
             let n = target_shape[0];
             match self {
                 Value::Num(a) => a.reshape_scalar(n),
-                #[cfg(feature = "bytes")]
                 Value::Byte(a) => a.reshape_scalar(n),
                 Value::Complex(a) => a.reshape_scalar(n),
                 Value::Char(a) => a.reshape_scalar(n),
@@ -167,7 +171,6 @@ impl Value {
         } else {
             match self {
                 Value::Num(a) => a.reshape(&target_shape, env),
-                #[cfg(feature = "bytes")]
                 Value::Byte(a) => {
                     if env.num_fill().is_ok() && env.byte_fill().is_err() {
                         let mut arr: Array<f64> = a.convert_ref();
@@ -189,7 +192,7 @@ impl Value {
         if old_shape.as_nat(env, "").is_ok() {
             return Err(env.error("Cannot undo scalar reshae"));
         }
-        let orig_shape = old_shape.as_nats(env, "Shape should be a list of natural numbers")?;
+        let orig_shape = old_shape.as_nats(env, "Shape should be a list of integers")?;
         if orig_shape.iter().product::<usize>() == self.shape().iter().product::<usize>() {
             *self.shape_mut() = Shape::from(orig_shape.as_slice());
             Ok(())
@@ -240,12 +243,8 @@ impl<T: ArrayValue> Array<T> {
     pub fn reshape(&mut self, dims: &[Result<isize, bool>], env: &Uiua) -> UiuaResult {
         let fill = env.scalar_fill::<T>();
         let axes = derive_shape(&self.shape, dims, fill.is_ok(), env)?;
-        if self.is_map()
-            && axes
-                .first()
-                .map_or(true, |&d| d.unsigned_abs() != self.row_count())
-        {
-            return Ok(());
+        if (axes.first()).map_or(true, |&d| d.unsigned_abs() != self.row_count()) {
+            self.take_map_keys();
         }
         let reversed_axes: Vec<usize> = axes
             .iter()
@@ -273,12 +272,13 @@ impl<T: ArrayValue> Array<T> {
                         self.data = cowslice![self.data[0].clone(); target_len];
                     } else {
                         let start = self.data.len();
-                        self.data.modify(|data| {
-                            data.reserve(target_len - data.len());
-                            for i in 0..target_len - start {
-                                data.push(data[i % start].clone());
-                            }
-                        });
+                        let old_data = self.data.clone();
+                        self.data.reserve(target_len - self.data.len());
+                        let additional = target_len - start;
+                        for _ in 0..additional / start {
+                            self.data.extend_from_slice(&old_data);
+                        }
+                        self.data.extend_from_slice(&old_data[..additional % start]);
                     }
                 }
             }
@@ -367,10 +367,8 @@ fn derive_shape(
 impl Value {
     /// `rerank` this value with another
     pub fn rerank(&mut self, rank: &Self, env: &Uiua) -> UiuaResult {
-        if self.is_map() {
-            return Ok(());
-        }
-        let irank = rank.as_int(env, "Rank must be a natural number")?;
+        self.take_map_keys();
+        let irank = rank.as_int(env, "Rank must be an integer")?;
         let shape = self.shape_mut();
         let rank = irank.unsigned_abs();
         if irank >= 0 {
@@ -413,7 +411,7 @@ impl Value {
             }
             return Ok(());
         }
-        let irank = rank.as_int(env, "Rank must be a natural number")?;
+        let irank = rank.as_int(env, "Rank must be an integer")?;
         let orig_shape = orig_shape.as_nats(env, "Shape must be a list of natural numbers")?;
         let rank = irank.unsigned_abs();
         let new_shape: Shape = if irank >= 0 {
@@ -457,7 +455,6 @@ impl Value {
         Ok(if self.rank() == 0 {
             match kept {
                 Value::Num(a) => a.scalar_keep(counts[0]).into(),
-                #[cfg(feature = "bytes")]
                 Value::Byte(a) => a.scalar_keep(counts[0]).into(),
                 Value::Complex(a) => a.scalar_keep(counts[0]).into(),
                 Value::Char(a) => a.scalar_keep(counts[0]).into(),
@@ -466,7 +463,6 @@ impl Value {
         } else {
             match kept {
                 Value::Num(a) => a.list_keep(&counts, env)?.into(),
-                #[cfg(feature = "bytes")]
                 Value::Byte(a) => a.list_keep(&counts, env)?.into(),
                 Value::Complex(a) => a.list_keep(&counts, env)?.into(),
                 Value::Char(a) => a.list_keep(&counts, env)?.into(),
@@ -485,11 +481,11 @@ impl Value {
         }
         kept.generic_bin_into(
             into,
-            |a, b| a.unkeep(&counts, b, env).map(Into::into),
-            |a, b| a.unkeep(&counts, b, env).map(Into::into),
-            |a, b| a.unkeep(&counts, b, env).map(Into::into),
-            |a, b| a.unkeep(&counts, b, env).map(Into::into),
-            |a, b| a.unkeep(&counts, b, env).map(Into::into),
+            |a, b| a.undo_keep(&counts, b, env).map(Into::into),
+            |a, b| a.undo_keep(&counts, b, env).map(Into::into),
+            |a, b| a.undo_keep(&counts, b, env).map(Into::into),
+            |a, b| a.undo_keep(&counts, b, env).map(Into::into),
+            |a, b| a.undo_keep(&counts, b, env).map(Into::into),
             |a, b| env.error(format!("Cannot unkeep {a} array with {b} array")),
         )
     }
@@ -501,13 +497,12 @@ impl<T: ArrayValue> Array<T> {
         // Scalar kept
         if self.rank() == 0 {
             self.shape.push(count);
-            self.data.modify(|data| {
-                let value = data[0].clone();
-                data.clear();
-                for _ in 0..count {
-                    data.push(value.clone());
-                }
-            });
+            let value = self.data[0].clone();
+            self.data.clear();
+            unsafe {
+                self.data
+                    .extend_from_trusted((0..count).map(|_| value.clone()))
+            };
             self.validate_shape();
             return self;
         }
@@ -524,17 +519,16 @@ impl<T: ArrayValue> Array<T> {
         // Keep ≥2 is a repeat
         self.shape[0] *= count;
         let old_data = self.data.clone();
-        self.data.modify(|data| {
-            data.reserve(data.len() * count);
-            for _ in 1..count {
-                data.extend_from_slice(&old_data);
-            }
-        });
+        self.data.reserve(self.data.len() * count);
+        for _ in 1..count {
+            self.data.extend_from_slice(&old_data);
+        }
         self.validate_shape();
         self
     }
     /// `keep` this array with some counts
     pub fn list_keep(mut self, counts: &[usize], env: &Uiua) -> UiuaResult<Self> {
+        self.take_map_keys();
         let mut amount = Cow::Borrowed(counts);
         match amount.len().cmp(&self.row_count()) {
             Ordering::Equal => {}
@@ -542,7 +536,7 @@ impl<T: ArrayValue> Array<T> {
                 Ok(fill) => {
                     if fill < 0.0 || fill.fract() != 0.0 {
                         return Err(env.error(format!(
-                            "Fill value for keep must be a non-negative\
+                            "Fill value for keep must be a non-negative \
                             integer, but it is {fill}"
                         )));
                     }
@@ -563,18 +557,18 @@ impl<T: ArrayValue> Array<T> {
                 return Err(env.error(match env.scalar_fill::<f64>() {
                     Ok(_) => {
                         format!(
-                            "Cannot keep array with shape {} with array of shape {}.\
-                            A fill value is available, but keep can only been filled\
+                            "Cannot keep array with shape {} with array of shape {}. \
+                            A fill value is available, but keep can only been filled \
                             if there are fewer counts than rows.",
                             self.shape(),
-                            FormatShape(amount.as_ref())
+                            FormatShape(&[amount.len()])
                         )
                     }
                     Err(e) => {
                         format!(
                             "Cannot keep array with shape {} with array of shape {}{e}",
                             self.shape(),
-                            FormatShape(amount.as_ref())
+                            FormatShape(&[amount.len()])
                         )
                     }
                 }))
@@ -635,7 +629,7 @@ impl<T: ArrayValue> Array<T> {
         self.validate_shape();
         Ok(self)
     }
-    pub(crate) fn unkeep(self, counts: &[usize], into: Self, env: &Uiua) -> UiuaResult<Self> {
+    fn undo_keep(self, counts: &[usize], into: Self, env: &Uiua) -> UiuaResult<Self> {
         if counts.iter().any(|&n| n > 1) {
             return Err(env.error("Cannot invert keep with non-boolean counts"));
         }
@@ -678,15 +672,10 @@ impl Value {
         b_depth: usize,
         env: &Uiua,
     ) -> UiuaResult<Self> {
-        let by_ints = || {
-            let ints =
-                self.as_integer_array(env, "Rotation amount must be an array of integers")?;
-            if ints.element_count() == 0 {
-                return Err(env.error("Rotation amount cannot be empty"));
-            }
-            Ok(ints)
-        };
-        #[cfg(feature = "bytes")]
+        if self.row_count() == 0 {
+            return Ok(rotated);
+        }
+        let by_ints = || self.as_integer_array(env, "Rotation amount must be an array of integers");
         if env.scalar_fill::<f64>().is_ok() {
             if let Value::Byte(bytes) = &rotated {
                 rotated = bytes.convert_ref::<f64>().into();
@@ -694,7 +683,6 @@ impl Value {
         }
         match &mut rotated {
             Value::Num(a) => a.rotate_depth(by_ints()?, b_depth, a_depth, env)?,
-            #[cfg(feature = "bytes")]
             Value::Byte(a) => a.rotate_depth(by_ints()?, b_depth, a_depth, env)?,
             Value::Complex(a) => a.rotate_depth(by_ints()?, b_depth, a_depth, env)?,
             Value::Char(a) => a.rotate_depth(by_ints()?, b_depth, a_depth, env)?,
@@ -818,7 +806,6 @@ impl Value {
         let size_spec = self.as_ints(env, "Window size must be an integer or list of integers")?;
         Ok(match from {
             Value::Num(a) => a.windows(&size_spec, env)?.into(),
-            #[cfg(feature = "bytes")]
             Value::Byte(a) => a.windows(&size_spec, env)?.into(),
             Value::Complex(a) => a.windows(&size_spec, env)?.into(),
             Value::Char(a) => a.windows(&size_spec, env)?.into(),
@@ -841,11 +828,7 @@ impl<T: ArrayValue> Array<T> {
         }
         let mut size_spec = Vec::with_capacity(isize_spec.len());
         for (d, s) in self.shape.iter().zip(isize_spec) {
-            size_spec.push(if *s >= 0 {
-                *s as usize
-            } else {
-                (*d as isize + 1 + *s).max(0) as usize
-            });
+            size_spec.push(if *s >= 0 { *s } else { *d as isize + 1 + *s });
         }
         // Determine the shape of the windows array
         let mut new_shape = Shape::with_capacity(self.shape.len() + size_spec.len());
@@ -853,19 +836,19 @@ impl<T: ArrayValue> Array<T> {
             self.shape
                 .iter()
                 .zip(&size_spec)
-                .map(|(a, b)| (a + 1).saturating_sub(*b)),
+                .map(|(a, b)| ((*a as isize + 1) - *b).max(0) as usize),
         );
-        new_shape.extend_from_slice(&size_spec);
+        new_shape.extend(size_spec.iter().map(|&s| s.max(0) as usize));
         new_shape.extend_from_slice(&self.shape[size_spec.len()..]);
         // Check if the window size is too large
         for (size, sh) in size_spec.iter().zip(&self.shape) {
-            if *size > *sh {
+            if *size <= 0 || *size > *sh as isize {
                 return Ok(Self::new(new_shape, CowSlice::new()));
             }
         }
         // Make a new window shape with the same rank as the windowed array
         let mut true_size: Vec<usize> = Vec::with_capacity(self.shape.len());
-        true_size.extend(size_spec);
+        true_size.extend(size_spec.iter().map(|&s| s as usize));
         if true_size.len() < self.shape.len() {
             true_size.extend(&self.shape[true_size.len()..]);
         }
@@ -1153,10 +1136,6 @@ impl<T: ArrayValue> Array<T> {
     /// Check which rows of this array are `member`s of another
     pub fn member(&self, of: &Self, env: &Uiua) -> UiuaResult<Array<u8>> {
         let elems = self;
-        if elems.rank() == 0 {
-            let elem = &elems.data[0];
-            return Ok(of.data.iter().any(|of| elem.array_eq(of)).into());
-        }
         let mut arr = match elems.rank().cmp(&of.rank()) {
             Ordering::Equal => {
                 let mut result_data = EcoVec::with_capacity(elems.row_count());
@@ -1178,6 +1157,12 @@ impl<T: ArrayValue> Array<T> {
                 Array::from_row_arrays(rows, env)?
             }
             Ordering::Less => {
+                if !of.shape.ends_with(&elems.shape) {
+                    return Err(env.error(format!(
+                        "Cannot look for array of shape {} in array of shape {}",
+                        self.shape, of.shape
+                    )));
+                }
                 if of.rank() - elems.rank() == 1 {
                     of.rows().any(|r| *elems == r).into()
                 } else {
@@ -1253,57 +1238,54 @@ impl Value {
 
 impl<T: ArrayValue> Array<T> {
     /// Get the `index of` the rows of this array in another
-    pub fn index_of(&self, searched_in: &Array<T>, env: &Uiua) -> UiuaResult<Array<f64>> {
-        let searched_for = self;
-        if searched_for.rank() == 0 {
-            let searched_for = &searched_for.data[0];
-            return Ok(Array::from(
-                searched_in
-                    .data
-                    .iter()
-                    .position(|of| searched_for.array_eq(of))
-                    .unwrap_or(searched_in.row_count()) as f64,
-            ));
-        }
-        Ok(match searched_for.rank().cmp(&searched_in.rank()) {
+    pub fn index_of(&self, haystack: &Array<T>, env: &Uiua) -> UiuaResult<Array<f64>> {
+        let needle = self;
+        Ok(match needle.rank().cmp(&haystack.rank()) {
             Ordering::Equal => {
-                let mut result_data = EcoVec::with_capacity(searched_for.row_count());
-                let mut members = HashMap::with_capacity(searched_in.row_count());
-                for (i, of) in searched_in.row_slices().enumerate() {
+                let mut result_data = EcoVec::with_capacity(needle.row_count());
+                let mut members = HashMap::with_capacity(haystack.row_count());
+                for (i, of) in haystack.row_slices().enumerate() {
                     members.entry(ArrayCmpSlice(of)).or_insert(i);
                 }
-                for elem in searched_for.row_slices() {
+                for elem in needle.row_slices() {
                     result_data.push(
                         members
                             .get(&ArrayCmpSlice(elem))
                             .map(|i| *i as f64)
-                            .unwrap_or(searched_in.row_count() as f64),
+                            .unwrap_or(haystack.row_count() as f64),
                     );
                 }
                 let shape: Shape = self.shape.iter().cloned().take(1).collect();
                 Array::new(shape, result_data)
             }
             Ordering::Greater => {
-                let mut rows = Vec::with_capacity(searched_for.row_count());
-                for elem in searched_for.rows() {
-                    rows.push(elem.index_of(searched_in, env)?);
+                let mut rows = Vec::with_capacity(needle.row_count());
+                for elem in needle.rows() {
+                    rows.push(elem.index_of(haystack, env)?);
                 }
                 Array::from_row_arrays(rows, env)?
             }
             Ordering::Less => {
-                if searched_in.rank() - searched_for.rank() == 1 {
-                    (searched_in
+                if !haystack.shape.ends_with(&needle.shape) {
+                    return Err(env.error(format!(
+                        "Cannot get index of array of shape {} in array of shape {}",
+                        needle.shape(),
+                        haystack.shape()
+                    )));
+                }
+                if haystack.rank() - needle.rank() == 1 {
+                    (haystack
                         .row_slices()
                         .position(|r| {
-                            r.len() == searched_for.data.len()
-                                && r.iter().zip(&searched_for.data).all(|(a, b)| a.array_eq(b))
+                            r.len() == needle.data.len()
+                                && r.iter().zip(&needle.data).all(|(a, b)| a.array_eq(b))
                         })
-                        .unwrap_or(searched_in.row_count()) as f64)
+                        .unwrap_or(haystack.row_count()) as f64)
                         .into()
                 } else {
-                    let mut rows = Vec::with_capacity(searched_in.row_count());
-                    for of in searched_in.rows() {
-                        rows.push(searched_for.index_of(&of, env)?);
+                    let mut rows = Vec::with_capacity(haystack.row_count());
+                    for of in haystack.rows() {
+                        rows.push(needle.index_of(&of, env)?);
                     }
                     Array::from_row_arrays(rows, env)?
                 }

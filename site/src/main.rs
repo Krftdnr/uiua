@@ -320,7 +320,7 @@ pub fn Prim(
     #[prop(optional)] glyph_only: bool,
     #[prop(optional)] hide_docs: bool,
 ) -> impl IntoView {
-    let span_class = prim_class(prim);
+    let symbol_class = format!("prim-glyph {}", prim_class(prim));
     let symbol = prim.to_string();
     let name = if !glyph_only && symbol != prim.name() {
         format!(" {}", prim.name())
@@ -353,23 +353,26 @@ pub fn Prim(
     if title.is_empty() {
         view! {
             <a href=href class="prim-code-a">
-                <code><span class=span_class>{ symbol }</span>{name}</code>
+                <code><span class=symbol_class>{ symbol }</span>{name}</code>
             </a>
         }
     } else {
         view! {
             <a href=href class="prim-code-a">
-                <code class="prim-code" data-title=title><span class=span_class>{ symbol }</span>{name}</code>
+                <code class="prim-code" data-title=title><span class=symbol_class>{ symbol }</span>{name}</code>
             </a>
         }
     }
 }
 
 #[component]
-pub fn Prims<const N: usize>(prims: [Primitive; N]) -> impl IntoView {
+pub fn Prims<const N: usize>(
+    prims: [Primitive; N],
+    #[prop(optional)] show_names: bool,
+) -> impl IntoView {
     prims
         .into_iter()
-        .map(|prim| view!(<Prim prim=prim glyph_only=true/>))
+        .map(|prim| view!(<Prim prim=prim glyph_only={!show_names}/>))
         .collect::<Vec<_>>()
 }
 
@@ -538,12 +541,15 @@ fn site() {
                             continue;
                         };
                         let code = code
+                            .replace("\\\\n", "<escaped-newline>")
+                            .replace("\\n", "\n")
                             .replace("\\\"", "\"")
                             .replace("\\\\", "\\")
-                            .replace("\\n", "\n");
-                        if [uiua::SysOp::AudioPlay, uiua::SysOp::GifShow]
-                            .iter()
-                            .any(|p| code.contains(p.name()))
+                            .replace("<escaped-newline>", "\\n");
+                        if code.contains("\"git:")
+                            || [uiua::SysOp::AudioPlay, uiua::SysOp::GifShow]
+                                .iter()
+                                .any(|p| code.contains(p.name()))
                         {
                             continue;
                         }

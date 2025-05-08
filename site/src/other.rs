@@ -93,7 +93,7 @@ pub fn Technical() -> impl IntoView {
 
         <Hd id="arrays">"Arrays"</Hd>
         <p>"Values on the stack are implemented as Rust "<code>"enum"</code>"s, where each variant contains a different array type."</p>
-        <p>"While the language itself only has 4 types, the interpreter can have 1 extra: a byte array. IO streams and some operations which have boolean results return byte arrays for space efficiency. This optimization is only enabled if the interpreter is built with the "<code>"bytes"</code>" feature."</p>
+        <p>"While the language itself only has 4 types, the interpreter can have 1 extra: a byte array. IO streams and some operations which have boolean results return byte arrays for space efficiency."</p>
         <p>"Array elements are stored in a reference-counted contiguous-memory container I call a "<em>"CowSlice"</em>" or clone-on-write slice. When an array is modified, its data is only copied if it is shared with another array. In addition, pulling out the rows of an array only increments the reference count of the data, and the row arrays have modified shapes and data offsets."</p>
         <p>"Array shapes are stored in a special array type that only allocates when there are more than 3 items."</p>
 
@@ -135,12 +135,14 @@ pub fn Install() -> impl IntoView {
         <p>"This requires a "<a href="https://www.rust-lang.org/tools/install">"Rust"</a>" installation (>=1.75)."</p>
         <p>"Once you have that, run the following command:"</p>
         <code class="code-block">"cargo install uiua"</code>
-        <p>"The following optional features are available (enabled by passing "<code>"--features <feature>"</code>"):"</p>
+        <p>"On Linux, this may require installing some dependencies:"</p>
+        <code class="code-block">"apt install libx11-dev"</code>
+        <p>"The following optional features are available but not enabled by default (enabled by passing "<code>"--features <feature>"</code>"):"</p>
         <ul>
             <li>
                 <p><code>"audio"</code>" - Enables audio system functions."</p>
                 <p>"On Linux, this may require installing some dependencies:"</p>
-                <code class="code-block">"apt install libasound2-dev libudev-dev pkg-config libx11-dev"</code>
+                <code class="code-block">"apt install libasound2-dev libudev-dev pkg-config"</code>
             </li>
         </ul>
         <p>"If you want the most recent development version of Uiua, you can install from the git repository."</p>
@@ -150,7 +152,7 @@ pub fn Install() -> impl IntoView {
         <p>"Uiua supports a few custom fonts, but "<a href="https://github.com/uiua-lang/uiua/raw/main/site/Uiua386.ttf">"Uiua386"</a>" is the primary one."</p>
         <ul>
             <li><a href="https://github.com/uiua-lang/uiua/raw/main/site/Uiua386.ttf">"Uiua386"</a>" - inspired by APL386. Thanks to Gifti for making it!"</li>
-            <li>"Jonathan Perret's"<a href="https://github.com/jonathanperret/uiua386color">"Uiua386Color"</a>" - a colored version of Uiua386"</li>
+            <li>"Jonathan Perret's "<a href="https://github.com/jonathanperret/uiua386color">"Uiua386Color"</a>" - a colored version of Uiua386"</li>
             <li><a href="https://github.com/uiua-lang/uiua/raw/main/site/DejaVuSansMono.ttf">"DejaVuSansMono"</a>" - a modified version"</li>
         </ul>
         <p>"Uiua was originally designed to be used with stock "<a href="https://dejavu-fonts.github.io">"DejaVu Sans Mono"</a>", but further development and glyph choices target Uiua386."</p>
@@ -269,6 +271,7 @@ pub fn Optimizations() -> impl IntoView {
             <tr><th><Prims prims=[Transpose, Transpose, Transpose]/>"…"</th><td><Prim prim=Transpose/>" n times"</td><td>"Single "<Prim prim=Transpose/></td></tr>
             <tr><th><Prims prims=[Rows, Transpose]/></th><td><Prim prim=Transpose/>" each row"</td><td>"Single "<Prim prim=Transpose/></td></tr>
             <tr><th><Prims prims=[Rows, Reduce]/><code>"F"</code><Prims prims=[Windows]/></th><td>"Make "<Prim prim=Windows/>" then "<Prim prim=Reduce/>" each row"</td><td>"Apply "<code>"F"</code>" to adjacent rows"</td></tr>
+            <tr><th><Prims prims=[Rows, Reduce]/><code>"F"</code></th><td><Prim prim=Reduce/>" each row"</td><td><Prim prim=Reduce/>" each column"</td></tr>
         </table>
     }
 }

@@ -14,15 +14,11 @@ impl Compiler {
             }) {
                 if let Ok((path_locals, local)) = self.ref_local(r) {
                     self.validate_local(&r.name.value, local, &r.name.span);
-                    self.code_meta
-                        .global_references
-                        .insert(binding.name.clone(), local.index);
+                    (self.code_meta.global_references).insert(binding.name.clone(), local.index);
                     for (local, comp) in path_locals.into_iter().zip(&r.path) {
                         (self.code_meta.global_references).insert(comp.module.clone(), local.index);
                     }
-                    self.code_meta
-                        .global_references
-                        .insert(r.name.clone(), local.index);
+                    (self.code_meta.global_references).insert(r.name.clone(), local.index);
                     self.scope.names.insert(
                         binding.name.value,
                         LocalName {
@@ -56,13 +52,6 @@ impl Compiler {
         let ident_margs = ident_modifier_args(&name);
         if binding.array_macro {
             // Array macro
-            if !self.scope.experimental {
-                self.add_error(
-                    span.clone(),
-                    "Array macros are experimental. To use them, \
-                    add `# Experimental!` to the top of the file.",
-                );
-            }
             if ident_margs == 0 {
                 self.add_error(
                     span.clone(),
@@ -104,10 +93,19 @@ impl Compiler {
                     ),
                 );
             }
-            let func = self.add_function(FunctionId::Named(name.clone()), sig, instrs);
+            let function = self.make_function(FunctionId::Named(name.clone()), sig, instrs);
             self.scope.names.insert(name.clone(), local);
-            (self.asm).add_global_at(local, Global::Macro, Some(span.clone()), comment.clone());
-            self.array_macros.insert(local.index, func);
+            (self.asm).add_global_at(
+                local,
+                BindingKind::Macro,
+                Some(span.clone()),
+                comment.clone(),
+            );
+            let mac = ArrayMacro {
+                function,
+                names: self.scope.names.clone(),
+            };
+            self.array_macros.insert(local.index, mac);
             return Ok(());
         }
         // Stack macro
@@ -136,9 +134,39 @@ impl Compiler {
         }
         if placeholder_count > 0 || ident_margs > 0 {
             self.scope.names.insert(name.clone(), local);
-            self.asm
-                .add_global_at(local, Global::Macro, Some(span.clone()), comment.clone());
-            self.stack_macros.insert(local.index, binding.words.clone());
+            (self.asm).add_global_at(
+                local,
+                BindingKind::Macro,
+                Some(span.clone()),
+                comment.clone(),
+            );
+            let mut words = binding.words.clone();
+            recurse_words(&mut words, &mut |word| match &word.value {
+                Word::Ref(r) => {
+                    if let Ok((path_locals, local)) = self.ref_local(r) {
+                        self.validate_local(&r.name.value, local, &r.name.span);
+                        (self.code_meta.global_references).insert(r.name.clone(), local.index);
+                        for (local, comp) in path_locals.into_iter().zip(&r.path) {
+                            (self.code_meta.global_references)
+                                .insert(comp.module.clone(), local.index);
+                        }
+                    }
+                }
+                Word::IncompleteRef { path, in_macro_arg } => {
+                    if let Ok(Some((_, path_locals))) = self.ref_path(path, *in_macro_arg) {
+                        for (local, comp) in path_locals.into_iter().zip(path) {
+                            (self.code_meta.global_references)
+                                .insert(comp.module.clone(), local.index);
+                        }
+                    }
+                }
+                _ => {}
+            });
+            let mac = StackMacro {
+                words,
+                names: self.scope.names.clone(),
+            };
+            self.stack_macros.insert(local.index, mac);
             return Ok(());
         }
 
@@ -164,12 +192,10 @@ impl Compiler {
                     }
                 }
 
-                comp.add_function(FunctionId::Named(name.clone()), sig, instrs)
+                comp.make_function(FunctionId::Named(name.clone()), sig, instrs)
             },
         );
-        let words_span = binding
-            .words
-            .first()
+        let words_span = (binding.words.first())
             .zip(binding.words.last())
             .map(|(f, l)| f.span.clone().merge(l.span.clone()))
             .unwrap_or_else(|| {
@@ -200,7 +226,7 @@ impl Compiler {
                 let mut f = make(instrs, sig, comp);
                 f.recursive = true;
                 let instrs = vec![Instr::PushFunc(f), Instr::Prim(Primitive::This, span_index)];
-                comp.add_function(FunctionId::Named(name.clone()), sig, instrs)
+                comp.make_function(FunctionId::Named(name.clone()), sig, instrs)
             });
         }
 
@@ -245,7 +271,13 @@ impl Compiler {
                     let func = make_fn(f.instrs(self).into(), f.signature(), self);
                     self.compile_bind_function(&name, local, func, span_index, comment)?;
                 } else if sig == (0, 1) && !is_setinv && !is_setund {
-                    // Binding is a constant or noadic function
+                    if let &[Instr::Prim(Primitive::Tag, span)] = instrs.as_slice() {
+                        instrs.push(Instr::Label {
+                            label: name.clone(),
+                            span,
+                        })
+                    }
+                    // Binding is a constant
                     let val = if let [Instr::Push(v)] = instrs.as_slice() {
                         Some(v.clone())
                     } else {
@@ -302,10 +334,11 @@ impl Compiler {
                         let val = val.clone();
                         self.asm.instrs.pop();
                         self.asm.bind_const(local, Some(val), span_index, comment);
-                        let last_slice = self.asm.top_slices.last_mut().unwrap();
-                        last_slice.len -= 1;
-                        if last_slice.len == 0 {
-                            self.asm.top_slices.pop();
+                        if let Some(last_slice) = self.asm.top_slices.last_mut() {
+                            last_slice.len -= 1;
+                            if last_slice.len == 0 {
+                                self.asm.top_slices.pop();
+                            }
                         }
                     } else {
                         self.asm.bind_const(local, None, span_index, comment);
@@ -343,7 +376,7 @@ impl Compiler {
                         binding.name.span.clone(),
                         format!(
                             "Cannot infer function signature: {e}{}",
-                            if e.ambiguous {
+                            if e.kind == SigCheckErrorKind::Ambiguous {
                                 ". A signature can be declared after the `←`."
                             } else {
                                 ""
@@ -369,11 +402,11 @@ impl Compiler {
             self.next_global += 1;
             let local = LocalName {
                 index: global_index,
-                public: false,
+                public: true,
             };
             self.asm.add_global_at(
                 local,
-                Global::Module(module_path.clone()),
+                BindingKind::Module(module_path.clone()),
                 Some(name.span.clone()),
                 prev_com.or_else(|| imported.comment.clone()),
             );
@@ -393,7 +426,7 @@ impl Compiler {
                     item.value.clone(),
                     LocalName {
                         index: local.index,
-                        public: false,
+                        public: true,
                     },
                 );
             } else {

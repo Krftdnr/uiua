@@ -102,13 +102,17 @@ pub enum Word {
     MultilineFormatString(Vec<Sp<Vec<String>>>),
     Label(String),
     Ref(Ref),
-    IncompleteRef(Vec<RefComponent>),
+    IncompleteRef {
+        path: Vec<RefComponent>,
+        in_macro_arg: bool,
+    },
     Strand(Vec<Sp<Word>>),
     Undertied(Vec<Sp<Word>>),
     Array(Arr),
     Func(Func),
     Switch(Switch),
     Primitive(Primitive),
+    SemicolonPop,
     Modified(Box<Modified>),
     Placeholder(PlaceholderOp),
     Comment(String),
@@ -116,7 +120,10 @@ pub enum Word {
     BreakLine,
     UnbreakLine,
     SemanticComment(SemanticComment),
-    OutputComment { i: usize, n: usize },
+    OutputComment {
+        i: usize,
+        n: usize,
+    },
 }
 
 impl PartialEq for Word {
@@ -175,6 +182,12 @@ impl Word {
             Word::Comment(_) | Word::Spaces | Word::BreakLine | Word::UnbreakLine
         )
     }
+    /// Whether this word is a literal
+    pub fn is_literal(&self) -> bool {
+        matches!(self, Word::Number(..) | Word::Char(_) | Word::String(_))
+            || matches!(self, Word::Array(arr) if arr.lines.iter().flatten().filter(|w| w.value.is_code()).all(|w| w.value.is_literal()))
+            || matches!(self, Word::Strand(items) if items.iter().all(|w| w.value.is_literal()))
+    }
 }
 
 impl fmt::Debug for Word {
@@ -206,8 +219,8 @@ impl fmt::Debug for Word {
             }
             Word::Label(label) => write!(f, "${label}"),
             Word::Ref(ident) => write!(f, "ref({ident})"),
-            Word::IncompleteRef(comps) => {
-                write!(f, "incomplete_ref({}~...)", comps[0].module.value)
+            Word::IncompleteRef { path, .. } => {
+                write!(f, "incomplete_ref({}~...)", path[0].module.value)
             }
             Word::Array(arr) => arr.fmt(f),
             Word::Strand(items) => write!(f, "strand({items:?})"),
@@ -215,6 +228,7 @@ impl fmt::Debug for Word {
             Word::Func(func) => func.fmt(f),
             Word::Switch(sw) => sw.fmt(f),
             Word::Primitive(prim) => prim.fmt(f),
+            Word::SemicolonPop => write!(f, ";"),
             Word::Modified(modified) => modified.fmt(f),
             Word::Spaces => write!(f, "' '"),
             Word::Comment(comment) => write!(f, "# {comment}"),
@@ -270,6 +284,10 @@ pub struct Ref {
     pub path: Vec<RefComponent>,
     /// The name of the item
     pub name: Sp<Ident>,
+    /// Whether this ref is in a macro argument
+    ///
+    /// This allows macros to be hygienic
+    pub in_macro_arg: bool,
 }
 
 /// A component of a reference

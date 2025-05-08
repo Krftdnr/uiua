@@ -592,16 +592,14 @@ impl<'a> Formatter<'a> {
             }
             Item::Binding(binding) => {
                 match binding.words.first().map(|w| &w.value) {
-                    Some(Word::Ref(r)) => {
-                        if r.root_module()
-                            .zip(self.prev_import_function.as_ref())
-                            .is_some_and(|(a, b)| a == b)
-                        {
-                            for _ in 0..self.config.multiline_indent {
-                                self.output.push(' ');
-                            }
-                        } else {
-                            self.prev_import_function = None;
+                    Some(Word::Ref(r))
+                        if binding.words.len() == 1
+                            && r.root_module()
+                                .zip(self.prev_import_function.as_ref())
+                                .is_some_and(|(a, b)| a == b) =>
+                    {
+                        for _ in 0..self.config.multiline_indent {
+                            self.output.push(' ');
                         }
                     }
                     _ => self.prev_import_function = None,
@@ -747,8 +745,8 @@ impl<'a> Formatter<'a> {
         depth: usize,
         angle_switch: bool,
     ) {
-        for word in trim_spaces(words, trim_end) {
-            self.format_word(word, depth, angle_switch);
+        for (i, word) in trim_spaces(words, trim_end).iter().enumerate() {
+            self.format_word(word, depth, angle_switch || i > 0);
         }
     }
     fn format_word(&mut self, word: &Sp<Word>, depth: usize, angle_switch: bool) {
@@ -854,7 +852,7 @@ impl<'a> Formatter<'a> {
                 }
                 self.format_ref(r);
             }
-            Word::IncompleteRef(path) => {
+            Word::IncompleteRef { path, .. } => {
                 if (self.output.chars().rev())
                     .take_while(|&c| is_ident_char(c))
                     .any(|c| c.is_uppercase())
@@ -984,6 +982,7 @@ impl<'a> Formatter<'a> {
                 self.output.push(if use_angle { '⟩' } else { ')' });
             }
             Word::Primitive(prim) => self.push(&word.span, &prim.to_string()),
+            Word::SemicolonPop => self.push(&word.span, ";"),
             Word::Modified(m) => {
                 match &m.modifier.value {
                     Modifier::Primitive(prim) => self.push(&m.modifier.span, &prim.to_string()),
@@ -1202,11 +1201,17 @@ impl<'a> Formatter<'a> {
         let values = self.output_comments.get_or_insert_with(|| {
             let mut env = Uiua::with_backend(self.config.backend.clone())
                 .with_execution_limit(Duration::from_secs(2));
+
+            #[cfg(feature = "native_sys")]
+            let enabled = crate::sys_native::set_output_enabled(false);
             let res = env.compile_run(|comp| {
                 comp.print_diagnostics(true)
                     .mode(RunMode::All)
                     .load_str_src(&self.inputs.get(&self.src), self.src.clone())
             });
+            #[cfg(feature = "native_sys")]
+            crate::sys_native::set_output_enabled(enabled);
+
             let mut values = env.rt.output_comments;
             if let Err(e) = res {
                 let next = (0..).take_while(|i| values.contains_key(i)).count();
@@ -1228,7 +1233,7 @@ fn word_is_multiline(word: &Word) -> bool {
         Word::MultilineString(_) => true,
         Word::MultilineFormatString(_) => true,
         Word::Ref(_) => false,
-        Word::IncompleteRef(_) => false,
+        Word::IncompleteRef { .. } => false,
         Word::Strand(_) => false,
         Word::Undertied(_) => false,
         Word::Array(arr) => {
@@ -1248,6 +1253,7 @@ fn word_is_multiline(word: &Word) -> bool {
                     .any(|words| words.iter().any(|word| word_is_multiline(&word.value)))
         }),
         Word::Primitive(_) => false,
+        Word::SemicolonPop => false,
         Word::Modified(m) => m.operands.iter().any(|word| word_is_multiline(&word.value)),
         Word::Placeholder(_) => false,
         Word::Comment(_) => true,
